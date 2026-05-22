@@ -138,19 +138,17 @@ function LetterStrip({
   );
 }
 
-// ── Reusable Section Label ────────────────────────────────
 function SectionLabel({ text }: { text: string }) {
   return <Text style={s.sectionLabel}>{text}</Text>;
 }
 
-// ── Divider ───────────────────────────────────────────────
 function Divider() {
   return <View style={s.divider} />;
 }
 
 // ── Main Screen ───────────────────────────────────────────
 export default function Index() {
-  const [ip, setIp] = useState("");
+  const [ip, setIp] = useState("192.168.4.1"); // ESP32 AP mode — always this IP
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [word, setWord] = useState("");
@@ -188,23 +186,36 @@ export default function Index() {
       setConnecting(false);
       Alert.alert(
         "Connection failed",
-        `Could not reach ESP32 at ${ip.trim()}:81\n\nMake sure both devices are on the same WiFi network.`,
+        `Could not reach ESP32 at ${ip.trim()}:81\n\nMake sure your phone is connected to the BrailleDOTS WiFi hotspot.`,
       );
     };
+
+    // Listen for messages from the device
     socket.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
-        if (msg.type === "button_press") {
-          if (msg.button === "next") handleNext();
-          if (msg.button === "back") handleBack();
+
+        // Device sends status after every navigation (button press)
+        // Use this to keep the app UI in sync with the physical device
+        if (msg.type === "status") {
+          setIndex(msg.index);
+        }
+
+        // Device sends this when ANSWER button is pressed physically
+        if (msg.type === "button" && msg.button === "answer") {
+          Alert.alert("Answer", "Student pressed the Answer button.");
         }
       } catch {}
     };
+
     ws.current = socket;
   }, [ip, connected]);
 
-  function sendLetter(letter: string) {
-    const msg = JSON.stringify({ type: "display", letter });
+  // Send the FULL word to the ESP32 at once.
+  // The device stores it, shows the first letter, and handles
+  // NEXT/BACK navigation locally via physical buttons.
+  function sendWord(fullWord: string) {
+    const msg = JSON.stringify({ type: "word", word: fullWord });
     if (ws.current?.readyState === WebSocket.OPEN) ws.current.send(msg);
     console.log("→ ESP32:", msg);
   }
@@ -218,29 +229,26 @@ export default function Index() {
       Alert.alert("Empty word", "Please type a word first.");
       return;
     }
+    if (!connected) {
+      Alert.alert("Not connected", "Connect to the ESP32 device first.");
+      return;
+    }
     const arr = cleaned.split("");
     setLetters(arr);
     setIndex(0);
     setStarted(true);
-    sendLetter(arr[0]);
+    sendWord(cleaned); // Send whole word — device handles letter-by-letter display
   }
 
+  // These update the app UI only.
+  // Physical buttons on the device navigate the solenoids.
+  // The device sends back status updates to keep index in sync.
   function handleNext() {
-    setIndex((prev) => {
-      if (prev >= letters.length - 1) return prev;
-      const n = prev + 1;
-      sendLetter(letters[n]);
-      return n;
-    });
+    setIndex((prev) => (prev >= letters.length - 1 ? prev : prev + 1));
   }
 
   function handleBack() {
-    setIndex((prev) => {
-      if (prev <= 0) return prev;
-      const b = prev - 1;
-      sendLetter(letters[b]);
-      return b;
-    });
+    setIndex((prev) => (prev <= 0 ? prev : prev - 1));
   }
 
   function handleReset() {
@@ -288,7 +296,7 @@ export default function Index() {
           <SectionLabel text="Device IP Address" />
           <TextInput
             style={s.input}
-            placeholder="e.g. 192.168.1.45"
+            placeholder="192.168.4.1"
             placeholderTextColor={C.grayMid}
             value={ip}
             onChangeText={setIp}
@@ -411,7 +419,6 @@ const s = StyleSheet.create({
   screen: { flex: 1, backgroundColor: C.white },
   scroll: { paddingHorizontal: 20, paddingBottom: 40 },
 
-  // Header
   headerBar: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -423,7 +430,6 @@ const s = StyleSheet.create({
   appName: { fontFamily: F.heading, fontSize: 22, color: C.navy },
   appSub: { fontFamily: F.body, fontSize: 12, color: C.gray, marginTop: 2 },
 
-  // Accent bar
   accentBar: {
     height: 4,
     backgroundColor: C.amber,
@@ -431,7 +437,6 @@ const s = StyleSheet.create({
     marginBottom: 24,
   },
 
-  // Status badge
   statusBadge: {
     flexDirection: "row",
     alignItems: "center",
@@ -450,7 +455,6 @@ const s = StyleSheet.create({
   textGreen: { color: C.green },
   textGray: { color: C.gray },
 
-  // Cards
   card: {
     backgroundColor: C.surface,
     borderRadius: 16,
@@ -464,10 +468,7 @@ const s = StyleSheet.create({
     shadowRadius: 8,
     elevation: 2,
   },
-  cardActive: {
-    borderColor: C.navyMid,
-    borderWidth: 1.5,
-  },
+  cardActive: { borderColor: C.navyMid, borderWidth: 1.5 },
   cardHeader: {
     flexDirection: "row",
     alignItems: "center",
@@ -483,7 +484,6 @@ const s = StyleSheet.create({
   cardTitle: { fontFamily: F.heading, fontSize: 16, color: C.navy, flex: 1 },
   cardCounter: { fontFamily: F.bodyBold, fontSize: 13, color: C.gray },
 
-  // Section label
   sectionLabel: {
     fontFamily: F.bodyBold,
     fontSize: 12,
@@ -493,7 +493,6 @@ const s = StyleSheet.create({
     marginBottom: 8,
   },
 
-  // Inputs
   input: {
     backgroundColor: C.white,
     color: C.navy,
@@ -514,7 +513,6 @@ const s = StyleSheet.create({
     color: C.navy,
   },
 
-  // Buttons
   btn: {
     paddingVertical: 15,
     borderRadius: 12,
@@ -535,7 +533,6 @@ const s = StyleSheet.create({
   btnTextDark: { fontFamily: F.bodyBold, fontSize: 14, color: C.navy },
   btnTextOutline: { fontFamily: F.bodyBold, fontSize: 14, color: C.gray },
 
-  // Connected pill
   connectedPill: {
     marginTop: 12,
     backgroundColor: C.greenLight,
@@ -546,19 +543,9 @@ const s = StyleSheet.create({
     borderWidth: 1,
     borderColor: C.greenMid,
   },
-  connectedPillText: {
-    fontFamily: F.bodyBold,
-    fontSize: 12,
-    color: C.green,
-  },
+  connectedPillText: { fontFamily: F.bodyBold, fontSize: 12, color: C.green },
 
-  // Letter strip
-  stripRow: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 6,
-    marginBottom: 4,
-  },
+  stripRow: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginBottom: 4 },
   stripTile: {
     width: 36,
     height: 36,
@@ -575,7 +562,6 @@ const s = StyleSheet.create({
   stripLetterActive: { color: C.surface },
   stripLetterDone: { color: C.navy },
 
-  // Big letter
   bigLetterBox: { alignItems: "center", paddingVertical: 8 },
   bigLetter: {
     fontFamily: F.heading,
@@ -593,32 +579,15 @@ const s = StyleSheet.create({
     marginBottom: 4,
   },
 
-  // Divider
-  divider: {
-    height: 1,
-    backgroundColor: C.bgAlt,
-    marginVertical: 18,
-  },
+  divider: { height: 1, backgroundColor: C.bgAlt, marginVertical: 18 },
 
-  // Braille cell
   brailleWrapper: { alignItems: "center" },
   brailleGrid: { flexDirection: "row", gap: 18, marginVertical: 16 },
   brailleCol: { gap: 14 },
-  dot: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: C.dotEmpty,
-  },
+  dot: { width: 36, height: 36, borderRadius: 18, backgroundColor: C.dotEmpty },
   dotRaised: { backgroundColor: C.navy },
-  monoText: {
-    fontFamily: F.mono,
-    fontSize: 13,
-    color: C.gray,
-    letterSpacing: 1,
-  },
+  monoText: { fontFamily: F.mono, fontSize: 13, color: C.gray, letterSpacing: 1 },
 
-  // Hint box
   hintBox: {
     backgroundColor: C.amberLight,
     borderRadius: 10,

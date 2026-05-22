@@ -288,8 +288,7 @@ void setup() {
   shift595(0x00);
   delay(200);
 
-  // Comment out after wiring is verified:
-  runDiagnostic();
+  // runDiagnostic(); // ← commented out, wiring verified
 
   // Create ESP32 hotspot
   WiFi.mode(WIFI_AP);
@@ -324,6 +323,7 @@ void loop() {
 
     if (digitalRead(BTN_NEXT) == LOW) {
       lastBtn = now;
+      Serial.printf("[DEBUG] wordLen=%d letterPos=%d\n", wordLen, letterPos);
       Serial.print("[BTN] NEXT — ");
       if (wordLen == 0) {
         Serial.println("no word loaded");
@@ -334,7 +334,7 @@ void loop() {
         sendStatus();
         Serial.printf("showing '%c' (%d/%d)\n", wordBuf[letterPos], letterPos+1, wordLen);
       }
-      wsSend("{\"type\":\"button\",\"button\":\"next\"}");
+      // Do NOT send to app — app was resetting back to letter 1
     }
 
     else if (digitalRead(BTN_BACK) == LOW) {
@@ -349,7 +349,7 @@ void loop() {
         sendStatus();
         Serial.printf("showing '%c' (%d/%d)\n", wordBuf[letterPos], letterPos+1, wordLen);
       }
-      wsSend("{\"type\":\"button\",\"button\":\"back\"}");
+      // Do NOT send to app — app was resetting back to letter 1
     }
 
     else if (digitalRead(BTN_ANSWER) == LOW) {
