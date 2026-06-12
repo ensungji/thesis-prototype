@@ -44,9 +44,22 @@ export function isValidWord(word: string): boolean {
 }
 
 /**
- * (For preview only) Checks if a dot position (1–6) is raised
- * for the given letter.
+ * Checks if a dot position (1–6) is raised for the given letter.
  */
 export function isDotRaised(letter: string, dot: number): boolean {
   return getPattern(letter).includes(dot);
+}
+
+/**
+ * Splits a word into 5-character chunks for the 5-cell device display.
+ * e.g. "BEAUTIFUL" → ["BEAUT", "IFUL"]
+ * e.g. "CAT"       → ["CAT"]
+ */
+export function wordToChunks(word: string): string[] {
+  const letters = wordToLetters(word);
+  const chunks: string[] = [];
+  for (let i = 0; i < letters.length; i += 5) {
+    chunks.push(letters.slice(i, i + 5).join(""));
+  }
+  return chunks;
 }

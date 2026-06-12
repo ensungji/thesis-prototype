@@ -1,6 +1,5 @@
 // mobile/app/login.tsx
-// Teacher login — UI complete. Backend commented out until new APK is ready.
-// To enable auth: uncomment the 3 sections marked [BACKEND].
+// Teacher login — real Supabase Auth, production ready.
 
 import { useState, useEffect } from "react";
 import {
@@ -17,7 +16,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-// [BACKEND] import { supabase } from "../lib/supabase";
+import { supabase } from "../lib/supabase";
 import { colors as C, fonts } from "../lib/theme";
 import { BrailleCell } from "../components/BrailleCell";
 
@@ -31,12 +30,12 @@ export default function Login() {
   const [error, setError]               = useState<string | null>(null);
   const [focused, setFocused]           = useState<"email" | "password" | null>(null);
 
-  // [BACKEND] Uncomment to auto-redirect if a session already exists (e.g. app restart)
-  // useEffect(() => {
-  //   supabase.auth.getSession().then(({ data: { session } }) => {
-  //     if (session) router.replace("/(teacher)/dashboard" as any);
-  //   });
-  // }, [router]);
+  // Skip login if a session already exists (e.g. app restart)
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session) router.replace("/(teacher)/dashboard" as any);
+    });
+  }, [router]);
 
   async function signIn() {
     if (!email.trim() || !password) {
@@ -44,20 +43,47 @@ export default function Login() {
       return;
     }
 
-    // [BACKEND] Uncomment below and remove the router.replace() line to enable real auth
-    // setLoading(true);
-    // setError(null);
-    // const { error: authError } = await supabase.auth.signInWithPassword({
-    //   email: email.trim().toLowerCase(),
-    //   password,
-    // });
-    // setLoading(false);
-    // if (authError) {
-    //   setError(authError.message);
-    //   return;
-    // }
+    setLoading(true);
+    setError(null);
 
-    router.replace("/(teacher)/dashboard" as any);
+    const { data: signInData, error: authError } = await supabase.auth.signInWithPassword({
+      email: email.trim().toLowerCase(),
+      password,
+    });
+
+    if (authError) {
+      setLoading(false);
+      setError(authError.message);
+      return;
+    }
+
+    // Fetch profile for role + active check
+    const { data: profile, error: profileError } = await supabase
+      .from("profiles")
+      .select("role, is_active")
+      .eq("id", signInData.user!.id)
+      .single();
+
+    setLoading(false);
+
+    // If profile fetch failed entirely, let them in as teacher (don't lock out)
+    if (profileError || !profile) {
+      router.replace("/(teacher)/dashboard" as any);
+      return;
+    }
+
+    // Only block if explicitly deactivated (is_active === false, not null/undefined)
+    if (profile.is_active === false) {
+      await supabase.auth.signOut();
+      setError("Your account has been deactivated. Contact the admin.");
+      return;
+    }
+
+    if (profile.role === "admin") {
+      router.replace("/admin" as any);
+    } else {
+      router.replace("/(teacher)/dashboard" as any);
+    }
   }
 
   return (
@@ -157,7 +183,7 @@ export default function Login() {
               </View>
             </View>
 
-            {/* Error message */}
+            {/* Error */}
             {error && (
               <View style={styles.errorBox} accessibilityRole="alert">
                 <Text style={styles.errorText}>{error}</Text>
