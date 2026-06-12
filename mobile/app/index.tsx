@@ -1,10 +1,12 @@
 // mobile/app/index.tsx
 // Braille D.O.T.S — Intro / Landing screen (React Native + Expo Router)
-// One simple, scrollable page that explains the whole concept.
+// Checks for an existing session on mount — logged-in users skip straight to dashboard.
 
+import { useState, useEffect } from "react";
 import { useRouter } from "expo-router";
-import { View, Text, Pressable, ScrollView, StyleSheet } from "react-native";
+import { View, Text, Pressable, ScrollView, StyleSheet, ActivityIndicator } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { supabase } from "../lib/supabase";
 import { colors as C } from "../lib/theme";
 import { BrailleCell } from "../components/BrailleCell";
 
@@ -17,9 +19,39 @@ const STEPS = [
 
 export default function Intro() {
   const router = useRouter();
+  const [checking, setChecking] = useState(true);
 
-  // Change "/login" to your first real screen.
-  // For the prototype path you can route to "/connect" instead.
+  useEffect(() => {
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
+      if (session) {
+        const { data: profile } = await supabase
+          .from("profiles")
+          .select("role")
+          .eq("id", session.user.id)
+          .single();
+        // If profile missing or fetch fails, default to teacher dashboard
+        if (profile?.role === "admin") {
+          router.replace("/admin" as any);
+        } else {
+          router.replace("/(teacher)/dashboard" as any);
+        }
+      } else {
+        setChecking(false);
+      }
+    });
+  }, []);
+
+  // Show a clean loading screen while session check runs
+  if (checking) {
+    return (
+      <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
+        <View style={styles.loadingCenter}>
+          <BrailleCell pattern={[1, 2, 5]} size={14} />
+        </View>
+      </SafeAreaView>
+    );
+  }
+
   const start = () => router.push("/login");
 
   return (
@@ -84,6 +116,7 @@ export default function Intro() {
 
 const styles = StyleSheet.create({
   safe:   { flex: 1, backgroundColor: C.bg },
+  loadingCenter: { flex: 1, alignItems: "center", justifyContent: "center" },
   scroll: { padding: 24, paddingBottom: 40, gap: 28 },
 
   brandRow:  { flexDirection: "row", alignItems: "center", gap: 12 },
