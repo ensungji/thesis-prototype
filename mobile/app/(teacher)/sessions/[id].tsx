@@ -12,17 +12,14 @@ import {
   TextInput,
   Modal,
   FlatList,
-  KeyboardAvoidingView,
-  Platform,
   StyleSheet,
   ActivityIndicator,
   RefreshControl,
   Alert,
   AppState,
-  Switch,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
 import { colors as C, fonts } from "../../../lib/theme";
@@ -117,12 +114,7 @@ export default function SessionDetail() {
   const [saving, setSaving] = useState(false);
 
   // ── Word list builder ───────────────────────────────────────────────────────
-  const [addWordModal, setAddWordModal] = useState(false);
-  const [wordTab, setWordTab] = useState<"new" | "bank">("new");
-  const [newWord, setNewWord] = useState("");
-  const [saveToBank, setSaveToBank] = useState(false);
-  const [wordBank, setWordBank] = useState<WordBankItem[]>([]);
-  const [bankSearch, setBankSearch] = useState("");
+  // (add-word logic lives in add-word.tsx; reloaded via useFocusEffect)
 
   // ── Active session ──────────────────────────────────────────────────────────
   const [manualWord, setManualWord] = useState("");
@@ -155,6 +147,15 @@ export default function SessionDetail() {
   // ── Delete session modal ────────────────────────────────────────────────────
   const [deleteSessionModal, setDeleteSessionModal] = useState(false);
   const [deletingSession, setDeletingSession] = useState(false);
+  const [deleteCountdown, setDeleteCountdown] = useState(5);
+
+  // Tick down from 5 whenever the delete modal is open
+  useEffect(() => {
+    if (!deleteSessionModal) return;
+    if (deleteCountdown <= 0) return;
+    const t = setTimeout(() => setDeleteCountdown((c) => c - 1), 1000);
+    return () => clearTimeout(t);
+  }, [deleteSessionModal, deleteCountdown]);
 
   // ── Word delete confirmation ────────────────────────────────────────────────
   const [deleteWordModal, setDeleteWordModal] = useState(false);
@@ -226,6 +227,13 @@ export default function SessionDetail() {
     loadData();
   }, [loadData]);
 
+  // Reload whenever the screen comes back into focus (e.g. returning from add-word)
+  useFocusEffect(
+    useCallback(() => {
+      loadData();
+    }, [loadData])
+  );
+
   // ── Realtime subscriptions ──────────────────────────────────────────────────
   useEffect(() => {
     if (!id) return;
@@ -269,18 +277,6 @@ export default function SessionDetail() {
     return () => { supabase.removeChannel(channel); };
   }, [id]);
 
-  async function loadWordBank() {
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) return;
-    const { data } = await supabase
-      .from("word_library")
-      .select("id, word, category")
-      .eq("teacher_id", user.id)
-      .order("word");
-    setWordBank(data ?? []);
-  }
 
   // ── Student assignment ──────────────────────────────────────────────────────
 
@@ -306,69 +302,34 @@ export default function SessionDetail() {
     }
   }
 
-  // ── Word list builder ───────────────────────────────────────────────────────
-
-  async function addWordToSession(word: string) {
-    const w = word.trim().toUpperCase();
-    if (!w || !isValidWord(w)) {
-      Alert.alert("Invalid word", "Only letters A–Z are supported.");
-      return;
-    }
-    if (sessionWords.find((sw) => sw.word === w)) {
-      Alert.alert("Duplicate", "This word is already in the list.");
-      return;
-    }
-
-    setSaving(true);
-    const { data } = await supabase
-      .from("session_words")
-      .insert({ session_id: id, word: w, order_index: sessionWords.length })
-      .select("id, word, order_index")
-      .single();
-
-    if (saveToBank && wordTab === "new") {
-      const {
-        data: { user: u },
-      } = await supabase.auth.getUser();
-      await supabase.from("word_library").insert({
-        teacher_id: u!.id,
-        word: w,
-        category: "My Words",
-        difficulty: "beginner",
-      });
-      // Silently ignore duplicates — word already in bank is fine
-    }
-
-    if (data) setSessionWords((prev) => [...prev, data]);
-    setNewWord("");
-    setSaveToBank(false);
-    setSaving(false);
-  }
-
   async function removeWord(wordId: string) {
     await supabase.from("session_words").delete().eq("id", wordId);
     setSessionWords((prev) => prev.filter((w) => w.id !== wordId));
   }
 
   function deleteSession() {
+    setDeleteCountdown(5); // reset countdown each time modal opens
     setDeleteSessionModal(true);
   }
 
   async function executeDeleteSession() {
+    if (deleteCountdown > 0) return; // safety guard
     setDeletingSession(true);
+    const sessionName = session?.name ?? "Session";
     await supabase.from("sessions").delete().eq("id", id!);
     setDeletingSession(false);
     setDeleteSessionModal(false);
-    router.back();
+    router.replace({
+      pathname: "/(teacher)/sessions" as any,
+      params: { deletedName: sessionName },
+    });
   }
 
   function openAddWord() {
-    setNewWord("");
-    setSaveToBank(false);
-    setWordTab("new");
-    setBankSearch("");
-    loadWordBank();
-    setAddWordModal(true);
+    router.push({
+      pathname: "/(teacher)/sessions/add-word" as any,
+      params: { sessionId: id },
+    });
   }
 
   // ── Session lifecycle ───────────────────────────────────────────────────────
@@ -525,8 +486,74 @@ export default function SessionDetail() {
   }
   if (!session) return null;
 
-  const filteredBank = wordBank.filter((w) =>
-    w.word.toLowerCase().includes(bankSearch.toLowerCase()),
+  const filteredBank = [] as WordBankItem[]; // word bank is now on add-word screen
+
+  // ── DELETE SESSION MODAL (shared across all status views) ───────────────────
+  const DeleteSessionModal = (
+    <Modal
+      visible={deleteSessionModal}
+      animationType="slide"
+      transparent
+      onRequestClose={() => setDeleteSessionModal(false)}
+    >
+      <View style={styles.modalOverlay}>
+        <Pressable
+          style={styles.backdrop}
+          onPress={() => setDeleteSessionModal(false)}
+        />
+        <View style={styles.sheet}>
+          <View style={styles.handle} />
+          <View style={styles.deletePreview}>
+            <Ionicons name="warning-outline" size={28} color={C.red} />
+            <Text style={styles.deletePreviewText}>{session?.name}</Text>
+          </View>
+          <Text style={styles.deleteTitle}>Delete this session?</Text>
+          <Text style={styles.deleteSub}>
+            {"This permanently removes the session and all its associated data. This cannot be undone."
+            }
+          </Text>
+          {deleteCountdown > 0 && (
+            <View style={styles.countdownRow}>
+              <Ionicons name="time-outline" size={14} color={C.muted} />
+              <Text style={styles.countdownText}>
+                Are you sure? You can delete in{" "}
+                <Text style={styles.countdownNumber}>{deleteCountdown}s</Text>
+              </Text>
+            </View>
+          )}
+          <View style={styles.sheetActions}>
+            <Pressable
+              onPress={() => setDeleteSessionModal(false)}
+              style={({ pressed }) => [
+                styles.sheetBtn,
+                styles.btnCancel,
+                pressed && { opacity: 0.7 },
+              ]}
+            >
+              <Text style={styles.btnCancelText}>Keep It</Text>
+            </Pressable>
+            <Pressable
+              onPress={executeDeleteSession}
+              disabled={deletingSession || deleteCountdown > 0}
+              style={({ pressed }) => [
+                styles.sheetBtn,
+                styles.btnDelete,
+                (deleteCountdown > 0 || deletingSession) && styles.btnDeleteDisabled,
+                pressed && deleteCountdown === 0 && { opacity: 0.8 },
+              ]}
+            >
+              {deletingSession ? (
+                <ActivityIndicator color={C.white} />
+              ) : (
+                <Text style={styles.btnDeleteText}>
+                  {deleteCountdown > 0 ? `Delete (${deleteCountdown})` : "Delete"}
+                </Text>
+              )}
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
   );
 
   // ── SHARED HEADER ───────────────────────────────────────────────────────────
@@ -799,59 +826,7 @@ export default function SessionDetail() {
         </ScrollView>
 
         {/* ── Delete session modal ───────────────────────────────────────────── */}
-        <Modal
-          visible={deleteSessionModal}
-          animationType="slide"
-          transparent
-          onRequestClose={() => setDeleteSessionModal(false)}
-        >
-          <View style={styles.modalOverlay}>
-            <Pressable
-              style={styles.backdrop}
-              onPress={() => setDeleteSessionModal(false)}
-            />
-            <View style={styles.sheet}>
-              <View style={styles.handle} />
-              <View style={styles.deletePreview}>
-                <Ionicons name="warning-outline" size={28} color={C.red} />
-                <Text style={styles.deletePreviewText}>{session?.name}</Text>
-              </View>
-              <Text style={styles.deleteTitle}>Delete this session?</Text>
-              <Text style={styles.deleteSub}>
-                {
-                  "This permanently removes the session and all its associated data. This cannot be undone."
-                }
-              </Text>
-              <View style={styles.sheetActions}>
-                <Pressable
-                  onPress={() => setDeleteSessionModal(false)}
-                  style={({ pressed }) => [
-                    styles.sheetBtn,
-                    styles.btnCancel,
-                    pressed && { opacity: 0.7 },
-                  ]}
-                >
-                  <Text style={styles.btnCancelText}>Keep It</Text>
-                </Pressable>
-                <Pressable
-                  onPress={executeDeleteSession}
-                  disabled={deletingSession}
-                  style={({ pressed }) => [
-                    styles.sheetBtn,
-                    styles.btnDelete,
-                    pressed && { opacity: 0.8 },
-                  ]}
-                >
-                  {deletingSession ? (
-                    <ActivityIndicator color={C.white} />
-                  ) : (
-                    <Text style={styles.btnDeleteText}>Delete</Text>
-                  )}
-                </Pressable>
-              </View>
-            </View>
-          </View>
-        </Modal>
+        {DeleteSessionModal}
 
         {/* ── Word delete confirmation modal ─────────────────────────────────── */}
         <Modal
@@ -912,157 +887,6 @@ export default function SessionDetail() {
           </View>
         </Modal>
 
-        {/* Add word modal */}
-        <Modal
-          visible={addWordModal}
-          animationType="slide"
-          transparent
-          onRequestClose={() => setAddWordModal(false)}
-        >
-          <View style={styles.modalOverlay}>
-            <Pressable
-              style={styles.backdrop}
-              onPress={() => setAddWordModal(false)}
-            />
-            <KeyboardAvoidingView
-              style={styles.keyboardSheet}
-              behavior={Platform.OS === "ios" ? "padding" : "padding"}
-            >
-              <View style={styles.sheet}>
-                <View style={styles.handle} />
-                <Text style={styles.sheetTitle}>Add Word</Text>
-
-                {/* Tabs */}
-                <View style={styles.tabRow}>
-                  <Pressable
-                    onPress={() => setWordTab("new")}
-                    style={[styles.tab, wordTab === "new" && styles.tabActive]}
-                  >
-                    <Text
-                      style={[
-                        styles.tabText,
-                        wordTab === "new" && styles.tabTextActive,
-                      ]}
-                    >
-                      New Word
-                    </Text>
-                  </Pressable>
-                  <Pressable
-                    onPress={() => setWordTab("bank")}
-                    style={[styles.tab, wordTab === "bank" && styles.tabActive]}
-                  >
-                    <Text
-                      style={[
-                        styles.tabText,
-                        wordTab === "bank" && styles.tabTextActive,
-                      ]}
-                    >
-                      Word Bank
-                    </Text>
-                  </Pressable>
-                </View>
-
-                {wordTab === "new" ? (
-                  <View style={{ gap: 12 }}>
-                    <TextInput
-                      style={[
-                        styles.sheetInput,
-                        { fontFamily: fonts.mono, letterSpacing: 2 },
-                      ]}
-                      value={newWord}
-                      onChangeText={(v) => setNewWord(v.toUpperCase())}
-                      placeholder="TYPE A WORD"
-                      placeholderTextColor={C.muted}
-                      autoFocus
-                      autoCapitalize="characters"
-                      autoCorrect={false}
-                      returnKeyType="done"
-                      onSubmitEditing={() => {
-                        addWordToSession(newWord);
-                      }}
-                    />
-                    <View style={styles.saveToBankRow}>
-                      <Text style={styles.saveToBankLabel}>
-                        Save to my Word Bank
-                      </Text>
-                      <Switch
-                        value={saveToBank}
-                        onValueChange={setSaveToBank}
-                        trackColor={{ true: C.navy }}
-                        thumbColor={C.white}
-                      />
-                    </View>
-                    <Pressable
-                      onPress={() => addWordToSession(newWord)}
-                      disabled={saving || !newWord.trim()}
-                      style={({ pressed }) => [
-                        styles.sheetBtn,
-                        styles.btnConfirm,
-                        (!newWord.trim() || saving) && { opacity: 0.5 },
-                        pressed && { opacity: 0.85 },
-                      ]}
-                    >
-                      {saving ? (
-                        <ActivityIndicator color="#1A1200" />
-                      ) : (
-                        <Text style={styles.btnConfirmText}>Add to List</Text>
-                      )}
-                    </Pressable>
-                  </View>
-                ) : (
-                  <View style={{ gap: 10 }}>
-                    <TextInput
-                      style={styles.sheetInput}
-                      value={bankSearch}
-                      onChangeText={setBankSearch}
-                      placeholder="Search word bank..."
-                      placeholderTextColor={C.muted}
-                      autoCapitalize="none"
-                    />
-                    {filteredBank.length === 0 ? (
-                      <Text style={styles.emptyHint}>
-                        {wordBank.length === 0
-                          ? "Your word bank is empty. Add a new word and save it to the bank."
-                          : "No words match your search."}
-                      </Text>
-                    ) : (
-                      <FlatList
-                        data={filteredBank}
-                        keyExtractor={(w) => w.id}
-                        style={{ maxHeight: 240 }}
-                        ItemSeparatorComponent={() => (
-                          <View style={{ height: 8 }} />
-                        )}
-                        renderItem={({ item }) => (
-                          <Pressable
-                            onPress={() => {
-                              addWordToSession(item.word);
-                              setAddWordModal(false);
-                            }}
-                            style={({ pressed }) => [
-                              styles.bankItem,
-                              pressed && { opacity: 0.7 },
-                            ]}
-                          >
-                            <Text style={styles.bankWord}>{item.word}</Text>
-                            <Text style={styles.bankCategory}>
-                              {item.category}
-                            </Text>
-                            <Ionicons
-                              name="add-circle-outline"
-                              size={18}
-                              color={C.navy}
-                            />
-                          </Pressable>
-                        )}
-                      />
-                    )}
-                  </View>
-                )}
-              </View>
-            </KeyboardAvoidingView>
-          </View>
-        </Modal>
       </SafeAreaView>
     );
 
@@ -1102,6 +926,7 @@ export default function SessionDetail() {
             </View>
           </View>
         </View>
+        {DeleteSessionModal}
       </SafeAreaView>
     );
 
@@ -1113,6 +938,7 @@ export default function SessionDetail() {
     return (
       <SafeAreaView style={styles.safe} edges={["top"]}>
         {Header}
+        {DeleteSessionModal}
         <ScrollView contentContainerStyle={styles.scroll}>
           <View style={styles.infoCard}>
             <Text style={styles.sessionName}>{session.name}</Text>
@@ -2225,7 +2051,19 @@ const styles = StyleSheet.create({
     lineHeight: 20,
   },
   btnDelete: { backgroundColor: C.red },
+  btnDeleteDisabled: { backgroundColor: "#ccc" },
   btnDeleteText: { fontFamily: fonts.heading, fontSize: 15, color: C.white },
+  countdownRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: C.brownBg,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  countdownText: { fontFamily: fonts.body, fontSize: 13, color: C.brown, flex: 1 },
+  countdownNumber: { fontFamily: fonts.heading, fontSize: 13, color: C.brown },
   sheetInput: {
     fontFamily: fonts.body,
     fontSize: 15,
@@ -2237,7 +2075,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 13,
   },
-  sheetBtn: { borderRadius: 12, paddingVertical: 14, alignItems: "center" },
+  sheetBtn: { flex: 1, borderRadius: 12, paddingVertical: 14, alignItems: "center" },
   btnCancel: { backgroundColor: C.bg, borderWidth: 1.5, borderColor: C.border },
   btnConfirm: { backgroundColor: C.amber },
   btnCancelText: { fontFamily: fonts.heading, fontSize: 15, color: C.navy },

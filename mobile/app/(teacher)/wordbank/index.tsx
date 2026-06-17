@@ -1,7 +1,8 @@
-// mobile/app/(teacher)/wordbank.tsx
-// Teacher's personal word bank — add, search, and delete words freely.
+// mobile/app/(teacher)/wordbank/index.tsx
+// Teacher's personal word bank — search and delete words.
+// Add words via the dedicated new.tsx screen.
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   View,
   Text,
@@ -9,30 +10,30 @@ import {
   FlatList,
   TextInput,
   Modal,
-  KeyboardAvoidingView,
   StyleSheet,
   ActivityIndicator,
   RefreshControl,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-import { supabase } from "../../lib/supabase";
-import { colors as C, fonts } from "../../lib/theme";
-import { BrailleCell } from "../../components/BrailleCell";
-import { BrailleLoader } from "../../components/BrailleLoader";
-import { isValidWord } from "../../lib/braille";
+import { supabase } from "../../../lib/supabase";
+import { colors as C, fonts } from "../../../lib/theme";
+import { BrailleCell } from "../../../components/BrailleCell";
+import { BrailleLoader } from "../../../components/BrailleLoader";
 
-type Word = { id: string; word: string; created_at?: string };
+type Word = { id: string; word: string };
 
 export default function WordBankScreen() {
+  const router = useRouter();
+
   const [words, setWords] = useState<Word[]>([]);
   const [filtered, setFiltered] = useState<Word[]>([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [addModal, setAddModal] = useState(false);
-  const [newWord, setNewWord] = useState("");
-  const [saving, setSaving] = useState(false);
+
+  // Delete confirmation
   const [deleteModal, setDeleteModal] = useState(false);
   const [wordToDelete, setWordToDelete] = useState<Word | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -53,10 +54,21 @@ export default function WordBankScreen() {
     setRefreshing(false);
   }, []);
 
+  // Initial load
   useEffect(() => {
     loadWords();
   }, [loadWords]);
 
+  // Reload when navigating back from add screen
+  const loadWordsRef = useRef(loadWords);
+  useEffect(() => { loadWordsRef.current = loadWords; });
+  useFocusEffect(
+    useCallback(() => {
+      loadWordsRef.current();
+    }, [])
+  );
+
+  // Live search filter
   useEffect(() => {
     if (!search.trim()) {
       setFiltered(words);
@@ -67,29 +79,6 @@ export default function WordBankScreen() {
     );
   }, [search, words]);
 
-  async function addWord() {
-    const w = newWord.trim().toUpperCase();
-    if (!w) return;
-    if (!isValidWord(w)) return;
-    if (words.find((x) => x.word === w)) return;
-
-    setSaving(true);
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    const { error } = await supabase.from("word_library").insert({
-      teacher_id: user!.id,
-      word: w,
-      category: "My Words",
-      difficulty: "beginner",
-    });
-    setSaving(false);
-    if (error) return;
-    setNewWord("");
-    setAddModal(false);
-    loadWords();
-  }
-
   function confirmDelete(word: Word) {
     setWordToDelete(word);
     setDeleteModal(true);
@@ -99,6 +88,7 @@ export default function WordBankScreen() {
     if (!wordToDelete) return;
     setDeleting(true);
     await supabase.from("word_library").delete().eq("id", wordToDelete.id);
+    // Optimistic update — remove from local state immediately
     setWords((prev) => prev.filter((w) => w.id !== wordToDelete.id));
     setDeleting(false);
     setDeleteModal(false);
@@ -121,10 +111,7 @@ export default function WordBankScreen() {
       <View style={styles.header}>
         <Text style={styles.title}>Word Bank</Text>
         <Pressable
-          onPress={() => {
-            setNewWord("");
-            setAddModal(true);
-          }}
+          onPress={() => router.push("/(teacher)/wordbank/new" as any)}
           style={({ pressed }) => [styles.addBtn, pressed && { opacity: 0.85 }]}
           accessibilityRole="button"
           accessibilityLabel="Add a word"
@@ -176,7 +163,6 @@ export default function WordBankScreen() {
         }
         renderItem={({ item }) => (
           <View style={styles.wordCard}>
-            {/* Braille dots preview */}
             <View style={styles.wordBraillePreview}>
               <BrailleCell
                 pattern={[]}
@@ -215,70 +201,7 @@ export default function WordBankScreen() {
         }
       />
 
-      {/* Add word modal */}
-      <Modal
-        visible={addModal}
-        animationType="slide"
-        transparent
-        onRequestClose={() => setAddModal(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <Pressable
-            style={styles.backdrop}
-            onPress={() => setAddModal(false)}
-          />
-          <KeyboardAvoidingView style={styles.keyboardSheet} behavior="padding">
-            <View style={styles.sheet}>
-              <View style={styles.handle} />
-              <Text style={styles.sheetTitle}>Add to Word Bank</Text>
-              <Text style={styles.sheetSub}>
-                Words saved here can be picked when building session word lists.
-              </Text>
-              <TextInput
-                style={styles.wordInput}
-                value={newWord}
-                onChangeText={(v) => setNewWord(v.toUpperCase())}
-                placeholder="TYPE A WORD"
-                placeholderTextColor={C.muted}
-                autoFocus
-                autoCapitalize="characters"
-                autoCorrect={false}
-                returnKeyType="done"
-                onSubmitEditing={addWord}
-              />
-              <View style={styles.sheetActions}>
-                <Pressable
-                  onPress={() => setAddModal(false)}
-                  style={({ pressed }) => [
-                    styles.sheetBtn,
-                    styles.btnCancel,
-                    pressed && { opacity: 0.7 },
-                  ]}
-                >
-                  <Text style={styles.btnCancelText}>Cancel</Text>
-                </Pressable>
-                <Pressable
-                  onPress={addWord}
-                  disabled={saving || !newWord.trim()}
-                  style={({ pressed }) => [
-                    styles.sheetBtn,
-                    styles.btnConfirm,
-                    (!newWord.trim() || saving) && { opacity: 0.5 },
-                    pressed && { opacity: 0.85 },
-                  ]}
-                >
-                  {saving ? (
-                    <ActivityIndicator color="#1A1200" />
-                  ) : (
-                    <Text style={styles.btnConfirmText}>Save Word</Text>
-                  )}
-                </Pressable>
-              </View>
-            </View>
-          </KeyboardAvoidingView>
-        </View>
-      </Modal>
-      {/* Delete confirmation modal */}
+      {/* Delete confirmation modal (kept as modal — it's just a quick confirm) */}
       <Modal
         visible={deleteModal}
         animationType="slide"
@@ -293,16 +216,13 @@ export default function WordBankScreen() {
           <View style={styles.sheet}>
             <View style={styles.handle} />
 
-            {/* Word preview */}
             <View style={styles.deleteWordPreview}>
               <Text style={styles.deleteWordText}>{wordToDelete?.word}</Text>
             </View>
 
             <Text style={styles.deleteTitle}>Remove from Word Bank?</Text>
             <Text style={styles.deleteSub}>
-              {
-                "This word will be removed from your bank. It won't affect sessions that have already used it."
-              }
+              {"This word will be removed from your bank. It won't affect sessions that have already used it."}
             </Text>
 
             <View style={styles.sheetActions}>
@@ -444,8 +364,8 @@ const styles = StyleSheet.create({
     lineHeight: 22,
   },
 
+  // Delete modal
   modalOverlay: { flex: 1, justifyContent: "flex-end" },
-  keyboardSheet: { flex: 1, justifyContent: "flex-end" },
   backdrop: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: "rgba(0,0,0,0.45)",
@@ -466,27 +386,7 @@ const styles = StyleSheet.create({
     alignSelf: "center",
     marginBottom: 4,
   },
-  sheetTitle: { fontFamily: fonts.heading, fontSize: 20, color: C.navy },
-  sheetSub: {
-    fontFamily: fonts.body,
-    fontSize: 13,
-    color: C.muted,
-    lineHeight: 20,
-  },
-  wordInput: {
-    fontFamily: fonts.mono,
-    fontSize: 18,
-    color: C.ink,
-    letterSpacing: 3,
-    backgroundColor: C.bg,
-    borderWidth: 1.5,
-    borderColor: C.border,
-    borderRadius: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    textAlign: "center",
-  },
-  sheetActions: { flexDirection: "row", gap: 10 },
+  sheetActions: { flexDirection: "row", gap: 10, marginTop: 4 },
   sheetBtn: {
     flex: 1,
     borderRadius: 12,
@@ -494,11 +394,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   btnCancel: { backgroundColor: C.bg, borderWidth: 1.5, borderColor: C.border },
-  btnConfirm: { backgroundColor: C.amber },
   btnCancelText: { fontFamily: fonts.heading, fontSize: 15, color: C.navy },
-  btnConfirmText: { fontFamily: fonts.heading, fontSize: 15, color: "#1A1200" },
+  btnDelete: { backgroundColor: C.red },
+  btnDeleteText: { fontFamily: fonts.heading, fontSize: 15, color: C.white },
 
-  // Delete modal
   deleteWordPreview: {
     alignSelf: "center",
     backgroundColor: C.redBg,
@@ -527,6 +426,4 @@ const styles = StyleSheet.create({
     textAlign: "center",
     lineHeight: 20,
   },
-  btnDelete: { backgroundColor: C.red },
-  btnDeleteText: { fontFamily: fonts.heading, fontSize: 15, color: C.white },
 });
