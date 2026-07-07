@@ -25,10 +25,10 @@ import { supabase } from "../../../lib/supabase";
 import { colors as C, fonts } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
 import { BrailleLoader } from "../../../components/BrailleLoader";
+import { Toast } from "../../../components/Toast";
 import { wordToChunks, getPattern, isValidWord } from "../../../lib/braille";
-import DraggableFlatList, {
-  ScaleDecorator,
-} from "react-native-draggable-flatlist";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -123,6 +123,18 @@ export default function SessionDetail() {
   const [wordListIndex, setWordListIndex] = useState(0);
   const [wordSent, setWordSent] = useState(false);
 
+  // The most recently *sent* word — used on the Paused card for context recovery.
+  // Set in doSendWord() and restored from AsyncStorage in restoreWordPosition().
+  // Distinct from manualWord (text input value) and wordListIndex (list position).
+  const [lastSentWord, setLastSentWord] = useState("");
+
+  // Tracks which words have been broadcast this session run (for dup detection)
+  const sentWords = useRef<Set<string>>(new Set()).current;
+
+  // Duplicate word modal
+  const [dupWordModal, setDupWordModal] = useState(false);
+  const [dupWord, setDupWord] = useState("");
+
   // ── Live attempt feed ───────────────────────────────────────────────────────
   const [liveAttempts, setLiveAttempts] = useState<WordAttempt[]>([]);
 
@@ -144,6 +156,37 @@ export default function SessionDetail() {
   const [statsData, setStatsData] = useState<StudentSessionStats | null>(null);
   const [loadingStats, setLoadingStats] = useState(false);
 
+  // ── Auto-pause: app background + navigation away ────────────────────────────
+  // sessionStatusRef mirrors session.status without stale-closure issues so
+  // useFocusEffect / AppState cleanup callbacks always read the latest value.
+  const appStateRef      = useRef(AppState.currentState);
+  const sessionStatusRef = useRef<string | null>(null);
+  useEffect(() => {
+    sessionStatusRef.current = session?.status ?? null;
+  }, [session?.status]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", async (next) => {
+      if (
+        (next === "background" || next === "inactive") &&
+        appStateRef.current === "active" &&
+        sessionStatusRef.current === "in_progress"
+      ) {
+        // Direct DB update + local state (ref-safe, no stale closure)
+        await supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
+        setSession((prev) => (prev ? { ...prev, status: "paused" } : prev));
+      }
+      appStateRef.current = next;
+    });
+    return () => sub.remove();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  // ── Finish session modal ────────────────────────────────────────────────────
+  const [finishSessionModal, setFinishSessionModal] = useState(false);
+  const [finishingSession, setFinishingSession] = useState(false);
+  const [finishToast, setFinishToast] = useState<{ name: string } | null>(null);
+
   // ── Delete session modal ────────────────────────────────────────────────────
   const [deleteSessionModal, setDeleteSessionModal] = useState(false);
   const [deletingSession, setDeletingSession] = useState(false);
@@ -161,22 +204,8 @@ export default function SessionDetail() {
   const [deleteWordModal, setDeleteWordModal] = useState(false);
   const [wordToRemove, setWordToRemove] = useState<SessionWord | null>(null);
 
-  // ── Auto-pause on background ────────────────────────────────────────────────
-  const appStateRef = useRef(AppState.currentState);
-  useEffect(() => {
-    const sub = AppState.addEventListener("change", (next) => {
-      if (
-        (next === "background" || next === "inactive") &&
-        appStateRef.current === "active" &&
-        session?.status === "in_progress"
-      ) {
-        pauseSession(true);
-      }
-      appStateRef.current = next;
-    });
-    return () => sub.remove();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session?.status]);
+
+
 
   // ── Load data ───────────────────────────────────────────────────────────────
 
@@ -215,23 +244,94 @@ export default function SessionDetail() {
       device: devicesData.find((d) => d.paired_student_id === s.id) ?? null,
     }));
 
-    setSession(sessionRes.data);
+    const fetchedSession = sessionRes.data;
+    const fetchedWords: SessionWord[] = wordsRes.data ?? [];
+
+    setSession(fetchedSession);
     setAllStudents(merged);
     setAssignedIds(new Set((assignedRes.data ?? []).map((r) => r.student_id)));
-    setSessionWords(wordsRes.data ?? []);
+    setSessionWords(fetchedWords);
     setLoading(false);
     setRefreshing(false);
+
+    // Restore last-broadcast word whenever the session is active or just resumed
+    if (
+      (fetchedSession?.status === "in_progress" ||
+        fetchedSession?.status === "paused") &&
+      fetchedWords.length > 0
+    ) {
+      await restoreWordPosition(id, fetchedWords);
+    }
   }, [id]);
+
+  // ── Restore last-sent word from AsyncStorage ────────────────────────────────
+  // Reads the per-session key saved on every broadcastChunk (or sendWord when
+  // no devices are connected) so the teacher UI always reflects the last word,
+  // regardless of device connectivity or app restart.
+  async function restoreWordPosition(sessionId: string, words: SessionWord[]) {
+    try {
+      const raw = await AsyncStorage.getItem(`session_word_pos_${sessionId}`);
+
+      // Pre-populate sentWords from DB records (manual sessions track history)
+      words.forEach((sw) => sentWords.add(sw.word));
+
+      if (!raw) return;
+
+      const pos = JSON.parse(raw) as {
+        word: string;
+        chunkIndex: number;
+      };
+
+      // Snap wordListIndex for word_list sessions
+      const idx = words.findIndex((sw) => sw.word === pos.word);
+      if (idx !== -1) setWordListIndex(idx);
+
+      // Restore braille display state
+      const restoredChunks = wordToChunks(pos.word);
+      setChunks(restoredChunks);
+      setChunkIndex(pos.chunkIndex ?? 0);
+      setWordSent(true);
+
+      // Restore manual word input
+      setManualWord(pos.word);
+
+      // Fix 3: restore lastSentWord so the Paused card always shows the correct
+      // word regardless of session type (manual or word_list).
+      setLastSentWord(pos.word);
+    } catch {
+      // Silently ignore storage errors
+    }
+  }
+
+  // ── Persist word position to AsyncStorage ─────────────────────────────────
+  async function saveWordPosition(sessionId: string, word: string, chunkIndex: number) {
+    try {
+      await AsyncStorage.setItem(
+        `session_word_pos_${sessionId}`,
+        JSON.stringify({ word, chunkIndex }),
+      );
+    } catch {
+      // Silently ignore storage errors
+    }
+  }
 
   useEffect(() => {
     loadData();
   }, [loadData]);
 
-  // Reload whenever the screen comes back into focus (e.g. returning from add-word)
+  // On focus: reload data. On blur (navigate away): auto-pause if in_progress.
+  // The cleanup return fires for every navigation-away event (back, tab switch,
+  // dashboard tap, etc.) — this is the primary pause trigger.
   useFocusEffect(
     useCallback(() => {
       loadData();
-    }, [loadData])
+      return () => {
+        if (sessionStatusRef.current === "in_progress") {
+          // Fire-and-forget — no await in cleanup
+          supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
+        }
+      };
+    }, [loadData, id])
   );
 
   // ── Realtime subscriptions ──────────────────────────────────────────────────
@@ -359,6 +459,10 @@ export default function SessionDetail() {
   }
 
   async function pauseSession(auto = false) {
+    // Fix 5: eagerly update the ref so the useFocusEffect cleanup callback
+    // (which fires on immediate navigation after a manual pause) reads the
+    // correct status and does not double-fire the DB update.
+    sessionStatusRef.current = "paused";
     await supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
     // [REALTIME] Send pause command to all devices
     if (!auto) await loadData();
@@ -366,34 +470,36 @@ export default function SessionDetail() {
   }
 
   async function resumeSession() {
+    // Fix 6: eagerly update the ref so that any race between resume and
+    // immediate navigation is handled correctly (the cleanup will see
+    // in_progress and will re-pause, which is the desired behaviour).
+    sessionStatusRef.current = "in_progress";
     await supabase
       .from("sessions")
       .update({ status: "in_progress" })
       .eq("id", id!);
     await loadData();
+    // Position is already restored inside loadData via restoreWordPosition
   }
 
   function confirmFinish() {
-    Alert.alert(
-      "Finish Session",
-      "Mark this session as finished? This cannot be undone.",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Finish",
-          onPress: async () => {
-            await supabase
-              .from("sessions")
-              .update({
-                status: "finished",
-                finished_at: new Date().toISOString(),
-              })
-              .eq("id", id!);
-            await loadData();
-          },
-        },
-      ],
-    );
+    setFinishSessionModal(true);
+  }
+
+  async function executeFinishSession() {
+    setFinishingSession(true);
+    const sessionName = session?.name ?? "Session";
+    await supabase
+      .from("sessions")
+      .update({
+        status: "finished",
+        finished_at: new Date().toISOString(),
+      })
+      .eq("id", id!);
+    await loadData();
+    setFinishingSession(false);
+    setFinishSessionModal(false);
+    setFinishToast({ name: sessionName });
   }
 
   // ── Send word to devices ────────────────────────────────────────────────────
@@ -404,12 +510,19 @@ export default function SessionDetail() {
       Alert.alert("Invalid word", "Only letters A–Z are supported.");
       return;
     }
+    // Duplicate check — show confirm modal instead of silently re-sending
+    if (sentWords.has(w)) {
+      setDupWord(w);
+      setDupWordModal(true);
+      return;
+    }
+    await doSendWord(w);
+  }
 
-    // Record word history for manual sessions
-    if (
-      session?.type === "manual" &&
-      !sessionWords.find((sw) => sw.word === w)
-    ) {
+  // Internal: broadcasts the word; also called on "Re-send Anyway"
+  async function doSendWord(w: string) {
+    // Record history for manual sessions
+    if (session?.type === "manual" && !sessionWords.find((sw) => sw.word === w)) {
       const { data: wordData } = await supabase
         .from("session_words")
         .insert({ session_id: id, word: w, order_index: sessionWords.length })
@@ -417,11 +530,15 @@ export default function SessionDetail() {
         .single();
       if (wordData) setSessionWords((prev) => [...prev, wordData]);
     }
-
+    sentWords.add(w);
+    // Fix 2: track the last *actually sent* word so the Paused card always
+    // displays accurate context, independent of list position or input state.
+    setLastSentWord(w);
     const newChunks = wordToChunks(w);
     setChunks(newChunks);
     setChunkIndex(0);
     setWordSent(true);
+    await saveWordPosition(id!, w, 0);
     await broadcastChunk(newChunks, 0, w);
   }
 
@@ -432,6 +549,8 @@ export default function SessionDetail() {
       session?.type === "manual"
         ? manualWord
         : (sessionWords[wordListIndex]?.word ?? "");
+    // Persist chunk position so resume always shows the exact chunk
+    await saveWordPosition(id!, word, newIdx);
     await broadcastChunk(chunks, newIdx, word);
   }
 
@@ -488,6 +607,114 @@ export default function SessionDetail() {
 
   const filteredBank = [] as WordBankItem[]; // word bank is now on add-word screen
 
+  // ── DUPLICATE WORD MODAL ────────────────────────────────────────────────────
+  const DupWordModal = (
+    <Modal
+      visible={dupWordModal}
+      animationType="slide"
+      transparent
+      onRequestClose={() => setDupWordModal(false)}
+    >
+      <View style={styles.modalOverlay}>
+        <Pressable style={styles.backdrop} onPress={() => setDupWordModal(false)} />
+        <View style={styles.sheet}>
+          <View style={styles.handle} />
+          {/* Word pill preview */}
+          <View style={styles.dupWordPreview}>
+            <Ionicons name="repeat-outline" size={22} color={C.brown} />
+            <Text style={styles.dupWordPreviewText}>{dupWord}</Text>
+          </View>
+          <Text style={styles.deleteTitle}>Already sent this session</Text>
+          <Text style={styles.deleteSub}>
+            {"You already sent "}{dupWord ? `"${dupWord}"` : "this word"}{" to devices earlier. Would you like to re-send it?"}
+          </Text>
+          <View style={styles.sheetActions}>
+            <Pressable
+              onPress={() => setDupWordModal(false)}
+              style={({ pressed }) => [
+                styles.sheetBtn,
+                styles.btnNotYet,
+                pressed && { opacity: 0.7 },
+              ]}
+            >
+              <Text style={styles.btnNotYetText}>Cancel</Text>
+            </Pressable>
+            <Pressable
+              onPress={async () => {
+                setDupWordModal(false);
+                sentWords.delete(dupWord); // allow re-send
+                await doSendWord(dupWord);
+              }}
+              style={({ pressed }) => [
+                styles.sheetBtn,
+                styles.btnConfirm,
+                pressed && { opacity: 0.85 },
+              ]}
+            >
+              <Text style={styles.btnConfirmText}>Re-send Anyway</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+
+  // ── FINISH SESSION MODAL ────────────────────────────────────────────────────
+  const FinishSessionModal = (
+    <Modal
+      visible={finishSessionModal}
+      animationType="slide"
+      transparent
+      onRequestClose={() => setFinishSessionModal(false)}
+    >
+      <View style={styles.modalOverlay}>
+        <Pressable
+          style={styles.backdrop}
+          onPress={() => setFinishSessionModal(false)}
+        />
+        <View style={styles.sheet}>
+          <View style={styles.handle} />
+          <View style={styles.finishPreview}>
+            <Ionicons name="flag-outline" size={28} color={C.green} />
+            <Text style={styles.finishPreviewText}>{session?.name}</Text>
+          </View>
+          <Text style={styles.deleteTitle}>Finish this session?</Text>
+          <Text style={styles.deleteSub}>
+            {"Mark this session as finished. Students will no longer be able to respond. This cannot be undone."}
+          </Text>
+          <View style={styles.sheetActions}>
+            <Pressable
+              onPress={() => setFinishSessionModal(false)}
+              style={({ pressed }) => [
+                styles.sheetBtn,
+                styles.btnNotYet,
+                pressed && { opacity: 0.7 },
+              ]}
+            >
+              <Text style={styles.btnNotYetText}>Not Yet</Text>
+            </Pressable>
+            <Pressable
+              onPress={executeFinishSession}
+              disabled={finishingSession}
+              style={({ pressed }) => [
+                styles.sheetBtn,
+                styles.btnFinishConfirm,
+                finishingSession && { opacity: 0.6 },
+                pressed && !finishingSession && { opacity: 0.85 },
+              ]}
+            >
+              {finishingSession ? (
+                <ActivityIndicator color={C.white} />
+              ) : (
+                <Text style={styles.btnFinishConfirmText}>Finish Session</Text>
+              )}
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+
   // ── DELETE SESSION MODAL (shared across all status views) ───────────────────
   const DeleteSessionModal = (
     <Modal
@@ -523,32 +750,32 @@ export default function SessionDetail() {
           )}
           <View style={styles.sheetActions}>
             <Pressable
-              onPress={() => setDeleteSessionModal(false)}
-              style={({ pressed }) => [
-                styles.sheetBtn,
-                styles.btnCancel,
-                pressed && { opacity: 0.7 },
-              ]}
-            >
-              <Text style={styles.btnCancelText}>Keep It</Text>
-            </Pressable>
-            <Pressable
               onPress={executeDeleteSession}
               disabled={deletingSession || deleteCountdown > 0}
               style={({ pressed }) => [
                 styles.sheetBtn,
-                styles.btnDelete,
-                (deleteCountdown > 0 || deletingSession) && styles.btnDeleteDisabled,
-                pressed && deleteCountdown === 0 && { opacity: 0.8 },
+                styles.btnDestructive,
+                (deleteCountdown > 0 || deletingSession) && styles.btnDestructiveDisabled,
+                pressed && deleteCountdown === 0 && { opacity: 0.85 },
               ]}
             >
               {deletingSession ? (
-                <ActivityIndicator color={C.white} />
+                <ActivityIndicator color={C.red} />
               ) : (
-                <Text style={styles.btnDeleteText}>
+                <Text style={styles.btnDestructiveText}>
                   {deleteCountdown > 0 ? `Delete (${deleteCountdown})` : "Delete"}
                 </Text>
               )}
+            </Pressable>
+            <Pressable
+              onPress={() => setDeleteSessionModal(false)}
+              style={({ pressed }) => [
+                styles.sheetBtn,
+                styles.btnKeep,
+                pressed && { opacity: 0.85 },
+              ]}
+            >
+              <Text style={styles.btnKeepText}>Keep It</Text>
             </Pressable>
           </View>
         </View>
@@ -713,96 +940,61 @@ export default function SessionDetail() {
 
               {sessionWords.length > 0 && (
                 <View style={styles.wordListContainer}>
-                  <DraggableFlatList
-                    data={sessionWords}
-                    keyExtractor={(item) => item.id}
-                    scrollEnabled={false}
-                    onDragEnd={async ({ data }) => {
-                      const updated = data.map((w, i) => ({
-                        ...w,
-                        order_index: i,
-                      }));
-                      setSessionWords(updated);
-                      await Promise.all(
-                        updated.map((w) =>
-                          supabase
-                            .from("session_words")
-                            .update({ order_index: w.order_index })
-                            .eq("id", w.id),
-                        ),
-                      );
-                    }}
-                    renderItem={({ item: sw, drag, isActive, getIndex }) => {
-                      const i = getIndex() ?? 0;
-                      return (
-                        <ScaleDecorator activeScale={1.03}>
-                          <View
-                            style={[
-                              styles.wordRow,
-                              isActive && styles.wordRowActive,
-                            ]}
-                          >
-                            <Pressable
-                              onLongPress={drag}
-                              delayLongPress={150}
-                              style={styles.dragHandle}
-                              hitSlop={6}
-                              accessibilityLabel="Hold to reorder"
-                            >
-                              <Ionicons
-                                name="menu"
-                                size={18}
-                                color={isActive ? C.navy : C.muted}
-                              />
-                            </Pressable>
-                            <Text style={styles.wordIndex}>
-                              {String(i + 1).padStart(2, "0")}
-                            </Text>
-                            <Text style={styles.wordText}>{sw.word}</Text>
-                            <Pressable
-                              onPress={() => {
-                                setWordToRemove(sw);
-                                setDeleteWordModal(true);
-                              }}
-                              hitSlop={8}
-                              style={({ pressed }) => [
-                                { opacity: pressed ? 0.5 : 1 },
-                              ]}
-                            >
-                              <Ionicons
-                                name="trash-outline"
-                                size={16}
-                                color={C.red}
-                              />
-                            </Pressable>
-                          </View>
-                        </ScaleDecorator>
-                      );
-                    }}
-                  />
-                </View>
-              )}
-              {sessionWords.length > 1 && (
-                <View style={styles.reorderHint}>
-                  <Ionicons name="menu" size={12} color={C.muted} />
-                  <Text style={styles.reorderHintText}>
-                    Hold the ≡ handle to reorder words
-                  </Text>
+                  {sessionWords.map((sw, i) => (
+                    <View key={sw.id} style={styles.wordRow}>
+                      <Text style={styles.wordIndex}>
+                        {String(i + 1).padStart(2, "0")}
+                      </Text>
+                      <Text style={styles.wordText}>{sw.word}</Text>
+                      <Pressable
+                        onPress={() => {
+                          setWordToRemove(sw);
+                          setDeleteWordModal(true);
+                        }}
+                        hitSlop={8}
+                        style={({ pressed }) => [
+                          { opacity: pressed ? 0.5 : 1 },
+                        ]}
+                      >
+                        <Ionicons
+                          name="trash-outline"
+                          size={16}
+                          color={C.red}
+                        />
+                      </Pressable>
+                    </View>
+                  ))}
                 </View>
               )}
 
-              <Pressable
-                onPress={openAddWord}
-                style={({ pressed }) => [
-                  styles.addWordBtn,
-                  pressed && { opacity: 0.85 },
-                ]}
-              >
-                <Ionicons name="add" size={16} color={C.navy} />
-                <Text style={styles.addWordBtnText}>Add Word</Text>
-              </Pressable>
+              <View style={styles.wordListActions}>
+                <Pressable
+                  onPress={openAddWord}
+                  style={({ pressed }) => [
+                    styles.addWordBtn,
+                    { flex: 1 },
+                    pressed && { opacity: 0.85 },
+                  ]}
+                >
+                  <Ionicons name="add" size={16} color={C.navy} />
+                  <Text style={styles.addWordBtnText}>Add Word</Text>
+                </Pressable>
+                {sessionWords.length > 1 && (
+                  <Pressable
+                    onPress={openAddWord}
+                    style={({ pressed }) => [
+                      styles.reorderBtn,
+                      pressed && { opacity: 0.85 },
+                    ]}
+                  >
+                    <Ionicons name="menu" size={16} color={C.navy} />
+                    <Text style={styles.reorderBtnText}>Reorder</Text>
+                  </Pressable>
+                )}
+              </View>
             </>
           )}
+
 
           {/* Launch button */}
           <Pressable
@@ -827,6 +1019,15 @@ export default function SessionDetail() {
 
         {/* ── Delete session modal ───────────────────────────────────────────── */}
         {DeleteSessionModal}
+
+        {/* ── Finish toast ─────────────────────────────────────────────────────── */}
+        <Toast
+          message="Session finished"
+          detail={finishToast?.name}
+          visible={!!finishToast}
+          variant="success"
+          onDismiss={() => setFinishToast(null)}
+        />
 
         {/* ── Word delete confirmation modal ─────────────────────────────────── */}
         <Modal
@@ -876,11 +1077,11 @@ export default function SessionDetail() {
                   }}
                   style={({ pressed }) => [
                     styles.sheetBtn,
-                    styles.btnDelete,
+                    styles.btnDestructive,
                     pressed && { opacity: 0.8 },
                   ]}
                 >
-                  <Text style={styles.btnDeleteText}>Remove</Text>
+                  <Text style={styles.btnDestructiveText}>Remove</Text>
                 </Pressable>
               </View>
             </View>
@@ -903,6 +1104,18 @@ export default function SessionDetail() {
             <Ionicons name="pause-circle" size={52} color={C.amber} />
             <Text style={styles.pausedTitle}>Session Paused</Text>
             <Text style={styles.pausedSub}>{session.name}</Text>
+
+            {/* Last word context — Fix 4: use lastSentWord (set in doSendWord
+                and restored in restoreWordPosition) instead of the fragile
+                manualWord/sessionWords fallback that could show the last word
+                in the list rather than the last *sent* word. */}
+            <View style={styles.pausedLastWord}>
+              <Text style={styles.pausedLastWordLabel}>Last word sent</Text>
+              <Text style={styles.pausedLastWordValue}>
+                {lastSentWord || "—"}
+              </Text>
+            </View>
+
             <View style={styles.pausedActions}>
               <Pressable
                 onPress={resumeSession}
@@ -927,6 +1140,15 @@ export default function SessionDetail() {
           </View>
         </View>
         {DeleteSessionModal}
+        {DupWordModal}
+        {FinishSessionModal}
+        <Toast
+          message="Session finished"
+          detail={finishToast?.name}
+          visible={!!finishToast}
+          variant="success"
+          onDismiss={() => setFinishToast(null)}
+        />
       </SafeAreaView>
     );
 
@@ -939,6 +1161,13 @@ export default function SessionDetail() {
       <SafeAreaView style={styles.safe} edges={["top"]}>
         {Header}
         {DeleteSessionModal}
+        <Toast
+          message="Session finished"
+          detail={finishToast?.name}
+          visible={!!finishToast}
+          variant="success"
+          onDismiss={() => setFinishToast(null)}
+        />
         <ScrollView contentContainerStyle={styles.scroll}>
           <View style={styles.infoCard}>
             <Text style={styles.sessionName}>{session.name}</Text>
@@ -956,6 +1185,40 @@ export default function SessionDetail() {
               </Text>
             </View>
           </View>
+
+          {/* ── Words sent during session ──────────────────────── */}
+          <Text style={styles.sectionLabel}>WORDS SENT</Text>
+          {sessionWords.length === 0 ? (
+            <View style={[styles.infoCard, { alignItems: "center", paddingVertical: 20 }]}>
+              <Ionicons name="text-outline" size={28} color={C.muted} />
+              <Text style={[styles.emptyHint, { marginTop: 6 }]}>
+                No words were sent in this session.
+              </Text>
+            </View>
+          ) : (
+            <View style={styles.wordListContainer}>
+              {sessionWords.map((sw, i) => (
+                <View
+                  key={sw.id}
+                  style={[
+                    styles.wordRow,
+                    i < sessionWords.length - 1 && {
+                      borderBottomWidth: 1,
+                      borderBottomColor: C.border,
+                    },
+                  ]}
+                >
+                  <Text style={styles.wordIndex}>
+                    {String(i + 1).padStart(2, "0")}
+                  </Text>
+                  <Text style={[styles.wordText, { letterSpacing: 2 }]}>
+                    {sw.word}
+                  </Text>
+                  {/* Show if any student answered this word */}
+                </View>
+              ))}
+            </View>
+          )}
 
           <Text style={styles.sectionLabel}>PARTICIPANTS</Text>
           <View style={{ gap: 10 }}>
@@ -983,7 +1246,6 @@ export default function SessionDetail() {
           </View>
         </ScrollView>
 
-        {/* Session stats modal */}
         <Modal
           visible={statsModal}
           animationType="slide"
@@ -995,194 +1257,152 @@ export default function SessionDetail() {
               style={styles.backdrop}
               onPress={() => setStatsModal(false)}
             />
-            <View style={[styles.sheet, { maxHeight: "85%" }]}>
+            <View style={[styles.sheet, { maxHeight: "90%" }]}>
               <View style={styles.handle} />
               {loadingStats || !statsData ? (
                 <View style={{ alignItems: "center", paddingVertical: 32 }}>
                   <ActivityIndicator size="large" color={C.navy} />
                 </View>
               ) : (
-                <>
-                  {/* Student identity */}
-                  <View
-                    style={{
-                      flexDirection: "row",
-                      alignItems: "center",
-                      gap: 12,
-                    }}
-                  >
-                    <View
-                      style={[
-                        styles.avatarSmall,
-                        { width: 48, height: 48, borderRadius: 24 },
-                      ]}
-                    >
-                      <Text style={[styles.avatarSmallText, { fontSize: 17 }]}>
-                        {getInitials(statsData.student.full_name)}
-                      </Text>
-                    </View>
-                    <View>
-                      <Text style={styles.sheetTitle}>
-                        {statsData.student.full_name}
-                      </Text>
-                      <Text
-                        style={{
-                          fontFamily: fonts.body,
-                          fontSize: 12,
-                          color: C.muted,
-                        }}
-                      >
-                        This session · {statsData.attempts.length} word
-                        {statsData.attempts.length !== 1 ? "s" : ""}
-                      </Text>
-                    </View>
-                  </View>
+                <FlatList
+                  data={sessionWords}
+                  keyExtractor={(sw) => sw.id}
+                  showsVerticalScrollIndicator={false}
+                  contentContainerStyle={{ gap: 0, paddingBottom: 8 }}
+                  ListHeaderComponent={
+                    <>
+                      {/* Student header */}
+                      <View style={styles.statsStudentHeader}>
+                        <View style={[styles.avatarSmall, { width: 48, height: 48, borderRadius: 24 }]}>
+                          <Text style={[styles.avatarSmallText, { fontSize: 17 }]}>
+                            {getInitials(statsData.student.full_name)}
+                          </Text>
+                        </View>
+                        <View>
+                          <Text style={styles.sheetTitle}>
+                            {statsData.student.full_name}
+                          </Text>
+                          <Text style={{ fontFamily: fonts.body, fontSize: 12, color: C.muted }}>
+                            {sessionWords.length} word{sessionWords.length !== 1 ? "s" : ""} sent this session
+                          </Text>
+                        </View>
+                      </View>
 
-                  {/* Session stats */}
-                  {(() => {
-                    const total = statsData.attempts.length;
-                    const correct = statsData.attempts.filter(
-                      (a) => a.is_correct,
-                    ).length;
-                    const acc =
-                      total > 0 ? Math.round((correct / total) * 100) : 0;
-                    const timed = statsData.attempts.filter(
-                      (a) => (a.response_time_ms ?? 0) > 0,
+                      {/* Summary chips */}
+                      {(() => {
+                        const total   = statsData.attempts.length;
+                        const correct = statsData.attempts.filter((a) => a.is_correct).length;
+                        const acc     = total > 0 ? Math.round((correct / total) * 100) : 0;
+                        const timed   = statsData.attempts.filter((a) => (a.response_time_ms ?? 0) > 0);
+                        const avgMs   = timed.length > 0
+                          ? Math.round(timed.reduce((s, a) => s + (a.response_time_ms ?? 0), 0) / timed.length)
+                          : 0;
+                        return (
+                          <View style={{ flexDirection: "row", gap: 10, marginBottom: 16 }}>
+                            <View style={[styles.statsChip, { backgroundColor: acc >= 80 ? C.greenBg : acc >= 60 ? C.brownBg : total === 0 ? C.bg : C.redBg }]}>
+                              <Text style={[styles.statsChipValue, { color: acc >= 80 ? C.green : acc >= 60 ? C.brown : total === 0 ? C.muted : C.red }]}>
+                                {acc}%
+                              </Text>
+                              <Text style={styles.statsChipLabel}>Accuracy</Text>
+                            </View>
+                            <View style={[styles.statsChip, { backgroundColor: C.blueWash }]}>
+                              <Text style={[styles.statsChipValue, { color: C.navy }]}>
+                                {avgMs > 0 ? avgMs >= 1000 ? `${(avgMs / 1000).toFixed(1)}s` : `${avgMs}ms` : "—"}
+                              </Text>
+                              <Text style={styles.statsChipLabel}>Avg Response</Text>
+                            </View>
+                            <View style={[styles.statsChip, { backgroundColor: C.brownBg }]}>
+                              <Text style={[styles.statsChipValue, { color: C.brown }]}>
+                                {correct}/{total}
+                              </Text>
+                              <Text style={styles.statsChipLabel}>Correct</Text>
+                            </View>
+                          </View>
+                        );
+                      })()}
+
+                      {/* Column headers */}
+                      <View style={styles.reviewTableHeader}>
+                        <Text style={[styles.reviewHeaderCell, { flex: 0.5 }]}>#</Text>
+                        <Text style={[styles.reviewHeaderCell, { flex: 1.4 }]}>WORD</Text>
+                        <Text style={[styles.reviewHeaderCell, { flex: 2 }]}>SPOKEN INPUT</Text>
+                        <Text style={[styles.reviewHeaderCell, { flex: 1 }]}>RESULT</Text>
+                      </View>
+                    </>
+                  }
+                  ListEmptyComponent={
+                    <Text style={styles.emptyHint}>No words sent this session.</Text>
+                  }
+                  renderItem={({ item: sw, index: i }) => {
+                    // Find matching attempt for this word
+                    const attempt = statsData.attempts.find(
+                      (a) => a.word === sw.word
                     );
-                    const avgMs =
-                      timed.length > 0
-                        ? Math.round(
-                            timed.reduce(
-                              (s, a) => s + (a.response_time_ms ?? 0),
-                              0,
-                            ) / timed.length,
-                          )
-                        : 0;
                     return (
-                      <View style={{ flexDirection: "row", gap: 10 }}>
-                        <View
-                          style={[
-                            styles.statsChip,
-                            {
-                              backgroundColor:
-                                acc >= 80
-                                  ? C.greenBg
-                                  : acc >= 60
-                                    ? C.brownBg
-                                    : total === 0
-                                      ? C.bg
-                                      : C.redBg,
-                            },
-                          ]}
-                        >
-                          <Text
+                      <View
+                        style={[
+                          styles.reviewRow,
+                          i % 2 === 0 && { backgroundColor: C.bg },
+                        ]}
+                      >
+                        {/* # */}
+                        <Text style={[styles.reviewCell, { flex: 0.5, color: C.muted, fontSize: 11 }]}>
+                          {String(i + 1).padStart(2, "0")}
+                        </Text>
+
+                        {/* Word sent */}
+                        <Text style={[styles.reviewCell, { flex: 1.4, fontFamily: fonts.mono, letterSpacing: 1.5, color: C.navy }]}>
+                          {sw.word}
+                        </Text>
+
+                        {/* Spoken input — placeholder until STT/firmware ready */}
+                        {attempt ? (
+                          <View style={{ flex: 2, flexDirection: "row", alignItems: "center", gap: 5 }}>
+                            <Ionicons
+                              name={attempt.is_correct ? "mic" : "mic-outline"}
+                              size={11}
+                              color={attempt.is_correct ? C.green : C.muted}
+                            />
+                            <Text
+                              style={[styles.reviewCell, {
+                                flex: 1,
+                                color: attempt.is_correct ? C.green : C.red,
+                                fontFamily: fonts.body,
+                              }]}
+                            >
+                              {attempt.is_correct ? sw.word : "(incorrect)"}
+                            </Text>
+                          </View>
+                        ) : (
+                          <View style={[styles.reviewVoicePlaceholder, { flex: 2 }]}>
+                            <Ionicons name="mic-off-outline" size={11} color={C.muted} />
+                            <Text style={styles.reviewVoicePlaceholderText}>
+                              voice input soon
+                            </Text>
+                          </View>
+                        )}
+
+                        {/* Result badge */}
+                        {attempt ? (
+                          <View
                             style={[
-                              styles.statsChipValue,
-                              {
-                                color:
-                                  acc >= 80
-                                    ? C.green
-                                    : acc >= 60
-                                      ? C.brown
-                                      : total === 0
-                                        ? C.muted
-                                        : C.red,
-                              },
+                              styles.resultBadge,
+                              { flex: 1, backgroundColor: attempt.is_correct ? C.greenBg : C.redBg },
                             ]}
                           >
-                            {acc}%
-                          </Text>
-                          <Text style={styles.statsChipLabel}>Accuracy</Text>
-                        </View>
-                        <View
-                          style={[
-                            styles.statsChip,
-                            { backgroundColor: C.blueWash },
-                          ]}
-                        >
-                          <Text
-                            style={[styles.statsChipValue, { color: C.navy }]}
-                          >
-                            {avgMs > 0
-                              ? avgMs >= 1000
-                                ? `${(avgMs / 1000).toFixed(1)}s`
-                                : `${avgMs}ms`
-                              : "—"}
-                          </Text>
-                          <Text style={styles.statsChipLabel}>
-                            Avg Response
-                          </Text>
-                        </View>
-                        <View
-                          style={[
-                            styles.statsChip,
-                            { backgroundColor: C.brownBg },
-                          ]}
-                        >
-                          <Text
-                            style={[styles.statsChipValue, { color: C.brown }]}
-                          >
-                            {correct}/{total}
-                          </Text>
-                          <Text style={styles.statsChipLabel}>Correct</Text>
-                        </View>
+                            <Text style={[styles.resultBadgeText, { color: attempt.is_correct ? C.green : C.red }]}>
+                              {attempt.is_correct ? "✓ Correct" : "✗ Wrong"}
+                            </Text>
+                          </View>
+                        ) : (
+                          <View style={[styles.resultBadge, { flex: 1, backgroundColor: C.border }]}>
+                            <Text style={[styles.resultBadgeText, { color: C.muted }]}>—</Text>
+                          </View>
+                        )}
                       </View>
                     );
-                  })()}
-
-                  {/* Attempts list */}
-                  <FlatList
-                    data={statsData.attempts}
-                    keyExtractor={(a) => a.id}
-                    style={{ maxHeight: 280 }}
-                    ItemSeparatorComponent={() => (
-                      <View style={{ height: 8 }} />
-                    )}
-                    ListEmptyComponent={
-                      <Text style={styles.emptyHint}>
-                        No attempts recorded for this session.
-                      </Text>
-                    }
-                    renderItem={({ item: a }) => (
-                      <View style={styles.attemptRow}>
-                        <View
-                          style={[
-                            styles.attemptDot,
-                            { backgroundColor: a.is_correct ? C.green : C.red },
-                          ]}
-                        />
-                        <Text style={styles.attemptWord}>{a.word}</Text>
-                        <View style={{ flex: 1 }} />
-                        {a.response_time_ms != null && (
-                          <Text style={styles.attemptTime}>
-                            {a.response_time_ms >= 1000
-                              ? `${(a.response_time_ms / 1000).toFixed(1)}s`
-                              : `${a.response_time_ms}ms`}
-                          </Text>
-                        )}
-                        <View
-                          style={[
-                            styles.resultBadge,
-                            {
-                              backgroundColor: a.is_correct
-                                ? C.greenBg
-                                : C.redBg,
-                            },
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              styles.resultBadgeText,
-                              { color: a.is_correct ? C.green : C.red },
-                            ]}
-                          >
-                            {a.is_correct ? "Correct" : "Wrong"}
-                          </Text>
-                        </View>
-                      </View>
-                    )}
-                  />
-                </>
+                  }}
+                />
               )}
             </View>
           </View>
@@ -1354,9 +1574,12 @@ export default function SessionDetail() {
             <View style={styles.wordNavRow}>
               <Pressable
                 onPress={() => {
-                  setWordListIndex((i) => Math.max(0, i - 1));
+                  const newIdx = Math.max(0, wordListIndex - 1);
+                  setWordListIndex(newIdx);
                   setWordSent(false);
                   setChunks([]);
+                  // Save navigation position so resume lands on the same word
+                  saveWordPosition(id!, sessionWords[newIdx]?.word ?? "", 0);
                 }}
                 disabled={wordListIndex === 0}
                 style={({ pressed }) => [
@@ -1400,11 +1623,12 @@ export default function SessionDetail() {
               </View>
               <Pressable
                 onPress={() => {
-                  setWordListIndex((i) =>
-                    Math.min(sessionWords.length - 1, i + 1),
-                  );
+                  const newIdx = Math.min(sessionWords.length - 1, wordListIndex + 1);
+                  setWordListIndex(newIdx);
                   setWordSent(false);
                   setChunks([]);
+                  // Save navigation position so resume lands on the same word
+                  saveWordPosition(id!, sessionWords[newIdx]?.word ?? "", 0);
                 }}
                 disabled={wordListIndex === sessionWords.length - 1}
                 style={({ pressed }) => [
@@ -1506,6 +1730,8 @@ export default function SessionDetail() {
           </View>
         )}
       </ScrollView>
+      {DupWordModal}
+      {FinishSessionModal}
     </SafeAreaView>
   );
 }
@@ -1630,15 +1856,6 @@ const styles = StyleSheet.create({
     borderBottomColor: C.border,
     backgroundColor: C.white,
   },
-  wordRowActive: {
-    backgroundColor: C.blueWash,
-    elevation: 4,
-    shadowColor: C.navy,
-    shadowOpacity: 0.15,
-    shadowRadius: 8,
-    borderRadius: 10,
-  },
-  dragHandle: { padding: 4 },
   wordIndex: {
     fontFamily: fonts.mono,
     fontSize: 12,
@@ -1653,6 +1870,10 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
   },
   deleteBtn: { padding: 6, borderRadius: 8, backgroundColor: C.redBg },
+  wordListActions: {
+    flexDirection: "row",
+    gap: 10,
+  },
   addWordBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -1666,13 +1887,19 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   addWordBtnText: { fontFamily: fonts.heading, fontSize: 14, color: C.navy },
-  reorderHint: {
+  reorderBtn: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 5,
+    gap: 6,
+    borderRadius: 12,
+    paddingVertical: 13,
+    paddingHorizontal: 16,
+    backgroundColor: C.blueWash,
+    borderWidth: 1.5,
+    borderColor: C.navy,
     justifyContent: "center",
   },
-  reorderHintText: { fontFamily: fonts.body, fontSize: 11, color: C.muted },
+  reorderBtnText: { fontFamily: fonts.heading, fontSize: 14, color: C.navy },
 
   // Manual session history
   historyRow: {
@@ -1760,6 +1987,30 @@ const styles = StyleSheet.create({
   },
   pausedTitle: { fontFamily: fonts.heading, fontSize: 22, color: C.navy },
   pausedSub: { fontFamily: fonts.body, fontSize: 14, color: C.muted },
+  pausedLastWord: {
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: C.blueWash,
+    borderRadius: 12,
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    width: "100%",
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  pausedLastWordLabel: {
+    fontFamily: fonts.mono,
+    fontSize: 9,
+    color: C.muted,
+    letterSpacing: 1.5,
+    textTransform: "uppercase",
+  },
+  pausedLastWordValue: {
+    fontFamily: fonts.heading,
+    fontSize: 22,
+    color: C.navy,
+    letterSpacing: 2,
+  },
   pausedActions: { width: "100%", gap: 10, marginTop: 8 },
   resumeBtn: {
     flexDirection: "row",
@@ -2050,9 +2301,48 @@ const styles = StyleSheet.create({
     textAlign: "center",
     lineHeight: 20,
   },
-  btnDelete: { backgroundColor: C.red },
-  btnDeleteDisabled: { backgroundColor: "#ccc" },
-  btnDeleteText: { fontFamily: fonts.heading, fontSize: 15, color: C.white },
+  // Destructive (Delete) — subtle red outline, no fill
+  btnDestructive: {
+    borderWidth: 1.5,
+    borderColor: C.red,
+    backgroundColor: C.redBg,
+  },
+  btnDestructiveDisabled: {
+    borderColor: C.border,
+    backgroundColor: C.bg,
+  },
+  btnDestructiveText: {
+    fontFamily: fonts.heading,
+    fontSize: 15,
+    color: C.red,
+  },
+
+  // Keep It (safe action) — solid green
+  btnKeep: { backgroundColor: C.green },
+  btnKeepText: { fontFamily: fonts.heading, fontSize: 15, color: C.white },
+
+  // Finish modal
+  finishPreview: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    alignSelf: "center",
+    backgroundColor: C.greenBg,
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderColor: C.green,
+  },
+  finishPreviewText: { fontFamily: fonts.heading, fontSize: 18, color: C.green },
+
+  // Finish confirm button — solid green
+  btnFinishConfirm: { backgroundColor: C.green },
+  btnFinishConfirmText: { fontFamily: fonts.heading, fontSize: 15, color: C.white },
+
+  // Not Yet (dismiss) — neutral outline
+  btnNotYet: { backgroundColor: C.bg, borderWidth: 1.5, borderColor: C.border },
+  btnNotYetText: { fontFamily: fonts.heading, fontSize: 15, color: C.navy },
   countdownRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -2076,10 +2366,26 @@ const styles = StyleSheet.create({
     paddingVertical: 13,
   },
   sheetBtn: { flex: 1, borderRadius: 12, paddingVertical: 14, alignItems: "center" },
+  // Legacy neutral button (word-delete modal Keep It)
   btnCancel: { backgroundColor: C.bg, borderWidth: 1.5, borderColor: C.border },
   btnConfirm: { backgroundColor: C.amber },
   btnCancelText: { fontFamily: fonts.heading, fontSize: 15, color: C.navy },
   btnConfirmText: { fontFamily: fonts.heading, fontSize: 15, color: "#1A1200" },
+
+  // Duplicate word modal
+  dupWordPreview: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    alignSelf: "center",
+    backgroundColor: C.brownBg,
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderColor: C.brown,
+  },
+  dupWordPreviewText: { fontFamily: fonts.heading, fontSize: 18, color: C.brown },
 
   // Word bank
   tabRow: {
@@ -2116,4 +2422,54 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
   },
   bankCategory: { fontFamily: fonts.body, fontSize: 11, color: C.muted },
+
+  // Stats modal — student header
+  statsStudentHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    marginBottom: 14,
+  },
+
+  // Stats modal — word review table
+  reviewTableHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    backgroundColor: C.blueWash,
+    borderRadius: 8,
+    marginBottom: 4,
+  },
+  reviewHeaderCell: {
+    fontFamily: fonts.mono,
+    fontSize: 9,
+    color: C.navy,
+    letterSpacing: 0.8,
+  },
+  reviewRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderRadius: 8,
+    gap: 4,
+  },
+  reviewCell: {
+    fontFamily: fonts.mono,
+    fontSize: 12,
+    color: C.ink,
+  },
+  reviewVoicePlaceholder: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    opacity: 0.5,
+  },
+  reviewVoicePlaceholderText: {
+    fontFamily: fonts.body,
+    fontSize: 11,
+    color: C.muted,
+    fontStyle: "italic",
+  },
 });

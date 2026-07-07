@@ -139,7 +139,7 @@ export default function Dashboard() {
         <View style={styles.headerLeft}>
           <BrailleCell pattern={[1, 2, 5]} size={10} />
           <View>
-            <Text style={styles.greeting}>Welcome back,</Text>
+            <Text style={styles.greeting}>Good to see you</Text>
             <Text style={styles.teacherName}>{displayName}</Text>
           </View>
         </View>

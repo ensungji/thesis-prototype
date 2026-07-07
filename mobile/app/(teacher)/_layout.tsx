@@ -87,8 +87,6 @@ export default function TeacherLayout() {
           tabBarIcon: ({ color, size }) => <Ionicons name="bookmarks" color={color} size={size} />,
         }}
       />
-      {/* Sub-screens hidden from tab bar */}
-      <Tabs.Screen name="wordbank/new" options={{ href: null }} />
     </Tabs>
   );
 }
