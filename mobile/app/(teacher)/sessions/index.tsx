@@ -41,7 +41,9 @@ const STATUS: Record<
 > = {
   pending: { bg: C.border, text: C.muted, label: "Pending" },
   in_progress: { bg: C.greenBg, text: C.green, label: "In Progress" },
-  paused: { bg: C.brownBg, text: C.brown, label: "Paused" },
+  // Paused sessions appear as "In Progress" in the list — they are still active sessions.
+  // The paused state is only surfaced inside the session detail view.
+  paused: { bg: C.greenBg, text: C.green, label: "In Progress" },
   finished: { bg: C.blueWash, text: C.navy, label: "Finished" },
 };
 

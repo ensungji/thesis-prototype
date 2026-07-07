@@ -1,26 +1,23 @@
 // mobile/app/admin/index.tsx
 // Admin dashboard — view, create, edit, and deactivate teacher accounts.
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback } from "react";
 import {
   View,
   Text,
   Pressable,
   FlatList,
-  TextInput,
   Modal,
-  KeyboardAvoidingView,
   StyleSheet,
-  ActivityIndicator,
   RefreshControl,
-  ScrollView,
-  Alert,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+import { useRouter, useFocusEffect, useLocalSearchParams } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../lib/supabase";
 import { colors as C, fonts } from "../../lib/theme";
 import { BrailleLoader } from "../../components/BrailleLoader";
+import { Toast } from "../../components/Toast";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -106,30 +103,33 @@ function TeacherCard({
 // ── Screen ────────────────────────────────────────────────────────────────────
 
 export default function AdminDashboard() {
+  const router = useRouter();
+  const insets = useSafeAreaInsets();
+  const params = useLocalSearchParams<{
+    created?: string;
+    updated?: string;
+  }>();
+
   const [teachers, setTeachers] = useState<Teacher[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [saving, setSaving] = useState(false);
+
+  // Sign-out confirm sheet
+  const [signOutModal, setSignOutModal] = useState(false);
+  const [signingOut, setSigningOut]     = useState(false);
 
   // Options sheet
   const [optionsModal, setOptionsModal] = useState(false);
   const [selected, setSelected] = useState<Teacher | null>(null);
 
-  // Add teacher modal
-  const [addModal, setAddModal] = useState(false);
-  const [newName, setNewName] = useState("");
-  const [newEmail, setNewEmail] = useState("");
-  const [newPass, setNewPass] = useState("");
-  const [newTitle, setNewTitle] = useState("");
-  const [newInstitution, setNewInstitution] = useState("");
-  const [showPass, setShowPass] = useState(false);
-  const [addError, setAddError] = useState<string | null>(null);
+  // Custom confirm sheet (replaces Alert.alert)
+  const [confirmModal, setConfirmModal] = useState(false);
+  const [confirmTarget, setConfirmTarget] = useState<Teacher | null>(null);
+  const [confirming, setConfirming] = useState(false);
 
-  // Edit teacher modal
-  const [editModal, setEditModal] = useState(false);
-  const [editName, setEditName] = useState("");
-  const [editTitle, setEditTitle] = useState("");
-  const [editInstitution, setEditInstitution] = useState("");
+  // Toast
+  type ToastState = { message: string; detail?: string; variant: "success" | "delete" } | null;
+  const [toast, setToast] = useState<ToastState>(null);
 
   // ── Load ───────────────────────────────────────────────────────────────────
 
@@ -144,107 +144,78 @@ export default function AdminDashboard() {
     setRefreshing(false);
   }, []);
 
-  useEffect(() => {
-    loadTeachers();
-  }, [loadTeachers]);
+  // On focus: load data + toast params, subscribe to realtime.
+  // On blur:  unsubscribe so we never accumulate duplicate channels.
+  useFocusEffect(
+    useCallback(() => {
+      loadTeachers();
 
-  // ── Add teacher ────────────────────────────────────────────────────────────
+      if (params.created) {
+        setToast({ message: "Account created", detail: params.created, variant: "success" });
+        router.setParams({ created: undefined });
+      }
+      if (params.updated) {
+        setToast({ message: "Profile updated", detail: params.updated, variant: "success" });
+        router.setParams({ updated: undefined });
+      }
 
-  async function addTeacher() {
-    if (!newName.trim() || !newEmail.trim() || !newPass.trim()) {
-      setAddError("Name, email and password are required.");
-      return;
-    }
-    if (newPass.trim().length < 6) {
-      setAddError("Password must be at least 6 characters.");
-      return;
-    }
-    setSaving(true);
-    setAddError(null);
+      // Realtime — re-fetch the full list on any change to the profiles table
+      const channel = supabase
+        .channel("admin-profiles-realtime")
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "profiles" },
+          () => loadTeachers(),
+        )
+        .subscribe();
 
-    const { data, error } = await supabase.functions.invoke("create-teacher", {
-      body: {
-        email: newEmail.trim().toLowerCase(),
-        password: newPass.trim(),
-        full_name: newName.trim(),
-        title: newTitle.trim() || null,
-        institution: newInstitution.trim() || null,
-      },
-    });
+      return () => {
+        supabase.removeChannel(channel);
+      };
+    }, [loadTeachers, params.created, params.updated, router]),
+  );
 
-    setSaving(false);
-    if (error || data?.error) {
-      setAddError(error?.message ?? data?.error ?? "Failed to create teacher.");
-      return;
-    }
-    setAddModal(false);
-    resetAddForm();
-    loadTeachers();
-  }
+  // ── Toggle active — opens custom confirm sheet ──────────────────────────────
 
-  function resetAddForm() {
-    setNewName("");
-    setNewEmail("");
-    setNewPass("");
-    setNewTitle("");
-    setNewInstitution("");
-    setAddError(null);
-  }
-
-  // ── Edit teacher ───────────────────────────────────────────────────────────
-
-  function openEdit(teacher: Teacher) {
-    setEditName(teacher.full_name ?? "");
-    setEditTitle(teacher.title ?? "");
-    setEditInstitution(teacher.institution ?? "");
+  function requestToggle(teacher: Teacher) {
     setOptionsModal(false);
-    setTimeout(() => setEditModal(true), 300);
+    // Small delay so the options sheet finishes closing before confirm opens
+    setTimeout(() => {
+      setConfirmTarget(teacher);
+      setConfirmModal(true);
+    }, 280);
   }
 
-  async function saveEdit() {
-    if (!selected) return;
-    setSaving(true);
+  async function confirmToggle() {
+    if (!confirmTarget) return;
+    setConfirming(true);
+    const newState = !confirmTarget.is_active;
     await supabase
       .from("profiles")
-      .update({
-        full_name: editName.trim(),
-        title: editTitle.trim() || null,
-        institution: editInstitution.trim() || null,
-      })
-      .eq("id", selected.id);
-    setSaving(false);
-    setEditModal(false);
+      .update({ is_active: newState })
+      .eq("id", confirmTarget.id);
+    setConfirming(false);
+    setConfirmModal(false);
     loadTeachers();
-  }
-
-  // ── Toggle active ──────────────────────────────────────────────────────────
-
-  async function toggleActive(teacher: Teacher) {
-    const newState = !teacher.is_active;
-    setOptionsModal(false);
-    Alert.alert(
-      newState ? "Activate Teacher" : "Deactivate Teacher",
-      `${newState ? "Activate" : "Deactivate"} ${teacher.full_name || teacher.email}?`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Confirm",
-          onPress: async () => {
-            await supabase
-              .from("profiles")
-              .update({ is_active: newState })
-              .eq("id", teacher.id);
-            loadTeachers();
-          },
-        },
-      ],
-    );
+    setToast({
+      message: newState ? "Teacher activated" : "Teacher deactivated",
+      detail: confirmTarget.full_name || confirmTarget.email,
+      variant: newState ? "success" : "delete",
+    });
+    setConfirmTarget(null);
   }
 
   // ── Sign out ───────────────────────────────────────────────────────────────
 
-  async function signOut() {
+  function signOut() {
+    setSignOutModal(true);
+  }
+
+  async function confirmSignOut() {
+    setSigningOut(true);
     await supabase.auth.signOut();
+    // router.replace("/") is handled automatically by the auth listener in _layout
+    setSigningOut(false);
   }
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -259,8 +230,11 @@ export default function AdminDashboard() {
     );
   }
 
-  const activeCount = teachers.filter((t) => t.is_active).length;
+  const activeCount   = teachers.filter((t) => t.is_active).length;
   const inactiveCount = teachers.length - activeCount;
+
+  // For the confirm sheet
+  const isDeactivating = confirmTarget?.is_active ?? true;
 
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
@@ -341,11 +315,12 @@ export default function AdminDashboard() {
 
       {/* FAB — Add Teacher */}
       <Pressable
-        onPress={() => {
-          resetAddForm();
-          setAddModal(true);
-        }}
-        style={({ pressed }) => [styles.fab, pressed && { opacity: 0.85 }]}
+        onPress={() => router.push("/admin/add-teacher" as any)}
+        style={({ pressed }) => [
+          styles.fab,
+          { bottom: Math.max(insets.bottom, 16) + 16 },
+          pressed && { opacity: 0.85 },
+        ]}
         accessibilityRole="button"
         accessibilityLabel="Add teacher"
       >
@@ -353,7 +328,73 @@ export default function AdminDashboard() {
         <Text style={styles.fabText}>Add Teacher</Text>
       </Pressable>
 
-      {/* ── Options sheet ───────────────────────────────────────────────── */}
+      {/* Toast */}
+      <Toast
+        message={toast?.message ?? ""}
+        detail={toast?.detail}
+        visible={!!toast}
+        variant={toast?.variant ?? "success"}
+        onDismiss={() => setToast(null)}
+      />
+
+      {/* ── Sign-out confirm sheet ────────────────────────────────────────── */}
+      <Modal
+        visible={signOutModal}
+        animationType="slide"
+        transparent
+        onRequestClose={() => !signingOut && setSignOutModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <Pressable
+            style={styles.backdrop}
+            onPress={() => !signingOut && setSignOutModal(false)}
+          />
+          <View style={[styles.confirmSheet, { paddingBottom: Math.max(insets.bottom, 16) + 16 }]}>
+            <View style={styles.handle} />
+
+            {/* Icon */}
+            <View style={[styles.confirmIconWrap, { backgroundColor: C.redBg }]}>
+              <Ionicons name="log-out-outline" size={32} color={C.red} />
+            </View>
+
+            <Text style={styles.confirmTitle}>Sign Out?</Text>
+            <Text style={styles.confirmBody}>
+              You will be returned to the login screen. Any unsaved changes will be lost.
+            </Text>
+
+            <View style={[styles.confirmActions, { marginTop: 8 }]}>
+              <Pressable
+                onPress={() => setSignOutModal(false)}
+                disabled={signingOut}
+                style={({ pressed }) => [
+                  styles.confirmBtn,
+                  styles.confirmBtnCancel,
+                  pressed && { opacity: 0.7 },
+                ]}
+              >
+                <Text style={styles.confirmBtnCancelText}>Cancel</Text>
+              </Pressable>
+
+              <Pressable
+                onPress={confirmSignOut}
+                disabled={signingOut}
+                style={({ pressed }) => [
+                  styles.confirmBtn,
+                  styles.confirmBtnDanger,
+                  (signingOut || pressed) && { opacity: 0.75 },
+                ]}
+              >
+                <Ionicons name="log-out-outline" size={16} color={C.red} />
+                <Text style={[styles.confirmBtnActionText, { color: C.red }]}>
+                  {signingOut ? "Signing out…" : "Yes, Sign Out"}
+                </Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* ── Options sheet ─────────────────────────────────────────────────── */}
       <Modal
         visible={optionsModal}
         animationType="slide"
@@ -365,31 +406,42 @@ export default function AdminDashboard() {
             style={styles.backdrop}
             onPress={() => setOptionsModal(false)}
           />
-          <View style={styles.sheet}>
+          <View style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 16) + 16 }]}>
             <View style={styles.handle} />
             <Text style={styles.sheetTitle}>
               {selected?.full_name || selected?.email}
             </Text>
             <Text style={styles.sheetSub}>{selected?.email}</Text>
 
+            {/* Edit Info */}
             <Pressable
-              onPress={() => selected && openEdit(selected)}
+              onPress={() => {
+                setOptionsModal(false);
+                router.push({
+                  pathname: "/admin/edit-teacher" as any,
+                  params: {
+                    id: selected?.id,
+                    full_name: selected?.full_name ?? "",
+                    title: selected?.title ?? "",
+                    institution: selected?.institution ?? "",
+                  },
+                });
+              }}
               style={({ pressed }) => [
                 styles.optionBtn,
                 pressed && { backgroundColor: C.bg },
               ]}
             >
-              <View
-                style={[styles.optionIcon, { backgroundColor: C.blueWash }]}
-              >
+              <View style={[styles.optionIcon, { backgroundColor: C.blueWash }]}>
                 <Ionicons name="pencil-outline" size={18} color={C.navy} />
               </View>
               <Text style={styles.optionText}>Edit Info</Text>
               <Ionicons name="chevron-forward" size={16} color={C.muted} />
             </Pressable>
 
+            {/* Toggle active/inactive — opens custom confirm sheet */}
             <Pressable
-              onPress={() => selected && toggleActive(selected)}
+              onPress={() => selected && requestToggle(selected)}
               style={({ pressed }) => [
                 styles.optionBtn,
                 pressed && { backgroundColor: C.bg },
@@ -437,216 +489,104 @@ export default function AdminDashboard() {
         </View>
       </Modal>
 
-      {/* ── Add Teacher modal ────────────────────────────────────────────── */}
+      {/* ── Confirm sheet (activate / deactivate) ─────────────────────────── */}
       <Modal
-        visible={addModal}
+        visible={confirmModal}
         animationType="slide"
         transparent
-        onRequestClose={() => setAddModal(false)}
+        onRequestClose={() => !confirming && setConfirmModal(false)}
       >
-        <KeyboardAvoidingView style={styles.keyboardSheet} behavior="padding">
+        <View style={styles.modalOverlay}>
           <Pressable
             style={styles.backdrop}
-            onPress={() => setAddModal(false)}
+            onPress={() => !confirming && setConfirmModal(false)}
           />
-          <View style={[styles.sheet, { maxHeight: "90%" }]}>
+          <View style={[styles.confirmSheet, { paddingBottom: Math.max(insets.bottom, 16) + 16 }]}>
             <View style={styles.handle} />
-            <Text style={styles.sheetTitle}>Add Teacher</Text>
-            <ScrollView
-              showsVerticalScrollIndicator={false}
-              style={{ maxHeight: 480 }}
-              contentContainerStyle={{ gap: 12 }}
-            >
-              <View style={styles.fieldGroup}>
-                <Text style={styles.label}>Full name</Text>
-                <TextInput
-                  style={styles.input}
-                  value={newName}
-                  onChangeText={setNewName}
-                  placeholder="e.g. Maria Santos"
-                  placeholderTextColor={C.muted}
-                  autoCapitalize="words"
-                />
-              </View>
-              <View style={styles.fieldGroup}>
-                <Text style={styles.label}>Email</Text>
-                <TextInput
-                  style={styles.input}
-                  value={newEmail}
-                  onChangeText={setNewEmail}
-                  placeholder="teacher@email.com"
-                  placeholderTextColor={C.muted}
-                  keyboardType="email-address"
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                />
-              </View>
-              <View style={styles.fieldGroup}>
-                <Text style={styles.label}>Temporary password</Text>
-                <View style={styles.passRow}>
-                  <TextInput
-                    style={[styles.input, { flex: 1 }]}
-                    value={newPass}
-                    onChangeText={setNewPass}
-                    placeholder="Min. 6 characters"
-                    placeholderTextColor={C.muted}
-                    secureTextEntry={!showPass}
-                    autoCapitalize="none"
-                  />
-                  <Pressable
-                    onPress={() => setShowPass((v) => !v)}
-                    style={styles.showBtn}
-                  >
-                    <Text style={styles.showBtnText}>
-                      {showPass ? "Hide" : "Show"}
-                    </Text>
-                  </Pressable>
-                </View>
-              </View>
-              <View style={styles.fieldGroup}>
-                <Text style={styles.label}>
-                  Title <Text style={styles.optional}>(optional)</Text>
-                </Text>
-                <TextInput
-                  style={styles.input}
-                  value={newTitle}
-                  onChangeText={setNewTitle}
-                  placeholder="e.g. Special Education Teacher"
-                  placeholderTextColor={C.muted}
-                  autoCapitalize="words"
-                />
-              </View>
-              <View style={styles.fieldGroup}>
-                <Text style={styles.label}>
-                  Institution <Text style={styles.optional}>(optional)</Text>
-                </Text>
-                <TextInput
-                  style={styles.input}
-                  value={newInstitution}
-                  onChangeText={setNewInstitution}
-                  placeholder="e.g. Philippine School for the Deaf"
-                  placeholderTextColor={C.muted}
-                  autoCapitalize="words"
-                />
-              </View>
-              {addError && (
-                <View style={styles.errorBox}>
-                  <Text style={styles.errorText}>{addError}</Text>
-                </View>
-              )}
-            </ScrollView>
-            <View style={styles.sheetActions}>
-              <Pressable
-                onPress={() => setAddModal(false)}
-                style={({ pressed }) => [
-                  styles.sheetBtn,
-                  styles.btnCancel,
-                  pressed && { opacity: 0.7 },
-                ]}
-              >
-                <Text style={styles.btnCancelText}>Cancel</Text>
-              </Pressable>
-              <Pressable
-                onPress={addTeacher}
-                disabled={saving}
-                style={({ pressed }) => [
-                  styles.sheetBtn,
-                  styles.btnConfirm,
-                  pressed && { opacity: 0.85 },
-                ]}
-              >
-                {saving ? (
-                  <ActivityIndicator color="#1A1200" />
-                ) : (
-                  <Text style={styles.btnConfirmText}>Create Account</Text>
-                )}
-              </Pressable>
-            </View>
-          </View>
-        </KeyboardAvoidingView>
-      </Modal>
 
-      {/* ── Edit Teacher modal ───────────────────────────────────────────── */}
-      <Modal
-        visible={editModal}
-        animationType="slide"
-        transparent
-        onRequestClose={() => setEditModal(false)}
-      >
-        <KeyboardAvoidingView style={styles.keyboardSheet} behavior="padding">
-          <Pressable
-            style={styles.backdrop}
-            onPress={() => setEditModal(false)}
-          />
-          <View style={styles.sheet}>
-            <View style={styles.handle} />
-            <Text style={styles.sheetTitle}>Edit Teacher</Text>
-            <View style={{ gap: 12 }}>
-              <View style={styles.fieldGroup}>
-                <Text style={styles.label}>Full name</Text>
-                <TextInput
-                  style={styles.input}
-                  value={editName}
-                  onChangeText={setEditName}
-                  autoCapitalize="words"
-                />
-              </View>
-              <View style={styles.fieldGroup}>
-                <Text style={styles.label}>
-                  Title <Text style={styles.optional}>(optional)</Text>
+            {/* Icon */}
+            <View
+              style={[
+                styles.confirmIconWrap,
+                { backgroundColor: isDeactivating ? C.redBg : C.greenBg },
+              ]}
+            >
+              <Ionicons
+                name={isDeactivating ? "ban-outline" : "checkmark-circle-outline"}
+                size={32}
+                color={isDeactivating ? C.red : C.green}
+              />
+            </View>
+
+            {/* Title */}
+            <Text style={styles.confirmTitle}>
+              {isDeactivating ? "Deactivate Teacher?" : "Activate Teacher?"}
+            </Text>
+
+            {/* Teacher name pill */}
+            <View style={styles.confirmNamePill}>
+              <View style={[styles.confirmPillAvatar, !confirmTarget?.is_active && { backgroundColor: C.muted }]}>
+                <Text style={styles.confirmPillAvatarText}>
+                  {confirmTarget ? getInitials(confirmTarget.full_name || confirmTarget.email) : ""}
                 </Text>
-                <TextInput
-                  style={styles.input}
-                  value={editTitle}
-                  onChangeText={setEditTitle}
-                  placeholder="e.g. Special Education Teacher"
-                  placeholderTextColor={C.muted}
-                  autoCapitalize="words"
-                />
               </View>
-              <View style={styles.fieldGroup}>
-                <Text style={styles.label}>
-                  Institution <Text style={styles.optional}>(optional)</Text>
+              <View>
+                <Text style={styles.confirmPillName}>
+                  {confirmTarget?.full_name || confirmTarget?.email}
                 </Text>
-                <TextInput
-                  style={styles.input}
-                  value={editInstitution}
-                  onChangeText={setEditInstitution}
-                  placeholder="e.g. Philippine School for the Deaf"
-                  placeholderTextColor={C.muted}
-                  autoCapitalize="words"
-                />
+                <Text style={styles.confirmPillEmail}>{confirmTarget?.email}</Text>
               </View>
             </View>
-            <View style={styles.sheetActions}>
+
+            {/* Description */}
+            <Text style={styles.confirmBody}>
+              {isDeactivating
+                ? "This teacher will no longer be able to sign in. Their students and sessions will remain intact and can be restored by reactivating the account."
+                : "This teacher will regain full access to their account, students, and sessions immediately."}
+            </Text>
+
+            {/* Actions */}
+            <View style={styles.confirmActions}>
               <Pressable
-                onPress={() => setEditModal(false)}
+                onPress={() => setConfirmModal(false)}
+                disabled={confirming}
                 style={({ pressed }) => [
-                  styles.sheetBtn,
-                  styles.btnCancel,
+                  styles.confirmBtn,
+                  styles.confirmBtnCancel,
                   pressed && { opacity: 0.7 },
                 ]}
               >
-                <Text style={styles.btnCancelText}>Cancel</Text>
+                <Text style={styles.confirmBtnCancelText}>Cancel</Text>
               </Pressable>
+
               <Pressable
-                onPress={saveEdit}
-                disabled={saving}
+                onPress={confirmToggle}
+                disabled={confirming}
                 style={({ pressed }) => [
-                  styles.sheetBtn,
-                  styles.btnConfirm,
-                  pressed && { opacity: 0.85 },
+                  styles.confirmBtn,
+                  isDeactivating ? styles.confirmBtnDanger : styles.confirmBtnSuccess,
+                  (confirming || pressed) && { opacity: 0.75 },
                 ]}
               >
-                {saving ? (
-                  <ActivityIndicator color="#1A1200" />
-                ) : (
-                  <Text style={styles.btnConfirmText}>Save</Text>
-                )}
+                <Ionicons
+                  name={isDeactivating ? "ban-outline" : "checkmark-circle-outline"}
+                  size={16}
+                  color={isDeactivating ? C.red : C.green}
+                />
+                <Text
+                  style={[
+                    styles.confirmBtnActionText,
+                    { color: isDeactivating ? C.red : C.green },
+                  ]}
+                >
+                  {confirming
+                    ? isDeactivating ? "Deactivating…" : "Activating…"
+                    : isDeactivating ? "Yes, Deactivate" : "Yes, Activate"}
+                </Text>
               </Pressable>
             </View>
           </View>
-        </KeyboardAvoidingView>
+        </View>
       </Modal>
     </SafeAreaView>
   );
@@ -748,7 +688,6 @@ const styles = StyleSheet.create({
 
   fab: {
     position: "absolute",
-    bottom: 32,
     alignSelf: "center",
     flexDirection: "row",
     alignItems: "center",
@@ -765,20 +704,11 @@ const styles = StyleSheet.create({
   },
   fabText: { fontFamily: fonts.heading, fontSize: 15, color: "#1A1200" },
 
-  // Modal shared
+  // ── Shared modal primitives ─────────────────────────────────────────────────
   modalOverlay: { flex: 1, justifyContent: "flex-end" },
-  keyboardSheet: { flex: 1, justifyContent: "flex-end" },
   backdrop: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: "rgba(0,0,0,0.45)",
-  },
-  sheet: {
-    backgroundColor: C.white,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    padding: 24,
-    paddingBottom: 44,
-    gap: 14,
   },
   handle: {
     width: 40,
@@ -788,6 +718,15 @@ const styles = StyleSheet.create({
     alignSelf: "center",
     marginBottom: 4,
   },
+
+  // ── Options sheet ───────────────────────────────────────────────────────────
+  sheet: {
+    backgroundColor: C.white,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: 24,
+    gap: 14,
+  },
   sheetTitle: { fontFamily: fonts.heading, fontSize: 20, color: C.navy },
   sheetSub: {
     fontFamily: fonts.body,
@@ -795,8 +734,6 @@ const styles = StyleSheet.create({
     color: C.muted,
     marginTop: -8,
   },
-
-  // Options
   optionBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -828,50 +765,100 @@ const styles = StyleSheet.create({
   },
   cancelBtnText: { fontFamily: fonts.heading, fontSize: 15, color: C.navy },
 
-  // Form
-  fieldGroup: { gap: 6 },
-  label: { fontFamily: fonts.heading, fontSize: 14, color: C.navy },
-  optional: { fontFamily: fonts.body, fontSize: 12, color: C.muted },
-  input: {
-    fontFamily: fonts.body,
-    fontSize: 15,
-    color: C.ink,
-    backgroundColor: C.bg,
-    borderWidth: 1.5,
-    borderColor: C.border,
-    borderRadius: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 13,
-  },
-  passRow: { flexDirection: "row", gap: 8 },
-  showBtn: {
-    paddingHorizontal: 14,
-    paddingVertical: 13,
-    borderRadius: 12,
-    borderWidth: 1.5,
-    borderColor: C.border,
-    backgroundColor: C.bg,
-    justifyContent: "center",
-  },
-  showBtnText: { fontFamily: fonts.heading, fontSize: 13, color: C.navy },
-  errorBox: {
-    backgroundColor: C.redBg,
-    borderRadius: 10,
-    padding: 12,
-    borderWidth: 1,
-    borderColor: C.red,
-  },
-  errorText: { fontFamily: fonts.body, fontSize: 13, color: C.red },
-
-  sheetActions: { flexDirection: "row", gap: 10 },
-  sheetBtn: {
-    flex: 1,
-    borderRadius: 12,
-    paddingVertical: 14,
+  // ── Confirm sheet ───────────────────────────────────────────────────────────
+  confirmSheet: {
+    backgroundColor: C.white,
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    padding: 24,
+    gap: 16,
     alignItems: "center",
   },
-  btnCancel: { backgroundColor: C.bg, borderWidth: 1.5, borderColor: C.border },
-  btnConfirm: { backgroundColor: C.amber },
-  btnCancelText: { fontFamily: fonts.heading, fontSize: 15, color: C.navy },
-  btnConfirmText: { fontFamily: fonts.heading, fontSize: 15, color: "#1A1200" },
+  confirmIconWrap: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    alignItems: "center",
+    justifyContent: "center",
+    marginTop: 8,
+  },
+  confirmTitle: {
+    fontFamily: fonts.heading,
+    fontSize: 22,
+    color: C.navy,
+    textAlign: "center",
+  },
+
+  // Teacher name pill inside confirm sheet
+  confirmNamePill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    backgroundColor: C.bg,
+    borderWidth: 1.5,
+    borderColor: C.border,
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    alignSelf: "stretch",
+  },
+  confirmPillAvatar: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: C.navy,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  confirmPillAvatarText: { fontFamily: fonts.heading, fontSize: 14, color: C.white },
+  confirmPillName: { fontFamily: fonts.heading, fontSize: 15, color: C.navy },
+  confirmPillEmail: { fontFamily: fonts.body, fontSize: 12, color: C.muted },
+
+  confirmBody: {
+    fontFamily: fonts.body,
+    fontSize: 13.5,
+    color: C.ink,
+    textAlign: "center",
+    lineHeight: 21,
+    paddingHorizontal: 4,
+  },
+
+  // Action buttons row
+  confirmActions: {
+    flexDirection: "row",
+    gap: 10,
+    alignSelf: "stretch",
+    marginTop: 4,
+  },
+  confirmBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    borderRadius: 14,
+    paddingVertical: 14,
+    borderWidth: 1.5,
+  },
+  confirmBtnCancel: {
+    backgroundColor: C.bg,
+    borderColor: C.border,
+  },
+  confirmBtnDanger: {
+    backgroundColor: C.redBg,
+    borderColor: C.red,
+  },
+  confirmBtnSuccess: {
+    backgroundColor: C.greenBg,
+    borderColor: C.green,
+  },
+  confirmBtnCancelText: {
+    fontFamily: fonts.heading,
+    fontSize: 15,
+    color: C.navy,
+  },
+  confirmBtnActionText: {
+    fontFamily: fonts.heading,
+    fontSize: 15,
+  },
 });
