@@ -123,6 +123,13 @@ export default function SessionDetail() {
   const [wordListIndex, setWordListIndex] = useState(0);
   const [wordSent, setWordSent] = useState(false);
 
+  // Tracks the word currently active (just sent, awaiting teacher "Done").
+  // null means no word is active and the teacher may type/send the next word.
+  const [activeWordId, setActiveWordId] = useState<string | null>(null);
+
+  // Tracks which words have been marked done (completed) this run.
+  const [completedWordIds, setCompletedWordIds] = useState<Set<string>>(new Set());
+
   // The most recently *sent* word — used on the Paused card for context recovery.
   // Set in doSendWord() and restored from AsyncStorage in restoreWordPosition().
   // Distinct from manualWord (text input value) and wordListIndex (list position).
@@ -156,6 +163,21 @@ export default function SessionDetail() {
   const [statsData, setStatsData] = useState<StudentSessionStats | null>(null);
   const [loadingStats, setLoadingStats] = useState(false);
 
+  // ── Finish session modal ────────────────────────────────────────────────────
+  const [finishSessionModal, setFinishSessionModal] = useState(false);
+  const [finishingSession, setFinishingSession] = useState(false);
+  const [finishToast, setFinishToast] = useState<{ name: string } | null>(null);
+
+  // ── Inline "must press Done first" error ─────────────────────────────────
+  const [activeWordError, setActiveWordError] = useState(false);
+  const activeWordErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function showActiveWordError() {
+    setActiveWordError(true);
+    if (activeWordErrorTimer.current) clearTimeout(activeWordErrorTimer.current);
+    activeWordErrorTimer.current = setTimeout(() => setActiveWordError(false), 3000);
+  }
+
   // ── Auto-pause: app background + navigation away ────────────────────────────
   // sessionStatusRef mirrors session.status without stale-closure issues so
   // useFocusEffect / AppState cleanup callbacks always read the latest value.
@@ -182,11 +204,6 @@ export default function SessionDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
-  // ── Finish session modal ────────────────────────────────────────────────────
-  const [finishSessionModal, setFinishSessionModal] = useState(false);
-  const [finishingSession, setFinishingSession] = useState(false);
-  const [finishToast, setFinishToast] = useState<{ name: string } | null>(null);
-
   // ── Delete session modal ────────────────────────────────────────────────────
   const [deleteSessionModal, setDeleteSessionModal] = useState(false);
   const [deletingSession, setDeletingSession] = useState(false);
@@ -204,17 +221,27 @@ export default function SessionDetail() {
   const [deleteWordModal, setDeleteWordModal] = useState(false);
   const [wordToRemove, setWordToRemove] = useState<SessionWord | null>(null);
 
+  // ── Remove-word success toast ───────────────────────────────────────────────
+  const [removeWordToast, setRemoveWordToast] = useState<{ word: string } | null>(null);
+
 
 
 
   // ── Load data ───────────────────────────────────────────────────────────────
 
   const loadData = useCallback(async () => {
-    if (!id) return;
+    if (!id) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
     const {
       data: { user },
     } = await supabase.auth.getUser();
-    if (!user) return;
+    if (!user) {
+      setLoading(false);
+      return;
+    }
 
     const [sessionRes, studentsRes, devicesRes, assignedRes, wordsRes] =
       await Promise.all([
@@ -280,6 +307,8 @@ export default function SessionDetail() {
       const pos = JSON.parse(raw) as {
         word: string;
         chunkIndex: number;
+        activeWordId?: string | null;
+        completedWordIds?: string[];
       };
 
       // Snap wordListIndex for word_list sessions
@@ -292,8 +321,18 @@ export default function SessionDetail() {
       setChunkIndex(pos.chunkIndex ?? 0);
       setWordSent(true);
 
-      // Restore manual word input
-      setManualWord(pos.word);
+      // Restore active / completed word state
+      const restoredActiveId = pos.activeWordId ?? null;
+      setActiveWordId(restoredActiveId);
+      if (pos.completedWordIds?.length) {
+        setCompletedWordIds(new Set(pos.completedWordIds));
+      }
+
+      // Only re-fill the manual input when the word is NOT still active.
+      // If it IS active the input should remain blank (Done-gate enforced).
+      if (!restoredActiveId) {
+        setManualWord(pos.word);
+      }
 
       // Fix 3: restore lastSentWord so the Paused card always shows the correct
       // word regardless of session type (manual or word_list).
@@ -304,11 +343,21 @@ export default function SessionDetail() {
   }
 
   // ── Persist word position to AsyncStorage ─────────────────────────────────
-  async function saveWordPosition(sessionId: string, word: string, chunkIndex: number) {
+  async function saveWordPosition(
+    sessionId: string,
+    word: string,
+    chunkIndex: number,
+    opts?: { activeWordId?: string | null; completedWordIds?: Set<string> },
+  ) {
     try {
       await AsyncStorage.setItem(
         `session_word_pos_${sessionId}`,
-        JSON.stringify({ word, chunkIndex }),
+        JSON.stringify({
+          word,
+          chunkIndex,
+          activeWordId: opts?.activeWordId ?? null,
+          completedWordIds: opts?.completedWordIds ? [...opts.completedWordIds] : [],
+        }),
       );
     } catch {
       // Silently ignore storage errors
@@ -335,8 +384,15 @@ export default function SessionDetail() {
   );
 
   // ── Realtime subscriptions ──────────────────────────────────────────────────
+  // Use a ref to hold the channel so that React Strict Mode double-invocation
+  // or rapid re-renders never call .on() on an already-subscribed channel,
+  // which triggers the "Cannot add postgres_changes callback after subscribe()" error.
+  const realtimeChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+
   useEffect(() => {
     if (!id) return;
+    // Guard: if a channel for this session already exists, skip creation.
+    if (realtimeChannelRef.current) return;
 
     const channel = supabase
       .channel(`session-detail-${id}`)
@@ -374,7 +430,12 @@ export default function SessionDetail() {
       )
       .subscribe();
 
-    return () => { supabase.removeChannel(channel); };
+    realtimeChannelRef.current = channel;
+
+    return () => {
+      supabase.removeChannel(channel);
+      realtimeChannelRef.current = null;
+    };
   }, [id]);
 
 
@@ -402,9 +463,10 @@ export default function SessionDetail() {
     }
   }
 
-  async function removeWord(wordId: string) {
+  async function removeWord(wordId: string, wordText?: string) {
     await supabase.from("session_words").delete().eq("id", wordId);
     setSessionWords((prev) => prev.filter((w) => w.id !== wordId));
+    if (wordText) setRemoveWordToast({ word: wordText });
   }
 
   function deleteSession() {
@@ -483,6 +545,10 @@ export default function SessionDetail() {
   }
 
   function confirmFinish() {
+    if (activeWordId) {
+      showActiveWordError();
+      return;
+    }
     setFinishSessionModal(true);
   }
 
@@ -521,6 +587,8 @@ export default function SessionDetail() {
 
   // Internal: broadcasts the word; also called on "Re-send Anyway"
   async function doSendWord(w: string) {
+    let wordId: string | null = null;
+
     // Record history for manual sessions
     if (session?.type === "manual" && !sessionWords.find((sw) => sw.word === w)) {
       const { data: wordData } = await supabase
@@ -528,8 +596,16 @@ export default function SessionDetail() {
         .insert({ session_id: id, word: w, order_index: sessionWords.length })
         .select("id, word, order_index")
         .single();
-      if (wordData) setSessionWords((prev) => [...prev, wordData]);
+      if (wordData) {
+        setSessionWords((prev) => [...prev, wordData]);
+        wordId = wordData.id;
+      }
+    } else {
+      // Word already in sessionWords — find its id
+      const existing = sessionWords.find((sw) => sw.word === w);
+      wordId = existing?.id ?? null;
     }
+
     sentWords.add(w);
     // Fix 2: track the last *actually sent* word so the Paused card always
     // displays accurate context, independent of list position or input state.
@@ -538,8 +614,32 @@ export default function SessionDetail() {
     setChunks(newChunks);
     setChunkIndex(0);
     setWordSent(true);
-    await saveWordPosition(id!, w, 0);
+
+    // Clear the input and mark this word as the active one
+    setManualWord("");
+    if (wordId) setActiveWordId(wordId);
+
+    await saveWordPosition(id!, w, 0, {
+      activeWordId: wordId,
+      completedWordIds,
+    });
     await broadcastChunk(newChunks, 0, w);
+  }
+
+  // Called when teacher presses "Done" on the active word.
+  // Marks the word completed and re-enables the input for the next word.
+  async function markActiveWordDone() {
+    if (!activeWordId) return;
+    const newCompleted = new Set(completedWordIds).add(activeWordId);
+    setCompletedWordIds(newCompleted);
+    setActiveWordId(null);
+    // Persist so the completed/active states survive backgrounding
+    if (id && lastSentWord) {
+      await saveWordPosition(id, lastSentWord, chunkIndex, {
+        activeWordId: null,
+        completedWordIds: newCompleted,
+      });
+    }
   }
 
   async function goToChunk(newIdx: number) {
@@ -547,10 +647,10 @@ export default function SessionDetail() {
     setChunkIndex(newIdx);
     const word =
       session?.type === "manual"
-        ? manualWord
+        ? lastSentWord
         : (sessionWords[wordListIndex]?.word ?? "");
     // Persist chunk position so resume always shows the exact chunk
-    await saveWordPosition(id!, word, newIdx);
+    await saveWordPosition(id!, word, newIdx, { activeWordId, completedWordIds });
     await broadcastChunk(chunks, newIdx, word);
   }
 
@@ -603,7 +703,32 @@ export default function SessionDetail() {
       </SafeAreaView>
     );
   }
-  if (!session) return null;
+
+  // Guard: session couldn't be loaded (deleted externally, bad id, network error).
+  // Show a recoverable error instead of a black screen.
+  if (!session) {
+    return (
+      <SafeAreaView style={styles.safe} edges={["top"]}>
+        <View style={styles.center}>
+          <Ionicons name="alert-circle-outline" size={40} color={C.muted} />
+          <Text style={[styles.emptyHint, { marginTop: 10, textAlign: "center" }]}>
+            Session not found.{"\n"}It may have been deleted or failed to load.
+          </Text>
+          <Pressable
+            onPress={() => router.back()}
+            style={({ pressed }) => [
+              styles.launchBtn,
+              { marginTop: 16, paddingHorizontal: 24 },
+              pressed && { opacity: 0.8 },
+            ]}
+          >
+            <Ionicons name="arrow-back" size={16} color="#1A1200" />
+            <Text style={styles.launchBtnText}>Go Back</Text>
+          </Pressable>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   const filteredBank = [] as WordBankItem[]; // word bank is now on add-word screen
 
@@ -1071,7 +1196,7 @@ export default function SessionDetail() {
                 </Pressable>
                 <Pressable
                   onPress={() => {
-                    if (wordToRemove) removeWord(wordToRemove.id);
+                    if (wordToRemove) removeWord(wordToRemove.id, wordToRemove.word);
                     setDeleteWordModal(false);
                     setWordToRemove(null);
                   }}
@@ -1087,6 +1212,15 @@ export default function SessionDetail() {
             </View>
           </View>
         </Modal>
+
+        {/* ── Remove-word success toast ───────────────────────────────────── */}
+        <Toast
+          message="Word removed from list"
+          detail={removeWordToast?.word}
+          visible={!!removeWordToast}
+          variant="delete"
+          onDismiss={() => setRemoveWordToast(null)}
+        />
 
       </SafeAreaView>
     );
@@ -1421,9 +1555,16 @@ export default function SessionDetail() {
         contentContainerStyle={styles.scroll}
         showsVerticalScrollIndicator={false}
       >
-        {/* Session name + status */}
+        {/* Session name + purpose + status */}
         <View style={styles.activeHeader}>
-          <Text style={styles.sessionName}>{session.name}</Text>
+          <View style={{ flex: 1, gap: 2 }}>
+            <Text style={styles.sessionName}>{session.name}</Text>
+            {session.purpose ? (
+              <Text style={styles.activePurpose} numberOfLines={2}>
+                {session.purpose}
+              </Text>
+            ) : null}
+          </View>
           <View style={styles.liveIndicator}>
             <Animated.View style={[styles.liveDot, { opacity: pulseAnim }]} />
             <Text style={styles.liveText}>Live</Text>
@@ -1466,33 +1607,60 @@ export default function SessionDetail() {
         {/* ── MANUAL: type word live ────────────────────────────────── */}
         {session.type === "manual" && (
           <>
-            <View style={styles.sectionCard}>
+            <View style={[styles.sectionCard, activeWordError && styles.sectionCardError]}>
               <Text style={styles.cardLabel}>SEND WORD</Text>
+              {activeWordError && (
+                <View style={styles.activeWordErrorBanner}>
+                  <Ionicons name="warning" size={13} color={C.red} />
+                  <Text style={styles.activeWordErrorText}>
+                    Press Done first before sending another word or finishing.
+                  </Text>
+                </View>
+              )}
               <View style={styles.sendRow}>
                 <TextInput
-                  style={[styles.wordInput, { flex: 1 }]}
+                  style={[
+                    styles.wordInput,
+                    { flex: 1 },
+                    !!activeWordId && styles.wordInputDisabled,
+                  ]}
                   value={manualWord}
                   onChangeText={(v) => {
+                    if (activeWordId) return; // blocked until teacher marks Done
                     setManualWord(v.toUpperCase());
                     setWordSent(false);
                   }}
-                  placeholder="TYPE WORD"
-                  placeholderTextColor={C.muted}
+                  placeholder={activeWordId ? "Press Done first" : "TYPE WORD"}
+                  placeholderTextColor={activeWordId ? C.amber : C.muted}
                   autoCapitalize="characters"
                   autoCorrect={false}
                   returnKeyType="send"
+                  editable={!activeWordId}
                   onSubmitEditing={() => sendWord(manualWord)}
                 />
-                <Pressable
-                  onPress={() => sendWord(manualWord)}
-                  style={({ pressed }) => [
-                    styles.sendBtn,
-                    pressed && { opacity: 0.85 },
-                  ]}
-                >
-                  <Ionicons name="send" size={16} color="#1A1200" />
-                  <Text style={styles.sendBtnText}>Send</Text>
-                </Pressable>
+                {activeWordId ? (
+                  <Pressable
+                    onPress={markActiveWordDone}
+                    style={({ pressed }) => [
+                      styles.doneBtn,
+                      pressed && { opacity: 0.85 },
+                    ]}
+                  >
+                    <Ionicons name="checkmark" size={16} color={C.white} />
+                    <Text style={styles.doneBtnText}>Done</Text>
+                  </Pressable>
+                ) : (
+                  <Pressable
+                    onPress={() => sendWord(manualWord)}
+                    style={({ pressed }) => [
+                      styles.sendBtn,
+                      pressed && { opacity: 0.85 },
+                    ]}
+                  >
+                    <Ionicons name="send" size={16} color="#1A1200" />
+                    <Text style={styles.sendBtnText}>Send</Text>
+                  </Pressable>
+                )}
               </View>
             </View>
 
@@ -1502,16 +1670,51 @@ export default function SessionDetail() {
                 <Text style={styles.cardLabel}>WORDS SENT</Text>
                 <View style={{ gap: 8 }}>
                   {[...sessionWords].reverse().map((sw, i) => {
+                    const isActive = sw.id === activeWordId;
+                    const isDone = completedWordIds.has(sw.id);
                     // Find any live attempt for this word
                     const attempt = liveAttempts.find(
                       (a) => a.word === sw.word
                     );
                     return (
-                      <View key={sw.id} style={styles.historyRow}>
-                        <Text style={styles.historyIndex}>
+                      <View
+                        key={sw.id}
+                        style={[
+                          styles.historyRow,
+                          isActive && styles.historyRowActive,
+                          isDone && styles.historyRowDone,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.historyIndex,
+                            isActive && { color: C.amber },
+                            isDone && { color: C.green },
+                          ]}
+                        >
                           {String(sessionWords.length - i).padStart(2, "0")}
                         </Text>
-                        <Text style={styles.historyWord}>{sw.word}</Text>
+                        <Text
+                          style={[
+                            styles.historyWord,
+                            isActive && { color: C.brown },
+                            isDone && { color: C.green },
+                          ]}
+                        >
+                          {sw.word}
+                        </Text>
+                        {isActive && (
+                          <View style={styles.activeWordBadge}>
+                            <View style={styles.activeWordDot} />
+                            <Text style={styles.activeWordBadgeText}>Active</Text>
+                          </View>
+                        )}
+                        {isDone && !isActive && (
+                          <View style={styles.doneWordBadge}>
+                            <Ionicons name="checkmark" size={10} color={C.green} />
+                            <Text style={styles.doneWordBadgeText}>Done</Text>
+                          </View>
+                        )}
                         {attempt && (
                           <View
                             style={[
@@ -1911,6 +2114,17 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
+  historyRowActive: {
+    backgroundColor: C.brownBg,
+    borderWidth: 1.5,
+    borderColor: C.amber,
+  },
+  historyRowDone: {
+    backgroundColor: C.greenBg,
+    borderWidth: 1.5,
+    borderColor: C.green,
+    opacity: 0.7,
+  },
   historyIndex: {
     fontFamily: fonts.mono,
     fontSize: 11,
@@ -1923,6 +2137,46 @@ const styles = StyleSheet.create({
     color: C.navy,
     flex: 1,
     letterSpacing: 1,
+  },
+
+  // Active word badge in WORDS SENT
+  activeWordBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: C.amber,
+    borderRadius: 100,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  activeWordDot: {
+    width: 5,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: "#1A1200",
+  },
+  activeWordBadgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 9,
+    color: "#1A1200",
+    letterSpacing: 0.5,
+  },
+
+  // Completed word badge in WORDS SENT
+  doneWordBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+    backgroundColor: C.greenBg,
+    borderRadius: 100,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+  },
+  doneWordBadgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 9,
+    color: C.green,
+    letterSpacing: 0.5,
   },
 
   // Live attempt badges (shown inline in WORDS SENT and WORD LIST)
@@ -2110,8 +2364,15 @@ const styles = StyleSheet.create({
   // Active view
   activeHeader: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
     justifyContent: "space-between",
+    gap: 8,
+  },
+  activePurpose: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: C.muted,
+    lineHeight: 18,
   },
   liveIndicator: { flexDirection: "row", alignItems: "center", gap: 5 },
   liveDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: C.green },
@@ -2147,6 +2408,28 @@ const styles = StyleSheet.create({
     borderColor: C.border,
     gap: 12,
   },
+  sectionCardError: {
+    borderColor: C.red,
+    backgroundColor: C.redBg,
+  },
+  activeWordErrorBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: C.redBg,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderWidth: 1,
+    borderColor: C.red,
+  },
+  activeWordErrorText: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: C.red,
+    flex: 1,
+    lineHeight: 17,
+  },
   cardLabel: {
     fontFamily: fonts.mono,
     fontSize: 10,
@@ -2166,6 +2449,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 13,
   },
+  wordInputDisabled: {
+    backgroundColor: C.brownBg,
+    borderColor: C.amber,
+    color: C.muted,
+  },
   sendBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -2176,6 +2464,18 @@ const styles = StyleSheet.create({
     paddingVertical: 13,
   },
   sendBtnText: { fontFamily: fonts.heading, fontSize: 14, color: "#1A1200" },
+
+  // Done button (replaces Send while a word is active)
+  doneBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: C.green,
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 13,
+  },
+  doneBtnText: { fontFamily: fonts.heading, fontSize: 14, color: C.white },
 
   // Word list navigation
   wordNavRow: { flexDirection: "row", alignItems: "center", gap: 12 },

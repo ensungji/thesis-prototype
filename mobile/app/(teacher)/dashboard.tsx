@@ -222,7 +222,12 @@ export default function Dashboard() {
               return (
                 <Pressable
                   key={s.id}
-                  onPress={() => router.push("/(teacher)/sessions" as any)}
+                  onPress={() =>
+                    router.push({
+                      pathname: "/(teacher)/sessions/[id]" as any,
+                      params: { id: s.id },
+                    })
+                  }
                   style={({ pressed }) => [styles.sessionRow, pressed && { opacity: 0.85 }]}
                 >
                   <View style={{ flex: 1, gap: 4 }}>

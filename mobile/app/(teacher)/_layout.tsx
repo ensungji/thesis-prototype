@@ -72,6 +72,17 @@ export default function TeacherLayout() {
           title: "Sessions",
           tabBarIcon: ({ color, size }) => <Ionicons name="book" color={color} size={size} />,
         }}
+        listeners={({ navigation }) => ({
+          tabPress: (e) => {
+            // Prevent the default tab-press behaviour (which would land on
+            // whatever is currently at the top of the sessions stack, e.g. a
+            // session detail pushed from the dashboard Recent Sessions list).
+            e.preventDefault();
+            // Always navigate to the sessions directory root so the user
+            // always sees the full session list + "New Session" button.
+            navigation.navigate("sessions", { screen: "index" });
+          },
+        })}
       />
       <Tabs.Screen
         name="analytics"

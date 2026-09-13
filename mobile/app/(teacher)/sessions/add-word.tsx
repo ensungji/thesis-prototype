@@ -19,11 +19,12 @@ import {
   Switch,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
 import { colors as C, fonts } from "../../../lib/theme";
 import { isValidWord } from "../../../lib/braille";
+import { Toast } from "../../../components/Toast";
 import DraggableFlatList, {
   ScaleDecorator,
 } from "react-native-draggable-flatlist";
@@ -41,6 +42,18 @@ export default function AddWordScreen() {
   const [saveToBank, setSaveToBank] = useState(false);
   const [saving, setSaving] = useState(false);
   const [errorModal, setErrorModal] = useState<{ title: string; message: string } | null>(null);
+
+  // ── Toast ──────────────────────────────────────────────────────────────────
+  const [toast, setToast] = useState<{
+    visible: boolean;
+    message: string;
+    detail?: string;
+    variant: "success" | "delete";
+  }>({ visible: false, message: "", variant: "success" });
+
+  function showToast(message: string, detail?: string, variant: "success" | "delete" = "success") {
+    setToast({ visible: true, message, detail, variant });
+  }
 
   // ── Word bank ──────────────────────────────────────────────────────────────
   const [wordBank, setWordBank] = useState<WordBankItem[]>([]);
@@ -80,10 +93,17 @@ export default function AddWordScreen() {
     setLoadingList(false);
   }, [sessionId]);
 
+  // Reload word bank every time this screen comes into focus so that
+  // entries added via the main Word Bank nav are always reflected here.
+  useFocusEffect(
+    useCallback(() => {
+      loadWordBank();
+    }, [loadWordBank])
+  );
+
   useEffect(() => {
-    loadWordBank();
     loadSessionWords();
-  }, [loadWordBank, loadSessionWords]);
+  }, [loadSessionWords]);
 
   // ── Add word ───────────────────────────────────────────────────────────────
   async function addWord(word: string, fromBank = false) {
@@ -125,18 +145,43 @@ export default function AddWordScreen() {
       .from("session_words")
       .insert({ session_id: sessionId, word: w, order_index: count ?? 0 });
 
-    // Optionally save to word bank
+    // Optionally save to word bank (with duplicate check)
     if (saveToBank && !fromBank) {
       const {
         data: { user },
       } = await supabase.auth.getUser();
       if (user) {
-        await supabase.from("word_library").insert({
-          teacher_id: user.id,
-          word: w,
-          category: "My Words",
-          difficulty: "beginner",
-        });
+        // Check for existing entry in word_library
+        const { data: existingInBank } = await supabase
+          .from("word_library")
+          .select("id")
+          .eq("teacher_id", user.id)
+          .eq("word", w)
+          .maybeSingle();
+
+        if (existingInBank) {
+          // Word already in bank — don't duplicate; just inform the user.
+          showToast(
+            "Word already in your Word Bank",
+            `"${w}" already exists in your Word Bank and was added to your word list instead.`,
+            "success",
+          );
+        } else {
+          const { error: bankError } = await supabase.from("word_library").insert({
+            teacher_id: user.id,
+            word: w,
+            category: "My Words",
+            difficulty: "beginner",
+          });
+
+          if (bankError) {
+            showToast("Failed to save to Word Bank", bankError.message, "delete");
+          } else {
+            showToast("Added to Word Bank", `"${w}" was saved to your Word Bank.`, "success");
+            // Refresh word bank so newly saved word appears immediately
+            await loadWordBank();
+          }
+        }
       }
     }
 
@@ -146,6 +191,13 @@ export default function AddWordScreen() {
     // Refresh list and switch to it so the user sees what they just added
     await loadSessionWords();
     setTab("list");
+  }
+
+  // ── Remove word from session list ───────────────────────────────────────────────
+  async function removeSessionWord(wordId: string, wordText: string) {
+    await supabase.from("session_words").delete().eq("id", wordId);
+    setSessionWords((prev) => prev.filter((w) => w.id !== wordId));
+    showToast("Word removed", `"${wordText}" was removed from the list.`, "delete");
   }
 
   // ── Reorder ────────────────────────────────────────────────────────────────
@@ -479,6 +531,19 @@ export default function AddWordScreen() {
 
                           {/* Word */}
                           <Text style={styles.wordText}>{sw.word}</Text>
+
+                          {/* Remove button */}
+                          <Pressable
+                            onPress={() => removeSessionWord(sw.id, sw.word)}
+                            hitSlop={8}
+                            style={({ pressed }) => ([
+                              styles.removeBtn,
+                              pressed && { opacity: 0.5 },
+                            ])}
+                            accessibilityLabel={`Remove ${sw.word}`}
+                          >
+                            <Ionicons name="trash-outline" size={15} color={C.red} />
+                          </Pressable>
                         </View>
                       </ScaleDecorator>
                     );
@@ -521,6 +586,15 @@ export default function AddWordScreen() {
           </View>
         </View>
       </Modal>
+
+      {/* ── Toast notifications ───────────────────────────────────────────── */}
+      <Toast
+        visible={toast.visible}
+        message={toast.message}
+        detail={toast.detail}
+        variant={toast.variant}
+        onDismiss={() => setToast((t) => ({ ...t, visible: false }))}
+      />
     </>
   );
 }
@@ -556,6 +630,7 @@ const styles = StyleSheet.create({
   // Tab bar
   tabBar: {
     flexDirection: "row",
+    justifyContent: "center",
     backgroundColor: C.white,
     borderBottomWidth: 1.5,
     borderBottomColor: C.border,
@@ -567,7 +642,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 5,
     paddingVertical: 13,
-    paddingHorizontal: 8,
+    paddingHorizontal: 14,
     borderBottomWidth: 2,
     borderBottomColor: "transparent",
     marginBottom: -1.5,
@@ -777,6 +852,12 @@ const styles = StyleSheet.create({
     color: C.navy,
     letterSpacing: 1.5,
     flex: 1,
+  },
+  removeBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    justifyContent: "center",
+    alignItems: "center",
   },
 
   // Empty states
