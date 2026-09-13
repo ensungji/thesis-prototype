@@ -439,6 +439,31 @@ export default function AdminDashboard() {
               <Ionicons name="chevron-forward" size={16} color={C.muted} />
             </Pressable>
 
+            {/* Reset Password */}
+            <Pressable
+              onPress={() => {
+                setOptionsModal(false);
+                router.push({
+                  pathname: "/admin/reset-password" as any,
+                  params: {
+                    id: selected?.id,
+                    full_name: selected?.full_name ?? "",
+                    email: selected?.email ?? "",
+                  },
+                });
+              }}
+              style={({ pressed }) => [
+                styles.optionBtn,
+                pressed && { backgroundColor: C.bg },
+              ]}
+            >
+              <View style={[styles.optionIcon, { backgroundColor: "#FFF4E0" }]}>
+                <Ionicons name="lock-closed-outline" size={18} color="#B45309" />
+              </View>
+              <Text style={styles.optionText}>Reset Password</Text>
+              <Ionicons name="chevron-forward" size={16} color={C.muted} />
+            </Pressable>
+
             {/* Toggle active/inactive — opens custom confirm sheet */}
             <Pressable
               onPress={() => selected && requestToggle(selected)}
