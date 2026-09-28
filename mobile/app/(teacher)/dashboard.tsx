@@ -11,6 +11,7 @@ import { useRouter } from "expo-router";
 import { supabase } from "../../lib/supabase";
 import { colors as C, fonts } from "../../lib/theme";
 import { BrailleCell } from "../../components/BrailleCell";
+import { getSessionTypeLabel } from "../../lib/session-timer";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -102,8 +103,9 @@ export default function Dashboard() {
   useEffect(() => {
     loadDashboard();
 
+    // Unique name per mount — prevents Supabase channel cache collisions.
     const channel = supabase
-      .channel("dashboard-realtime")
+      .channel(`dashboard-realtime-${Date.now()}`)
       .on("postgres_changes", { event: "*", schema: "public", table: "sessions" }, loadDashboard)
       .on("postgres_changes", { event: "*", schema: "public", table: "students" }, loadDashboard)
       .subscribe();
@@ -241,7 +243,7 @@ export default function Dashboard() {
                       </Text>
                     </View>
                     <Text style={styles.typeText}>
-                      {s.type === "word_list" ? "Word List" : "Manual"}
+                      {getSessionTypeLabel(s.type)}
                     </Text>
                   </View>
                 </Pressable>

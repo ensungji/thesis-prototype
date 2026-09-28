@@ -266,23 +266,29 @@ export default function Intro() {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    supabase.auth.getSession().then(async ({ data: { session } }) => {
-      if (session) {
-        const { data: profile } = await supabase
-          .from("profiles")
-          .select("role")
-          .eq("id", session.user.id)
-          .single();
-        if (profile?.role === "admin") {
-          router.replace("/admin" as any);
+    supabase.auth
+      .getSession()
+      .then(async ({ data: { session } }) => {
+        if (session) {
+          const { data: profile } = await supabase
+            .from("profiles")
+            .select("role")
+            .eq("id", session.user.id)
+            .single();
+          if (profile?.role === "admin") {
+            router.replace("/admin" as any);
+          } else {
+            router.replace("/(teacher)/dashboard" as any);
+          }
         } else {
-          router.replace("/(teacher)/dashboard" as any);
+          // 2500 ms — gives DB + assets time to fully initialize
+          setTimeout(() => setReady(true), 2500);
         }
-      } else {
-        // 2500 ms — gives DB + assets time to fully initialize
-        setTimeout(() => setReady(true), 2500);
-      }
-    });
+      })
+      .catch((err) => {
+        console.warn("Auth session check failed on startup:", err);
+        setReady(true);
+      });
   }, []);
 
   if (!ready) return <SplashScreen />;

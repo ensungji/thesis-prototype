@@ -159,9 +159,10 @@ export default function AdminDashboard() {
         router.setParams({ updated: undefined });
       }
 
-      // Realtime — re-fetch the full list on any change to the profiles table
+      // Realtime — re-fetch the full list on any change to the profiles table.
+      // Unique name per mount — prevents Supabase channel cache collisions.
       const channel = supabase
-        .channel("admin-profiles-realtime")
+        .channel(`admin-profiles-realtime-${Date.now()}`)
         .on(
           "postgres_changes",
           { event: "*", schema: "public", table: "profiles" },

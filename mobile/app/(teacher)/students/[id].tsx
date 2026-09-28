@@ -21,6 +21,7 @@ import { supabase } from "../../../lib/supabase";
 import { colors as C, fonts } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
 import { BrailleLoader } from "../../../components/BrailleLoader";
+import { Toast } from "../../../components/Toast";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -117,16 +118,32 @@ export default function StudentDetail() {
   // Edit modal
   const [editModal, setEditModal] = useState(false);
   const [editName, setEditName] = useState("");
+  // Inline error shown inside the edit modal (replaces Alert.alert)
+  const [editError, setEditError] = useState<string | null>(null);
 
   // Pair modal
   const [pairModal, setPairModal] = useState(false);
   const [deviceCode, setDeviceCode] = useState("");
   const [pairError, setPairError] = useState<string | null>(null);
 
+  // Toast for success / error feedback
+  const [toast, setToast] = useState<{
+    visible: boolean; message: string; detail?: string; variant: "success" | "delete";
+  }>({ visible: false, message: "", variant: "success" });
+
+  function showToast(message: string, detail?: string, variant: "success" | "delete" = "success") {
+    setToast({ visible: true, message, detail, variant });
+  }
+
   // ── Load data ────────────────────────────────────────────────────────────────
 
   const loadData = useCallback(async () => {
-    if (!id) return;
+    // FIX: guard with setLoading(false) on early return — without this,
+    // the spinner would hang forever if id is undefined.
+    if (!id) {
+      setLoading(false);
+      return;
+    }
     const [studentRes, deviceRes, attemptsRes] = await Promise.all([
       supabase.from("students").select("id, full_name").eq("id", id).single(),
       supabase
@@ -150,36 +167,26 @@ export default function StudentDetail() {
 
   useEffect(() => {
     loadData();
+
+    // FIX: unique channel name per mount — supabase.channel("name") returns
+    // the cached existing channel if removeChannel() is still in flight,
+    // causing "cannot add postgres_changes callbacks after subscribe()".
+    const channelName = `student-detail-${id}-${Date.now()}`;
     const channel = supabase
-      .channel(`student-detail-${id}`)
+      .channel(channelName)
       .on(
         "postgres_changes",
-        {
-          event: "DELETE",
-          schema: "public",
-          table: "students",
-          filter: `id=eq.${id}`,
-        },
+        { event: "DELETE", schema: "public", table: "students", filter: `id=eq.${id}` },
         () => router.back(),
       )
       .on(
         "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "students",
-          filter: `id=eq.${id}`,
-        },
+        { event: "UPDATE", schema: "public", table: "students", filter: `id=eq.${id}` },
         loadData,
       )
       .on(
         "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "devices",
-          filter: `paired_student_id=eq.${id}`,
-        },
+        { event: "*", schema: "public", table: "devices", filter: `paired_student_id=eq.${id}` },
         loadData,
       )
       .subscribe();
@@ -198,6 +205,7 @@ export default function StudentDetail() {
 
   async function saveEdit() {
     if (!editName.trim() || !id) return;
+    setEditError(null);
     setSaving(true);
     const { error } = await supabase
       .from("students")
@@ -205,7 +213,8 @@ export default function StudentDetail() {
       .eq("id", id);
     setSaving(false);
     if (error) {
-      Alert.alert("Error", error.message);
+      // FIX: show inline error inside the modal instead of blocking Alert.alert
+      setEditError("Failed to save. Please try again.");
       return;
     }
     setEditModal(false);
@@ -241,7 +250,9 @@ export default function StudentDetail() {
     const { error } = await supabase.from("students").delete().eq("id", id!);
     setSaving(false);
     if (error) {
+      // FIX: silent failure replaced with a visible toast
       setDeleteModal(false);
+      showToast("Delete failed", "Could not remove this student.", "delete");
       return;
     }
     router.back();
@@ -629,12 +640,18 @@ export default function StudentDetail() {
               <TextInput
                 style={styles.sheetInput}
                 value={editName}
-                onChangeText={setEditName}
+                onChangeText={(v) => { setEditName(v); setEditError(null); }}
                 autoFocus
                 autoCapitalize="words"
                 returnKeyType="done"
                 onSubmitEditing={saveEdit}
               />
+              {/* Inline error — replaces the old Alert.alert */}
+              {editError && (
+                <View style={styles.errorBox}>
+                  <Text style={styles.errorBoxText}>{editError}</Text>
+                </View>
+              )}
               <View style={styles.sheetActions}>
                 <Pressable
                   onPress={() => setEditModal(false)}
@@ -744,6 +761,15 @@ export default function StudentDetail() {
           </KeyboardAvoidingView>
         </View>
       </Modal>
+
+      {/* Toast — used for delete failure and any future feedback */}
+      <Toast
+        visible={toast.visible}
+        message={toast.message}
+        detail={toast.detail}
+        variant={toast.variant}
+        onDismiss={() => setToast((t) => ({ ...t, visible: false }))}
+      />
     </SafeAreaView>
   );
 }

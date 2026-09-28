@@ -15,7 +15,6 @@ import {
   StyleSheet,
   ActivityIndicator,
   RefreshControl,
-  Alert,
   AppState,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -28,7 +27,22 @@ import { BrailleLoader } from "../../../components/BrailleLoader";
 import { Toast } from "../../../components/Toast";
 import { wordToChunks, getPattern, isValidWord } from "../../../lib/braille";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { useKeepAwake } from "expo-keep-awake";
+import {
+  MIN_WORD_DURATION_SEC,
+  MAX_WORD_DURATION_SEC,
+  DEFAULT_WORD_DURATION_SEC,
+  clampDuration,
+  isTimedSequence,
+  isLiveSession,
+  getSessionTypeLabel,
+  loadWordDurations,
+  saveWordDurations,
+  SessionType,
+} from "../../../lib/session-timer";
 
+// Mandatory 10-second hardware cooldown between words to prevent solenoid burnout
+const COOLDOWN_DURATION_SEC = 10;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -36,14 +50,19 @@ type Session = {
   id: string;
   name: string;
   purpose: string | null;
-  type: "manual" | "word_list";
+  type: SessionType | "manual" | "word_list";
   status: string;
   started_at: string | null;
   finished_at: string | null;
 };
 type Device = { id: string; device_code: string; status: string } | null;
 type Student = { id: string; full_name: string; device: Device };
-type SessionWord = { id: string; word: string; order_index: number };
+type SessionWord = {
+  id: string;
+  word: string;
+  order_index: number;
+  duration_seconds?: number;
+};
 type WordBankItem = { id: string; word: string; category: string };
 type WordAttempt = {
   id: string;
@@ -70,6 +89,21 @@ const DEVICE_COLOR: Record<string, string> = {
   pending: C.navy,
   offline: C.red,
 };
+
+// Fisher-Yates algorithm for unbiased, true randomization
+function fisherYatesShuffle<T extends { id: string }>(items: T[]): T[] {
+  if (items.length <= 1) return [...items];
+  const shuffled = [...items];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    const isSameOrder = shuffled.every((item, idx) => item.id === items[idx].id);
+    if (!isSameOrder) break;
+  }
+  return shuffled;
+}
 
 // ── Five-cell display ─────────────────────────────────────────────────────────
 
@@ -98,6 +132,13 @@ function FiveCellDisplay({ chunk }: { chunk: string }) {
   );
 }
 
+// ── Keep awake for active session ─────────────────────────────────────────────
+
+function ActiveSessionKeepAwake() {
+  useKeepAwake();
+  return null;
+}
+
 // ── Screen ────────────────────────────────────────────────────────────────────
 
 export default function SessionDetail() {
@@ -112,6 +153,7 @@ export default function SessionDetail() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [shuffling, setShuffling] = useState(false);
 
   // ── Word list builder ───────────────────────────────────────────────────────
   // (add-word logic lives in add-word.tsx; reloaded via useFocusEffect)
@@ -123,7 +165,39 @@ export default function SessionDetail() {
   const [wordListIndex, setWordListIndex] = useState(0);
   const [wordSent, setWordSent] = useState(false);
 
-  // Tracks the word currently active (just sent, awaiting teacher "Done").
+  // ── Timed Sequence Auto-Cycle playback state ────────────────────────────────
+  const [isPlaying, setIsPlaying] = useState(true);
+  const [isCooldown, setIsCooldown] = useState(false);
+  const [timerSecondsLeft, setTimerSecondsLeft] = useState<number>(DEFAULT_WORD_DURATION_SEC);
+  const [totalWordSeconds, setTotalWordSeconds] = useState<number>(DEFAULT_WORD_DURATION_SEC);
+  const autoCycleTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isPlayingRef = useRef(true);
+  const isCooldownRef = useRef(false);
+  const timerSecondsLeftRef = useRef(DEFAULT_WORD_DURATION_SEC);
+  const wordListIndexRef = useRef(0);
+  const sessionWordsRef = useRef<SessionWord[]>([]);
+
+  useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
+
+  useEffect(() => {
+    isCooldownRef.current = isCooldown;
+  }, [isCooldown]);
+
+  useEffect(() => {
+    timerSecondsLeftRef.current = timerSecondsLeft;
+  }, [timerSecondsLeft]);
+
+  useEffect(() => {
+    wordListIndexRef.current = wordListIndex;
+  }, [wordListIndex]);
+
+  useEffect(() => {
+    sessionWordsRef.current = sessionWords;
+  }, [sessionWords]);
+
+  // Tracks the word currently active (just sent, awaiting teacher "Done" or "Clear Display").
   // null means no word is active and the teacher may type/send the next word.
   const [activeWordId, setActiveWordId] = useState<string | null>(null);
 
@@ -134,6 +208,41 @@ export default function SessionDetail() {
   // Set in doSendWord() and restored from AsyncStorage in restoreWordPosition().
   // Distinct from manualWord (text input value) and wordListIndex (list position).
   const [lastSentWord, setLastSentWord] = useState("");
+
+  // ── Live Session: 60-Second Hardware Safety Kill-Switch Refs ────────────────
+  const liveSafetyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeWordIdRef = useRef<string | null>(null);
+  const lastSentWordRef = useRef<string>("");
+  const completedWordIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    activeWordIdRef.current = activeWordId;
+  }, [activeWordId]);
+
+  useEffect(() => {
+    lastSentWordRef.current = lastSentWord;
+  }, [lastSentWord]);
+
+  useEffect(() => {
+    completedWordIdsRef.current = completedWordIds;
+  }, [completedWordIds]);
+
+  // Clean up safety timer on screen unmount
+  useEffect(() => {
+    return () => {
+      if (liveSafetyTimerRef.current) {
+        clearTimeout(liveSafetyTimerRef.current);
+        liveSafetyTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Hardware safety auto-clear notification toast
+  const [safetyToast, setSafetyToast] = useState<{
+    visible: boolean;
+    message: string;
+    detail?: string;
+  }>({ visible: false, message: "" });
 
   // Tracks which words have been broadcast this session run (for dup detection)
   const sentWords = useRef<Set<string>>(new Set()).current;
@@ -224,6 +333,16 @@ export default function SessionDetail() {
   // ── Remove-word success toast ───────────────────────────────────────────────
   const [removeWordToast, setRemoveWordToast] = useState<{ word: string } | null>(null);
 
+  // ── Validation toast (replaces Alert.alert for launch/send-word checks) ─────
+  // Non-blocking, consistent with the rest of the app's feedback style.
+  const [validationToast, setValidationToast] = useState<{
+    visible: boolean; message: string; detail?: string;
+  }>({ visible: false, message: "" });
+
+  function showValidationToast(message: string, detail?: string) {
+    setValidationToast({ visible: true, message, detail });
+  }
+
 
 
 
@@ -260,7 +379,7 @@ export default function SessionDetail() {
           .eq("session_id", id),
         supabase
           .from("session_words")
-          .select("id, word, order_index")
+          .select("*")
           .eq("session_id", id)
           .order("order_index"),
       ]);
@@ -272,7 +391,18 @@ export default function SessionDetail() {
     }));
 
     const fetchedSession = sessionRes.data;
-    const fetchedWords: SessionWord[] = wordsRes.data ?? [];
+    const rawWords = (wordsRes.data ?? []) as SessionWord[];
+    const cachedDurations = await loadWordDurations(id);
+    const fetchedWords: SessionWord[] = rawWords.map((sw) => {
+      const dur =
+        sw.duration_seconds ??
+        cachedDurations[sw.id] ??
+        DEFAULT_WORD_DURATION_SEC;
+      return {
+        ...sw,
+        duration_seconds: clampDuration(dur),
+      };
+    });
 
     setSession(fetchedSession);
     setAllStudents(merged);
@@ -287,7 +417,7 @@ export default function SessionDetail() {
         fetchedSession?.status === "paused") &&
       fetchedWords.length > 0
     ) {
-      await restoreWordPosition(id, fetchedWords);
+      await restoreWordPosition(id, fetchedWords, fetchedSession);
     }
   }, [id]);
 
@@ -295,11 +425,15 @@ export default function SessionDetail() {
   // Reads the per-session key saved on every broadcastChunk (or sendWord when
   // no devices are connected) so the teacher UI always reflects the last word,
   // regardless of device connectivity or app restart.
-  async function restoreWordPosition(sessionId: string, words: SessionWord[]) {
+  async function restoreWordPosition(
+    sessionId: string,
+    words: SessionWord[],
+    sessionObj?: Session | null
+  ) {
     try {
       const raw = await AsyncStorage.getItem(`session_word_pos_${sessionId}`);
 
-      // Pre-populate sentWords from DB records (manual sessions track history)
+      // Pre-populate sentWords from DB records (live sessions track history)
       words.forEach((sw) => sentWords.add(sw.word));
 
       if (!raw) return;
@@ -311,9 +445,17 @@ export default function SessionDetail() {
         completedWordIds?: string[];
       };
 
-      // Snap wordListIndex for word_list sessions
+      // Snap wordListIndex for timed sequence sessions
       const idx = words.findIndex((sw) => sw.word === pos.word);
-      if (idx !== -1) setWordListIndex(idx);
+      const activeIdx = idx !== -1 ? idx : 0;
+      setWordListIndex(activeIdx);
+      if (words[activeIdx]) {
+        const dur = clampDuration(
+          words[activeIdx].duration_seconds ?? DEFAULT_WORD_DURATION_SEC
+        );
+        setTotalWordSeconds(dur);
+        setTimerSecondsLeft(dur);
+      }
 
       // Restore braille display state
       const restoredChunks = wordToChunks(pos.word);
@@ -324,19 +466,33 @@ export default function SessionDetail() {
       // Restore active / completed word state
       const restoredActiveId = pos.activeWordId ?? null;
       setActiveWordId(restoredActiveId);
+      activeWordIdRef.current = restoredActiveId;
       if (pos.completedWordIds?.length) {
-        setCompletedWordIds(new Set(pos.completedWordIds));
+        const cSet = new Set(pos.completedWordIds);
+        setCompletedWordIds(cSet);
+        completedWordIdsRef.current = cSet;
       }
 
-      // Only re-fill the manual input when the word is NOT still active.
-      // If it IS active the input should remain blank (Done-gate enforced).
-      if (!restoredActiveId) {
+      const activeType = sessionObj?.type ?? session?.type;
+      const activeStatus = sessionObj?.status ?? session?.status;
+
+      // Only re-fill the manual input when not active and NOT in a live session
+      if (!restoredActiveId && !isLiveSession(activeType)) {
         setManualWord(pos.word);
       }
 
-      // Fix 3: restore lastSentWord so the Paused card always shows the correct
-      // word regardless of session type (manual or word_list).
+      // Restore lastSentWord so the Paused card always shows the correct word
       setLastSentWord(pos.word);
+      lastSentWordRef.current = pos.word;
+
+      // If this is an active live session word that was restored, restart safety kill-switch
+      if (
+        restoredActiveId &&
+        isLiveSession(activeType) &&
+        activeStatus === "in_progress"
+      ) {
+        startLiveSafetyTimer();
+      }
     } catch {
       // Silently ignore storage errors
     }
@@ -364,17 +520,22 @@ export default function SessionDetail() {
     }
   }
 
-  useEffect(() => {
-    loadData();
-  }, [loadData]);
-
-  // On focus: reload data. On blur (navigate away): auto-pause if in_progress.
-  // The cleanup return fires for every navigation-away event (back, tab switch,
-  // dashboard tap, etc.) — this is the primary pause trigger.
+  // ── Data loading on mount + every re-focus ──────────────────────────────────
+  // FIX (nav-audit): A useEffect(() => { loadData() }, [loadData]) was removed
+  // from here. It was redundant because useFocusEffect already fires loadData()
+  // on the initial mount, AND again every time the screen re-gains focus (e.g.
+  // after returning from add-word or switching back from another tab).
+  // Having both running simultaneously on mount created a race condition:
+  // two concurrent async fetches both called setLoading(true) then raced to
+  // call setLoading(false) + setSession(), with the slower one silently
+  // discarding the faster one's state update.
+  //
+  // On blur (navigating away): the cleanup fn auto-pauses an in_progress session.
   useFocusEffect(
     useCallback(() => {
       loadData();
       return () => {
+        stopLiveSafetyTimer();
         if (sessionStatusRef.current === "in_progress") {
           // Fire-and-forget — no await in cleanup
           supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
@@ -384,18 +545,29 @@ export default function SessionDetail() {
   );
 
   // ── Realtime subscriptions ──────────────────────────────────────────────────
-  // Use a ref to hold the channel so that React Strict Mode double-invocation
-  // or rapid re-renders never call .on() on an already-subscribed channel,
-  // which triggers the "Cannot add postgres_changes callback after subscribe()" error.
-  const realtimeChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
-
+  // FIX: supabase.channel("name") returns the CACHED existing channel object if
+  // a channel with that name is still alive in Supabase's internal registry
+  // (removeChannel is async — the old channel may still be unsubscribing when
+  // the component remounts). Calling .on() on an already-subscribed channel
+  // immediately throws "cannot add postgres_changes callbacks after subscribe()".
+  //
+  // Solution: append Date.now() so every effect invocation gets a guaranteed
+  // unique channel name. Supabase then always creates a fresh channel, making
+  // the in-flight cleanup of the previous one completely irrelevant.
+  //
+  // The realtimeChannelRef guard has been removed — it only protected against
+  // the same effect instance double-subscribing (which React Strict Mode can
+  // trigger), but it did not protect against Supabase's channel cache. With
+  // unique names, Strict Mode double-invocation is also safe: each run gets
+  // its own name, and the cleanup correctly removes only that specific channel.
   useEffect(() => {
     if (!id) return;
-    // Guard: if a channel for this session already exists, skip creation.
-    if (realtimeChannelRef.current) return;
+
+    // Unique channel name per mount — never collides with a stale cached channel.
+    const channelName = `session-detail-${id}-${Date.now()}`;
 
     const channel = supabase
-      .channel(`session-detail-${id}`)
+      .channel(channelName)
       // Session row changes (status, started_at, finished_at)
       .on(
         "postgres_changes",
@@ -430,11 +602,10 @@ export default function SessionDetail() {
       )
       .subscribe();
 
-    realtimeChannelRef.current = channel;
-
     return () => {
+      // Removes only THIS invocation's channel — the unique name ensures we
+      // never accidentally remove a channel belonging to a newer mount.
       supabase.removeChannel(channel);
-      realtimeChannelRef.current = null;
     };
   }, [id]);
 
@@ -494,29 +665,329 @@ export default function SessionDetail() {
     });
   }
 
+  // ── Shuffle words in Timed Sequence (strictly available during 'pending') ───
+  async function shuffleWords() {
+    if (session?.status !== "pending" || sessionWords.length <= 1 || shuffling) {
+      return;
+    }
+
+    const shuffled = fisherYatesShuffle(sessionWords);
+    const reindexed: SessionWord[] = shuffled.map((sw, index) => ({
+      ...sw,
+      order_index: index,
+    }));
+
+    // 1. Immediately update local state so teacher sees randomized order in UI
+    setSessionWords(reindexed);
+    sessionWordsRef.current = reindexed;
+
+    // 2. Persist new order_index in background to Supabase
+    setShuffling(true);
+    try {
+      await Promise.all(
+        reindexed.map((sw) =>
+          supabase
+            .from("session_words")
+            .update({ order_index: sw.order_index })
+            .eq("id", sw.id)
+        )
+      );
+    } catch (err) {
+      console.error("Failed to persist shuffled word order to database:", err);
+    } finally {
+      setShuffling(false);
+    }
+  }
+
+  // ── Clear braille devices (releases physical solenoids to prevent burnout) ──
+  async function clearDevices() {
+    const connectedDevices = allStudents
+      .filter((s) => assignedIds.has(s.id) && s.device?.status === "connected")
+      .map((s) => s.device!.id);
+
+    if (connectedDevices.length === 0) return;
+
+    const commands = connectedDevices.map((device_id) => ({
+      device_id,
+      session_id: id,
+      command_type: "display_chunk" as const,
+      payload: {
+        word: "",
+        chunk: "",
+        chunk_index: 0,
+        total_chunks: 1,
+      },
+    }));
+    await supabase.from("device_commands").insert(commands);
+  }
+
+  // ── Live Session: Safety Kill-Switch Trigger ────────────────────────────────
+  // Automatically triggers after 60s if the teacher hasn't manually clicked
+  // 'Clear Display', releasing solenoids to prevent burnout and notifying the teacher.
+  async function triggerSafetyAutoClear() {
+    liveSafetyTimerRef.current = null;
+    await clearDevices();
+    const currentActiveId = activeWordIdRef.current;
+    if (currentActiveId) {
+      setCompletedWordIds((prev) => {
+        const next = new Set(prev).add(currentActiveId);
+        completedWordIdsRef.current = next;
+        return next;
+      });
+    }
+    setActiveWordId(null);
+    activeWordIdRef.current = null;
+    setWordSent(false);
+    setChunks([]);
+
+    if (id && lastSentWordRef.current) {
+      await saveWordPosition(id, lastSentWordRef.current, 0, {
+        activeWordId: null,
+        completedWordIds: completedWordIdsRef.current,
+      });
+    }
+
+    setSafetyToast({
+      visible: true,
+      message: "Display auto-cleared for hardware safety",
+      detail: "Solenoids released after 60s inactivity",
+    });
+  }
+
+  function startLiveSafetyTimer() {
+    if (liveSafetyTimerRef.current) {
+      clearTimeout(liveSafetyTimerRef.current);
+    }
+    liveSafetyTimerRef.current = setTimeout(() => {
+      triggerSafetyAutoClear();
+    }, 60000);
+  }
+
+  function stopLiveSafetyTimer() {
+    if (liveSafetyTimerRef.current) {
+      clearTimeout(liveSafetyTimerRef.current);
+      liveSafetyTimerRef.current = null;
+    }
+  }
+
+  // ── Live Session: Manual Clear Display (Teacher Pacing Control) ──────────────
+  // Triggered when teacher clicks 'Clear Display' when the student is done reading.
+  // Instantly drops solenoids, stops the 60s timer, marks word completed, and
+  // restores the text input for the next word.
+  async function handleClearDisplay() {
+    stopLiveSafetyTimer();
+    await clearDevices();
+    if (activeWordId) {
+      const newCompleted = new Set(completedWordIds).add(activeWordId);
+      setCompletedWordIds(newCompleted);
+      completedWordIdsRef.current = newCompleted;
+    }
+    setActiveWordId(null);
+    activeWordIdRef.current = null;
+    setWordSent(false);
+    setChunks([]);
+    setManualWord("");
+
+    if (id && lastSentWord) {
+      await saveWordPosition(id, lastSentWord, chunkIndex, {
+        activeWordId: null,
+        completedWordIds: completedWordIdsRef.current,
+      });
+    }
+  }
+
+  // ── Per-word duration stepper logic (strictly 5s - 60s hard-capped) ─────────
+  async function updateWordDuration(wordId: string, newSec: number) {
+    const clamped = clampDuration(newSec);
+    setSessionWords((prev) =>
+      prev.map((w) => (w.id === wordId ? { ...w, duration_seconds: clamped } : w))
+    );
+
+    if (id) {
+      const updatedMap: Record<string, number> = {};
+      sessionWords.forEach((w) => {
+        updatedMap[w.id] =
+          w.id === wordId
+            ? clamped
+            : (w.duration_seconds ?? DEFAULT_WORD_DURATION_SEC);
+      });
+      await saveWordDurations(id, updatedMap);
+    }
+
+    try {
+      await supabase
+        .from("session_words")
+        .update({ duration_seconds: clamped })
+        .eq("id", wordId);
+    } catch {
+      // Local cache fallback handles it if column not yet in DB
+    }
+  }
+
+  // ── Auto-cycle word transition helper ──────────────────────────────────────
+  async function advanceToWord(newIdx: number, autoPlay = true) {
+    const words = sessionWordsRef.current;
+    if (newIdx < 0 || newIdx >= words.length) return;
+    await clearDevices();
+    const targetWord = words[newIdx];
+    const dur = clampDuration(
+      targetWord.duration_seconds ?? DEFAULT_WORD_DURATION_SEC
+    );
+    isCooldownRef.current = false;
+    wordListIndexRef.current = newIdx;
+    timerSecondsLeftRef.current = dur;
+    setIsCooldown(false);
+    setWordListIndex(newIdx);
+    setTotalWordSeconds(dur);
+    setTimerSecondsLeft(dur);
+    if (id) {
+      await saveWordPosition(id, targetWord.word, 0);
+    }
+    await doSendWord(targetWord.word);
+    if (autoPlay) {
+      setIsPlaying(true);
+    }
+  }
+
+  // ── Timed Sequence Auto-Cycle Interval Engine ───────────────────────────────
+  useEffect(() => {
+    if (
+      session?.status !== "in_progress" ||
+      !isTimedSequence(session?.type) ||
+      !isPlaying ||
+      sessionWords.length === 0
+    ) {
+      if (autoCycleTimer.current) {
+        clearInterval(autoCycleTimer.current);
+        autoCycleTimer.current = null;
+      }
+      return;
+    }
+
+    autoCycleTimer.current = setInterval(() => {
+      const prev = timerSecondsLeftRef.current;
+      if (prev <= 1) {
+        if (isCooldownRef.current) {
+          // ── Cooldown phase completed: advance to next word ──
+          isCooldownRef.current = false;
+          setIsCooldown(false);
+          const currentIdx = wordListIndexRef.current;
+          const words = sessionWordsRef.current;
+          const nextIdx = currentIdx + 1;
+
+          if (nextIdx < words.length) {
+            const nextDur = clampDuration(
+              words[nextIdx]?.duration_seconds ?? DEFAULT_WORD_DURATION_SEC
+            );
+            advanceToWord(nextIdx, true);
+            setTimerSecondsLeft(nextDur);
+            timerSecondsLeftRef.current = nextDur;
+          } else {
+            // Safety fallback: if no next word, auto-finish
+            if (autoCycleTimer.current) {
+              clearInterval(autoCycleTimer.current);
+              autoCycleTimer.current = null;
+            }
+            executeFinishSession();
+          }
+        } else {
+          // ── Word active duration completed ──
+          clearDevices(); // Immediately de-energize solenoids
+
+          const currentIdx = wordListIndexRef.current;
+          const words = sessionWordsRef.current;
+          const nextIdx = currentIdx + 1;
+
+          if (nextIdx < words.length) {
+            // Enter 10-second hardware cooldown phase
+            isCooldownRef.current = true;
+            setIsCooldown(true);
+            setTotalWordSeconds(COOLDOWN_DURATION_SEC);
+            setTimerSecondsLeft(COOLDOWN_DURATION_SEC);
+            timerSecondsLeftRef.current = COOLDOWN_DURATION_SEC;
+          } else {
+            // Final word in sequence completed active duration:
+            // No cooldown needed after the last word -> Auto-finish session!
+            if (autoCycleTimer.current) {
+              clearInterval(autoCycleTimer.current);
+              autoCycleTimer.current = null;
+            }
+            executeFinishSession();
+          }
+        }
+      } else {
+        const nextVal = prev - 1;
+        timerSecondsLeftRef.current = nextVal;
+        setTimerSecondsLeft(nextVal);
+      }
+    }, 1000);
+
+    return () => {
+      if (autoCycleTimer.current) {
+        clearInterval(autoCycleTimer.current);
+        autoCycleTimer.current = null;
+      }
+    };
+  }, [session?.status, session?.type, isPlaying, sessionWords.length]);
+
   // ── Session lifecycle ───────────────────────────────────────────────────────
 
   async function launchSession() {
     if (assignedIds.size === 0) {
-      Alert.alert(
-        "No students",
-        "Assign at least one student before launching.",
-      );
+      // Replaced Alert.alert — non-blocking toast is consistent with app style
+      showValidationToast("No students assigned", "Assign at least one student before launching.");
       return;
     }
-    if (session?.type === "word_list" && sessionWords.length === 0) {
-      Alert.alert(
-        "No words",
-        "Add at least one word to the list before launching.",
-      );
+    if (isTimedSequence(session?.type) && sessionWords.length === 0) {
+      showValidationToast("No words in sequence", "Add at least one word before launching.");
       return;
     }
+
+    // ── Pre-flight check: block if another session is already active ──────────
+    // A "pending" session can only be started when no other session (owned by
+    // this teacher) is currently in_progress, paused, or active. Exclude the
+    // current session itself in case of edge-case double-taps.
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (user) {
+      const { count } = await supabase
+        .from("sessions")
+        .select("id", { count: "exact", head: true })
+        .eq("teacher_id", user.id)
+        .in("status", ["in_progress", "paused", "active"])
+        .neq("id", id!);
+      if ((count ?? 0) > 0) {
+        showValidationToast(
+          "Cannot start: Another session is already active. Please end it first."
+        );
+        return;
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     setSaving(true);
     await supabase
       .from("sessions")
       .update({ status: "in_progress", started_at: new Date().toISOString() })
       .eq("id", id!);
     await loadData();
+
+    // If timed sequence, start word 0 immediately with its clamped duration
+    if (isTimedSequence(session?.type) && sessionWords.length > 0) {
+      const firstWord = sessionWords[0];
+      const dur = clampDuration(firstWord.duration_seconds ?? DEFAULT_WORD_DURATION_SEC);
+      isCooldownRef.current = false;
+      wordListIndexRef.current = 0;
+      timerSecondsLeftRef.current = dur;
+      setIsCooldown(false);
+      setWordListIndex(0);
+      setTotalWordSeconds(dur);
+      setTimerSecondsLeft(dur);
+      setIsPlaying(true);
+      await doSendWord(firstWord.word);
+    }
+
     setSaving(false);
   }
 
@@ -525,6 +996,13 @@ export default function SessionDetail() {
     // (which fires on immediate navigation after a manual pause) reads the
     // correct status and does not double-fire the DB update.
     sessionStatusRef.current = "paused";
+    setIsPlaying(false);
+    stopLiveSafetyTimer();
+    if (autoCycleTimer.current) {
+      clearInterval(autoCycleTimer.current);
+      autoCycleTimer.current = null;
+    }
+    await clearDevices(); // Release solenoids immediately
     await supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
     // [REALTIME] Send pause command to all devices
     if (!auto) await loadData();
@@ -532,6 +1010,25 @@ export default function SessionDetail() {
   }
 
   async function resumeSession() {
+    // Pre-flight check: block if another session is already active
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (user) {
+      const { count } = await supabase
+        .from("sessions")
+        .select("id", { count: "exact", head: true })
+        .eq("teacher_id", user.id)
+        .in("status", ["in_progress", "paused", "active"])
+        .neq("id", id!);
+      if ((count ?? 0) > 0) {
+        showValidationToast(
+          "Cannot start: Another session is already active. Please end it first."
+        );
+        return;
+      }
+    }
+
     // Fix 6: eagerly update the ref so that any race between resume and
     // immediate navigation is handled correctly (the cleanup will see
     // in_progress and will re-pause, which is the desired behaviour).
@@ -541,20 +1038,49 @@ export default function SessionDetail() {
       .update({ status: "in_progress" })
       .eq("id", id!);
     await loadData();
-    // Position is already restored inside loadData via restoreWordPosition
+
+    if (isTimedSequence(session?.type) && sessionWords.length > 0) {
+      const currentIdx = Math.min(sessionWords.length - 1, Math.max(0, wordListIndex));
+      const currentWord = sessionWords[currentIdx];
+      const dur = clampDuration(currentWord.duration_seconds ?? DEFAULT_WORD_DURATION_SEC);
+      isCooldownRef.current = false;
+      setIsCooldown(false);
+      setTotalWordSeconds(dur);
+      setTimerSecondsLeft(dur);
+      timerSecondsLeftRef.current = dur;
+      setIsPlaying(true);
+      await doSendWord(currentWord.word);
+    } else if (isLiveSession(session?.type) && activeWordId && lastSentWord) {
+      const liveChunks = wordToChunks(lastSentWord);
+      await broadcastChunk(liveChunks, chunkIndex, lastSentWord);
+      startLiveSafetyTimer();
+    }
   }
 
   function confirmFinish() {
-    if (activeWordId) {
-      showActiveWordError();
-      return;
-    }
     setFinishSessionModal(true);
   }
 
   async function executeFinishSession() {
     setFinishingSession(true);
+    setIsPlaying(false);
+    setIsCooldown(false);
+    isCooldownRef.current = false;
+    stopLiveSafetyTimer();
+    if (autoCycleTimer.current) {
+      clearInterval(autoCycleTimer.current);
+      autoCycleTimer.current = null;
+    }
+    await clearDevices(); // Release solenoids immediately
+    setActiveWordId(null);
+    activeWordIdRef.current = null;
+    setWordSent(false);
+    setChunks([]);
+
     const sessionName = session?.name ?? "Session";
+    // Instantly transition to finished view
+    setSession((prev) => (prev ? { ...prev, status: "finished" } : prev));
+    sessionStatusRef.current = "finished";
     await supabase
       .from("sessions")
       .update({
@@ -571,45 +1097,99 @@ export default function SessionDetail() {
   // ── Send word to devices ────────────────────────────────────────────────────
 
   async function sendWord(word: string) {
-    const w = word.trim().toUpperCase();
-    if (!w || !isValidWord(w)) {
-      Alert.alert("Invalid word", "Only letters A–Z are supported.");
+    // Input Validation: Enforce strict A-Z only validation to prevent symbol errors
+    const sanitized = word.replace(/[^a-zA-Z]/g, "").trim().toUpperCase();
+    if (!sanitized || !isValidWord(sanitized)) {
+      showValidationToast("Invalid word", "Only letters A–Z are supported.");
       return;
     }
     // Duplicate check — show confirm modal instead of silently re-sending
-    if (sentWords.has(w)) {
-      setDupWord(w);
+    if (sentWords.has(sanitized)) {
+      setDupWord(sanitized);
       setDupWordModal(true);
       return;
     }
-    await doSendWord(w);
+    await doSendWord(sanitized);
   }
 
   // Internal: broadcasts the word; also called on "Re-send Anyway"
   async function doSendWord(w: string) {
     let wordId: string | null = null;
 
-    // Record history for manual sessions
-    if (session?.type === "manual" && !sessionWords.find((sw) => sw.word === w)) {
-      const { data: wordData } = await supabase
-        .from("session_words")
-        .insert({ session_id: id, word: w, order_index: sessionWords.length })
-        .select("id, word, order_index")
-        .single();
-      if (wordData) {
-        setSessionWords((prev) => [...prev, wordData]);
-        wordId = wordData.id;
+    // Database Persistence: Immediately execute Supabase INSERT into session_words table
+    // tied to current session_id. This ensures words appear in the Finished summary.
+    if (isLiveSession(session?.type)) {
+      const orderIdx = sessionWords.length;
+      let insertedWord: SessionWord | null = null;
+
+      try {
+        const { data, error } = await supabase
+          .from("session_words")
+          .insert({
+            session_id: id,
+            word: w,
+            order_index: orderIdx,
+            duration_seconds: DEFAULT_WORD_DURATION_SEC,
+          })
+          .select("id, word, order_index, duration_seconds")
+          .maybeSingle();
+
+        if (error) {
+          // Fallback if duration_seconds column does not exist
+          const { data: fallbackData, error: fallbackError } = await supabase
+            .from("session_words")
+            .insert({
+              session_id: id,
+              word: w,
+              order_index: orderIdx,
+            })
+            .select("id, word, order_index")
+            .maybeSingle();
+
+          if (fallbackData) {
+            insertedWord = {
+              id: fallbackData.id,
+              word: fallbackData.word,
+              order_index: fallbackData.order_index,
+              duration_seconds: DEFAULT_WORD_DURATION_SEC,
+            };
+          } else if (fallbackError) {
+            console.error("Failed to insert into session_words:", fallbackError.message);
+          }
+        } else if (data) {
+          insertedWord = {
+            id: data.id,
+            word: data.word,
+            order_index: data.order_index,
+            duration_seconds: data.duration_seconds ?? DEFAULT_WORD_DURATION_SEC,
+          };
+        }
+      } catch (err) {
+        console.error("Error inserting into session_words:", err);
       }
+
+      const finalWord: SessionWord = insertedWord ?? {
+        id: `live_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        word: w,
+        order_index: orderIdx,
+        duration_seconds: DEFAULT_WORD_DURATION_SEC,
+      };
+
+      setSessionWords((prev) => [...prev, finalWord]);
+      sessionWordsRef.current = [...sessionWordsRef.current, finalWord];
+      wordId = finalWord.id;
+
+      // 60-Second Safety Kill-Switch: Start hidden 60-second hardware burnout protection timer
+      startLiveSafetyTimer();
     } else {
-      // Word already in sessionWords — find its id
+      // Timed sequence word list
       const existing = sessionWords.find((sw) => sw.word === w);
       wordId = existing?.id ?? null;
     }
 
     sentWords.add(w);
-    // Fix 2: track the last *actually sent* word so the Paused card always
-    // displays accurate context, independent of list position or input state.
     setLastSentWord(w);
+    lastSentWordRef.current = w;
     const newChunks = wordToChunks(w);
     setChunks(newChunks);
     setChunkIndex(0);
@@ -617,7 +1197,10 @@ export default function SessionDetail() {
 
     // Clear the input and mark this word as the active one
     setManualWord("");
-    if (wordId) setActiveWordId(wordId);
+    if (wordId) {
+      setActiveWordId(wordId);
+      activeWordIdRef.current = wordId;
+    }
 
     await saveWordPosition(id!, w, 0, {
       activeWordId: wordId,
@@ -626,27 +1209,16 @@ export default function SessionDetail() {
     await broadcastChunk(newChunks, 0, w);
   }
 
-  // Called when teacher presses "Done" on the active word.
-  // Marks the word completed and re-enables the input for the next word.
+  // Alias for backward compatibility — delegates to handleClearDisplay
   async function markActiveWordDone() {
-    if (!activeWordId) return;
-    const newCompleted = new Set(completedWordIds).add(activeWordId);
-    setCompletedWordIds(newCompleted);
-    setActiveWordId(null);
-    // Persist so the completed/active states survive backgrounding
-    if (id && lastSentWord) {
-      await saveWordPosition(id, lastSentWord, chunkIndex, {
-        activeWordId: null,
-        completedWordIds: newCompleted,
-      });
-    }
+    await handleClearDisplay();
   }
 
   async function goToChunk(newIdx: number) {
     if (newIdx < 0 || newIdx >= chunks.length) return;
     setChunkIndex(newIdx);
     const word =
-      session?.type === "manual"
+      isLiveSession(session?.type)
         ? lastSentWord
         : (sessionWords[wordListIndex]?.word ?? "");
     // Persist chunk position so resume always shows the exact chunk
@@ -991,7 +1563,7 @@ export default function SessionDetail() {
             <View style={styles.infoRow}>
               <View style={[styles.badge, { backgroundColor: C.blueWash }]}>
                 <Text style={[styles.badgeText, { color: C.navy }]}>
-                  {session.type === "word_list" ? "Word List" : "Manual"}
+                  {getSessionTypeLabel(session.type)}
                 </Text>
               </View>
               <View style={[styles.badge, { backgroundColor: C.border }]}>
@@ -1055,40 +1627,112 @@ export default function SessionDetail() {
             </View>
           )}
 
-          {/* Word list builder (word_list type only) */}
-          {session.type === "word_list" && (
+          {/* Timed sequence builder (timed_sequence or legacy word_list) */}
+          {isTimedSequence(session.type) && (
             <>
-              <Text style={styles.sectionLabel}>WORD LIST</Text>
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 4 }}>
+                <Text style={styles.sectionLabel}>TIMED SEQUENCE</Text>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                  {sessionWords.length > 1 && (
+                    <Pressable
+                      onPress={shuffleWords}
+                      disabled={shuffling}
+                      hitSlop={6}
+                      style={({ pressed }) => [
+                        styles.shuffleHeaderBtn,
+                        pressed && { opacity: 0.7 },
+                        shuffling && { opacity: 0.5 },
+                      ]}
+                      accessibilityLabel="Shuffle word order"
+                    >
+                      <Ionicons name="shuffle" size={13} color={C.navy} />
+                      <Text style={styles.shuffleHeaderBtnText}>
+                        {shuffling ? "Shuffling..." : "Shuffle"}
+                      </Text>
+                    </Pressable>
+                  )}
+                  <View style={styles.safetyPill}>
+                    <Ionicons name="shield-checkmark" size={12} color={C.green} />
+                    <Text style={styles.safetyPillText}>5s – 60s limit</Text>
+                  </View>
+                </View>
+              </View>
               <Text style={styles.sectionHint}>
-                Words will be sent to devices in this order.
+                Set the active duration for each word before launching.
               </Text>
 
               {sessionWords.length > 0 && (
                 <View style={styles.wordListContainer}>
-                  {sessionWords.map((sw, i) => (
-                    <View key={sw.id} style={styles.wordRow}>
-                      <Text style={styles.wordIndex}>
-                        {String(i + 1).padStart(2, "0")}
-                      </Text>
-                      <Text style={styles.wordText}>{sw.word}</Text>
-                      <Pressable
-                        onPress={() => {
-                          setWordToRemove(sw);
-                          setDeleteWordModal(true);
-                        }}
-                        hitSlop={8}
-                        style={({ pressed }) => [
-                          { opacity: pressed ? 0.5 : 1 },
-                        ]}
-                      >
-                        <Ionicons
-                          name="trash-outline"
-                          size={16}
-                          color={C.red}
-                        />
-                      </Pressable>
-                    </View>
-                  ))}
+                  {sessionWords.map((sw, i) => {
+                    const dur = sw.duration_seconds ?? DEFAULT_WORD_DURATION_SEC;
+                    return (
+                      <View key={sw.id} style={styles.sequenceWordRow}>
+                        <Text style={styles.wordIndex}>
+                          {String(i + 1).padStart(2, "0")}
+                        </Text>
+                        <Text style={styles.sequenceWordText}>{sw.word}</Text>
+
+                        {/* Per-word timer stepper: 5s to 60s hard-capped */}
+                        <View style={styles.stepperWrap}>
+                          <Pressable
+                            onPress={() => updateWordDuration(sw.id, dur - 5)}
+                            disabled={dur <= MIN_WORD_DURATION_SEC}
+                            style={({ pressed }) => [
+                              styles.stepperBtn,
+                              dur <= MIN_WORD_DURATION_SEC && styles.stepperBtnDisabled,
+                              pressed && { opacity: 0.6 },
+                            ]}
+                            hitSlop={4}
+                            accessibilityLabel="Decrease duration by 5s"
+                          >
+                            <Ionicons
+                              name="remove"
+                              size={14}
+                              color={dur <= MIN_WORD_DURATION_SEC ? C.border : C.navy}
+                            />
+                          </Pressable>
+                          <View style={styles.stepperBadge}>
+                            <Ionicons name="timer-outline" size={12} color={C.muted} />
+                            <Text style={styles.stepperText}>{dur}s</Text>
+                          </View>
+                          <Pressable
+                            onPress={() => updateWordDuration(sw.id, dur + 5)}
+                            disabled={dur >= MAX_WORD_DURATION_SEC}
+                            style={({ pressed }) => [
+                              styles.stepperBtn,
+                              dur >= MAX_WORD_DURATION_SEC && styles.stepperBtnDisabled,
+                              pressed && { opacity: 0.6 },
+                            ]}
+                            hitSlop={4}
+                            accessibilityLabel="Increase duration by 5s"
+                          >
+                            <Ionicons
+                              name="add"
+                              size={14}
+                              color={dur >= MAX_WORD_DURATION_SEC ? C.border : C.navy}
+                            />
+                          </Pressable>
+                        </View>
+
+                        <Pressable
+                          onPress={() => {
+                            setWordToRemove(sw);
+                            setDeleteWordModal(true);
+                          }}
+                          hitSlop={8}
+                          style={({ pressed }) => [
+                            { opacity: pressed ? 0.5 : 1 },
+                          ]}
+                        >
+                          <Ionicons
+                            name="trash-outline"
+                            size={16}
+                            color={C.red}
+                          />
+                        </Pressable>
+                      </View>
+                    );
+                  })}
                 </View>
               )}
 
@@ -1117,6 +1761,29 @@ export default function SessionDetail() {
                   </Pressable>
                 )}
               </View>
+
+              {/* Shuffle Words button right above the Launch Session button */}
+              {sessionWords.length > 1 && (
+                <Pressable
+                  onPress={shuffleWords}
+                  disabled={shuffling}
+                  style={({ pressed }) => [
+                    styles.shuffleWordsBtn,
+                    pressed && { opacity: 0.85 },
+                    shuffling && { opacity: 0.6 },
+                  ]}
+                  accessibilityLabel="Shuffle words"
+                >
+                  {shuffling ? (
+                    <ActivityIndicator size="small" color={C.navy} />
+                  ) : (
+                    <Ionicons name="shuffle" size={18} color={C.navy} />
+                  )}
+                  <Text style={styles.shuffleWordsBtnText}>
+                    {shuffling ? "Shuffling Words..." : "Shuffle Words"}
+                  </Text>
+                </Pressable>
+              )}
             </>
           )}
 
@@ -1222,6 +1889,15 @@ export default function SessionDetail() {
           onDismiss={() => setRemoveWordToast(null)}
         />
 
+        {/* ── Validation toast (replaces Alert.alert for launch/word checks) ── */}
+        <Toast
+          message={validationToast.message}
+          detail={validationToast.detail}
+          visible={validationToast.visible}
+          variant="delete"
+          onDismiss={() => setValidationToast((t) => ({ ...t, visible: false }))}
+        />
+
       </SafeAreaView>
     );
 
@@ -1283,6 +1959,21 @@ export default function SessionDetail() {
           variant="success"
           onDismiss={() => setFinishToast(null)}
         />
+        <Toast
+          message={validationToast.message}
+          detail={validationToast.detail}
+          visible={validationToast.visible}
+          variant="delete"
+          onDismiss={() => setValidationToast((t) => ({ ...t, visible: false }))}
+        />
+        <Toast
+          message={safetyToast.message}
+          detail={safetyToast.detail}
+          visible={safetyToast.visible}
+          variant="warning"
+          duration={5000}
+          onDismiss={() => setSafetyToast((prev) => ({ ...prev, visible: false }))}
+        />
       </SafeAreaView>
     );
 
@@ -1308,15 +1999,27 @@ export default function SessionDetail() {
             {session.purpose && (
               <Text style={styles.sessionPurpose}>{session.purpose}</Text>
             )}
-            <View
-              style={[
-                styles.badge,
-                { backgroundColor: C.blueWash, alignSelf: "flex-start" },
-              ]}
-            >
-              <Text style={[styles.badgeText, { color: C.navy }]}>
-                Finished
-              </Text>
+            <View style={styles.infoRow}>
+              <View
+                style={[
+                  styles.badge,
+                  { backgroundColor: C.blueWash, alignSelf: "flex-start" },
+                ]}
+              >
+                <Text style={[styles.badgeText, { color: C.navy }]}>
+                  {getSessionTypeLabel(session.type)}
+                </Text>
+              </View>
+              <View
+                style={[
+                  styles.badge,
+                  { backgroundColor: C.greenBg, alignSelf: "flex-start" },
+                ]}
+              >
+                <Text style={[styles.badgeText, { color: C.green }]}>
+                  Finished
+                </Text>
+              </View>
             </View>
           </View>
 
@@ -1550,6 +2253,7 @@ export default function SessionDetail() {
 
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
+      <ActiveSessionKeepAwake />
       {Header}
       <ScrollView
         contentContainerStyle={styles.scroll}
@@ -1604,65 +2308,97 @@ export default function SessionDetail() {
           </View>
         </ScrollView>
 
-        {/* ── MANUAL: type word live ────────────────────────────────── */}
-        {session.type === "manual" && (
+        {/* ── LIVE SESSION: Teacher Pacing Control with 60s Safety Net ──────── */}
+        {isLiveSession(session.type) && (
           <>
-            <View style={[styles.sectionCard, activeWordError && styles.sectionCardError]}>
-              <Text style={styles.cardLabel}>SEND WORD</Text>
-              {activeWordError && (
-                <View style={styles.activeWordErrorBanner}>
-                  <Ionicons name="warning" size={13} color={C.red} />
-                  <Text style={styles.activeWordErrorText}>
-                    Press Done first before sending another word or finishing.
+            {activeWordId ? (
+              /* Active Word state: Input is hidden, replaced by prominent Clear Display button */
+              <View style={[styles.sectionCard, styles.sectionCardActiveLive]}>
+                <View style={styles.liveCardHeader}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                    <Ionicons name="hardware-chip-outline" size={16} color={C.navy} />
+                    <Text style={styles.cardLabel}>ACTIVE DISPLAY · STUDENT READING</Text>
+                  </View>
+                  <View style={styles.activeDisplayBadge}>
+                    <Animated.View style={[styles.liveDot, { opacity: pulseAnim }]} />
+                    <Text style={styles.activeDisplayBadgeText}>Displaying</Text>
+                  </View>
+                </View>
+
+                {/* Hero card showing current word on device */}
+                <View style={styles.activeLiveHero}>
+                  <Text style={styles.activeLiveWordLabel}>WORD ON BRAILLE DISPLAY</Text>
+                  <Text style={styles.activeLiveWordText}>{lastSentWord}</Text>
+                  <Text style={styles.activeLiveWordSub}>
+                    Solenoids are engaged. When the student is done reading, click below to clear the pins and type the next word.
                   </Text>
                 </View>
-              )}
-              <View style={styles.sendRow}>
-                <TextInput
-                  style={[
-                    styles.wordInput,
-                    { flex: 1 },
-                    !!activeWordId && styles.wordInputDisabled,
+
+                {/* Prominent Clear Display button (replaces text input) */}
+                <Pressable
+                  onPress={handleClearDisplay}
+                  style={({ pressed }) => [
+                    styles.clearDisplayBtn,
+                    pressed && { opacity: 0.85 },
                   ]}
-                  value={manualWord}
-                  onChangeText={(v) => {
-                    if (activeWordId) return; // blocked until teacher marks Done
-                    setManualWord(v.toUpperCase());
-                    setWordSent(false);
-                  }}
-                  placeholder={activeWordId ? "Press Done first" : "TYPE WORD"}
-                  placeholderTextColor={activeWordId ? C.amber : C.muted}
-                  autoCapitalize="characters"
-                  autoCorrect={false}
-                  returnKeyType="send"
-                  editable={!activeWordId}
-                  onSubmitEditing={() => sendWord(manualWord)}
-                />
-                {activeWordId ? (
-                  <Pressable
-                    onPress={markActiveWordDone}
-                    style={({ pressed }) => [
-                      styles.doneBtn,
-                      pressed && { opacity: 0.85 },
-                    ]}
-                  >
-                    <Ionicons name="checkmark" size={16} color={C.white} />
-                    <Text style={styles.doneBtnText}>Done</Text>
-                  </Pressable>
-                ) : (
+                  accessibilityLabel="Clear Display and Finish Word"
+                >
+                  <Ionicons name="stop-circle" size={20} color={C.white} />
+                  <Text style={styles.clearDisplayBtnText}>Clear Display (Finish Word)</Text>
+                </Pressable>
+              </View>
+            ) : (
+              /* Ready for Next Word: Clean text input with strict A-Z validation */
+              <View style={styles.sectionCard}>
+                <View style={styles.liveCardHeader}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                    <Ionicons name="hand-right-outline" size={16} color={C.navy} />
+                    <Text style={styles.cardLabel}>LIVE SESSION · MANUAL PACING</Text>
+                  </View>
+                  <View style={styles.livePacingBadge}>
+                    <Ionicons name="shield-checkmark" size={12} color={C.green} />
+                    <Text style={styles.livePacingBadgeText}>60s Safety Net</Text>
+                  </View>
+                </View>
+
+                <Text style={styles.liveControlHint}>
+                  Type a word and send it to the braille display. You dictate the pace based on the student's progress.
+                </Text>
+
+                <View style={styles.sendRow}>
+                  <TextInput
+                    style={[styles.wordInput, { flex: 1 }]}
+                    value={manualWord}
+                    onChangeText={(v) => {
+                      // Input Validation: Enforce strict A-Z only
+                      setManualWord(v.replace(/[^a-zA-Z]/g, "").toUpperCase());
+                      setWordSent(false);
+                    }}
+                    placeholder="TYPE WORD (A–Z)"
+                    placeholderTextColor={C.muted}
+                    autoCapitalize="characters"
+                    autoCorrect={false}
+                    returnKeyType="send"
+                    onSubmitEditing={() => {
+                      if (manualWord.trim()) sendWord(manualWord);
+                    }}
+                  />
                   <Pressable
                     onPress={() => sendWord(manualWord)}
+                    disabled={!manualWord.trim()}
                     style={({ pressed }) => [
                       styles.sendBtn,
+                      !manualWord.trim() && { opacity: 0.5 },
                       pressed && { opacity: 0.85 },
                     ]}
+                    accessibilityLabel="Send word"
                   >
                     <Ionicons name="send" size={16} color="#1A1200" />
                     <Text style={styles.sendBtnText}>Send</Text>
                   </Pressable>
-                )}
+                </View>
               </View>
-            </View>
+            )}
 
             {/* Words sent history + live student responses */}
             {sessionWords.length > 0 && (
@@ -1770,37 +2506,153 @@ export default function SessionDetail() {
           </>
         )}
 
-        {/* ── WORD LIST: navigate through list ─────────────────────── */}
-        {session.type === "word_list" && sessionWords.length > 0 && (
+        {/* ── TIMED SEQUENCE: Auto-cycle playback engine ──────────── */}
+        {isTimedSequence(session.type) && sessionWords.length > 0 && (
           <View style={styles.sectionCard}>
-            <Text style={styles.cardLabel}>WORD LIST</Text>
-            <View style={styles.wordNavRow}>
-              <Pressable
-                onPress={() => {
-                  const newIdx = Math.max(0, wordListIndex - 1);
-                  setWordListIndex(newIdx);
-                  setWordSent(false);
-                  setChunks([]);
-                  // Save navigation position so resume lands on the same word
-                  saveWordPosition(id!, sessionWords[newIdx]?.word ?? "", 0);
-                }}
-                disabled={wordListIndex === 0}
-                style={({ pressed }) => [
-                  styles.navBtn,
-                  pressed && { opacity: 0.7 },
-                  wordListIndex === 0 && { opacity: 0.3 },
+            <View style={styles.timedCardHeader}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                <Ionicons name="timer" size={16} color={C.navy} />
+                <Text style={styles.cardLabel}>TIMED SEQUENCE · AUTO-CYCLE</Text>
+              </View>
+              <View
+                style={[
+                  styles.playbackStateBadge,
+                  {
+                    backgroundColor: isCooldown
+                      ? C.blueWash
+                      : isPlaying
+                      ? C.greenBg
+                      : C.brownBg,
+                  },
                 ]}
               >
-                <Ionicons name="chevron-back" size={20} color={C.navy} />
-              </Pressable>
-              <View style={styles.wordDisplay}>
-                <Text style={styles.wordDisplayIndex}>
-                  {wordListIndex + 1} / {sessionWords.length}
+                <View
+                  style={[
+                    styles.playbackStateDot,
+                    {
+                      backgroundColor: isCooldown
+                        ? C.navy
+                        : isPlaying
+                        ? C.green
+                        : C.amber,
+                    },
+                  ]}
+                />
+                <Text
+                  style={[
+                    styles.playbackStateText,
+                    {
+                      color: isCooldown
+                        ? C.navy
+                        : isPlaying
+                        ? C.green
+                        : C.brown,
+                    },
+                  ]}
+                >
+                  {isCooldown
+                    ? "Student Break"
+                    : isPlaying
+                    ? "Auto-cycling"
+                    : "Paused"}
                 </Text>
-                <Text style={styles.wordDisplayText}>
+              </View>
+            </View>
+
+            {/* Hero Word Card with Countdown & Progress */}
+            {isCooldown ? (
+              <View style={[styles.timedHeroBox, styles.timedHeroBoxCooldown]}>
+                <View style={styles.cooldownHeaderRow}>
+                  <Ionicons name="sparkles-outline" size={15} color={C.navy} />
+                  <Text style={styles.cooldownBadgeText}>STUDENT BREAK</Text>
+                </View>
+                <Text style={styles.cooldownTitleText}>Student Break</Text>
+                <Text style={styles.cooldownSubText}>
+                  Get ready for the next word:{" "}
+                  <Text style={styles.cooldownNextWordText}>
+                    {sessionWords[wordListIndex + 1]?.word ?? "Next"}
+                  </Text>
+                </Text>
+
+                {/* Visual progress bar for cooldown */}
+                <View style={styles.progressBarTrack}>
+                  <View
+                    style={[
+                      styles.progressBarFill,
+                      styles.progressBarFillCooldown,
+                      {
+                        width: `${Math.max(
+                          0,
+                          Math.min(
+                            100,
+                            (timerSecondsLeft / COOLDOWN_DURATION_SEC) * 100
+                          )
+                        )}%`,
+                      },
+                    ]}
+                  />
+                </View>
+
+                {/* Countdown counter & Solenoid safety badge */}
+                <View style={styles.timerRow}>
+                  <View style={styles.timerMain}>
+                    <Ionicons name="time-outline" size={18} color={C.navy} />
+                    <Text style={styles.timerNumber}>{timerSecondsLeft}s</Text>
+                    <Text style={styles.timerUnit}>
+                      remaining of {COOLDOWN_DURATION_SEC}s
+                    </Text>
+                  </View>
+
+                  <View style={styles.hardwareLimitBadge}>
+                    <Ionicons name="checkmark-circle-outline" size={12} color={C.green} />
+                    <Text style={styles.hardwareLimitText}>Display Cleared</Text>
+                  </View>
+                </View>
+              </View>
+            ) : (
+              <View style={styles.timedHeroBox}>
+                <Text style={styles.wordDisplayIndex}>
+                  Word {wordListIndex + 1} of {sessionWords.length}
+                </Text>
+                <Text style={styles.timedWordText}>
                   {sessionWords[wordListIndex]?.word}
                 </Text>
-                {/* Show attempt result for current word live */}
+
+                {/* Visual progress bar */}
+                <View style={styles.progressBarTrack}>
+                  <View
+                    style={[
+                      styles.progressBarFill,
+                      {
+                        width: `${Math.max(
+                          0,
+                          Math.min(
+                            100,
+                            (timerSecondsLeft / (totalWordSeconds || 1)) * 100
+                          )
+                        )}%`,
+                      },
+                    ]}
+                  />
+                </View>
+
+                {/* Countdown counter & Solenoid safety badge */}
+                <View style={styles.timerRow}>
+                  <View style={styles.timerMain}>
+                    <Ionicons name="time-outline" size={18} color={C.navy} />
+                    <Text style={styles.timerNumber}>{timerSecondsLeft}s</Text>
+                    <Text style={styles.timerUnit}>
+                      remaining of {totalWordSeconds}s
+                    </Text>
+                  </View>
+
+                  <View style={styles.hardwareLimitBadge}>
+                    <Ionicons name="shield-outline" size={11} color={C.muted} />
+                    <Text style={styles.hardwareLimitText}>Max 60s coil safe</Text>
+                  </View>
+                </View>
+
+                {/* Live student response for this active word */}
                 {(() => {
                   const currentWord = sessionWords[wordListIndex]?.word;
                   const attempt = liveAttempts.find((a) => a.word === currentWord);
@@ -1809,7 +2661,12 @@ export default function SessionDetail() {
                     <View
                       style={[
                         styles.wordListAttemptBadge,
-                        { backgroundColor: attempt.is_correct ? C.greenBg : C.redBg },
+                        {
+                          backgroundColor: attempt.is_correct
+                            ? C.greenBg
+                            : C.redBg,
+                          marginTop: 8,
+                        },
                       ]}
                     >
                       <Text
@@ -1818,47 +2675,57 @@ export default function SessionDetail() {
                           { color: attempt.is_correct ? C.green : C.red },
                         ]}
                       >
-                        {attempt.is_correct ? "✓ Correct" : "✗ Wrong"}
+                        {attempt.is_correct
+                          ? "✓ Student Answered Correctly"
+                          : "✗ Incorrect Attempt"}
                       </Text>
                     </View>
                   );
                 })()}
               </View>
+            )}
+
+            {/* Playback Controls Row: strictly automated flow (Pause/Resume only) */}
+            <View style={styles.playbackControlsRow}>
+              {/* Play / Pause Timer */}
               <Pressable
-                onPress={() => {
-                  const newIdx = Math.min(sessionWords.length - 1, wordListIndex + 1);
-                  setWordListIndex(newIdx);
-                  setWordSent(false);
-                  setChunks([]);
-                  // Save navigation position so resume lands on the same word
-                  saveWordPosition(id!, sessionWords[newIdx]?.word ?? "", 0);
+                onPress={async () => {
+                  if (isPlaying) {
+                    setIsPlaying(false);
+                    await clearDevices(); // Drop coils while paused
+                  } else {
+                    setIsPlaying(true);
+                    if (!isCooldown) {
+                      const currentWord = sessionWords[wordListIndex];
+                      if (currentWord) {
+                        await doSendWord(currentWord.word);
+                      }
+                    }
+                  }
                 }}
-                disabled={wordListIndex === sessionWords.length - 1}
                 style={({ pressed }) => [
-                  styles.navBtn,
-                  pressed && { opacity: 0.7 },
-                  wordListIndex === sessionWords.length - 1 && { opacity: 0.3 },
+                  styles.playbackBtnPrimary,
+                  pressed && { opacity: 0.85 },
                 ]}
+                accessibilityLabel={
+                  isPlaying ? "Pause sequence timer" : "Resume sequence timer"
+                }
               >
-                <Ionicons name="chevron-forward" size={20} color={C.navy} />
+                <Ionicons
+                  name={isPlaying ? "pause" : "play"}
+                  size={20}
+                  color="#1A1200"
+                />
+                <Text style={styles.playbackBtnPrimaryText}>
+                  {isPlaying ? "Pause Timer" : "Resume Timer"}
+                </Text>
               </Pressable>
             </View>
-            <Pressable
-              onPress={() => sendWord(sessionWords[wordListIndex]?.word ?? "")}
-              style={({ pressed }) => [
-                styles.sendBtn,
-                { alignSelf: "stretch", justifyContent: "center" },
-                pressed && { opacity: 0.85 },
-              ]}
-            >
-              <Ionicons name="send" size={16} color="#1A1200" />
-              <Text style={styles.sendBtnText}>Send to Devices</Text>
-            </Pressable>
           </View>
         )}
 
-        {/* ── Word list: live responses feed ───────────────────────── */}
-        {session.type === "word_list" && liveAttempts.length > 0 && (
+        {/* ── Timed Sequence: live responses feed ───────────────────────── */}
+        {isTimedSequence(session.type) && liveAttempts.length > 0 && (
           <View style={styles.sectionCard}>
             <Text style={styles.cardLabel}>LIVE RESPONSES</Text>
             <View style={{ gap: 8 }}>
@@ -1892,14 +2759,16 @@ export default function SessionDetail() {
             <View style={styles.chunkHeader}>
               <Text style={styles.cardLabel}>DEVICE DISPLAY</Text>
               <Text style={styles.chunkCount}>
-                Chunk {chunkIndex + 1} of {chunks.length}
+                {isCooldown
+                  ? "Display Cleared"
+                  : `Chunk ${chunkIndex + 1} of ${chunks.length}`}
               </Text>
             </View>
 
-            <FiveCellDisplay chunk={chunks[chunkIndex]} />
+            <FiveCellDisplay chunk={isCooldown ? "" : chunks[chunkIndex]} />
 
             {/* Chunk navigation */}
-            {chunks.length > 1 && (
+            {!isCooldown && chunks.length > 1 && (
               <View style={styles.chunkNavRow}>
                 <Pressable
                   onPress={() => goToChunk(chunkIndex - 1)}
@@ -1928,13 +2797,40 @@ export default function SessionDetail() {
               </View>
             )}
             <Text style={styles.deviceHint}>
-              Student presses Next / Back on the device to navigate chunks.
+              {isCooldown
+                ? "Display is cleared for a short break before the next word."
+                : "Student presses Next / Back on the device to navigate chunks."}
             </Text>
           </View>
         )}
       </ScrollView>
       {DupWordModal}
       {FinishSessionModal}
+      {/* ── Validation toast (invalid word from send-word check) ─────────── */}
+      <Toast
+        message={validationToast.message}
+        detail={validationToast.detail}
+        visible={validationToast.visible}
+        variant="delete"
+        onDismiss={() => setValidationToast((t) => ({ ...t, visible: false }))}
+      />
+      {/* ── Finish toast ─────────────────────────────────────────────────── */}
+      <Toast
+        message="Session finished"
+        detail={finishToast?.name}
+        visible={!!finishToast}
+        variant="success"
+        onDismiss={() => setFinishToast(null)}
+      />
+      {/* ── Hardware Safety Kill-Switch Toast (60s inactivity) ───────────── */}
+      <Toast
+        message={safetyToast.message}
+        detail={safetyToast.detail}
+        visible={safetyToast.visible}
+        variant="warning"
+        duration={5000}
+        onDismiss={() => setSafetyToast((prev) => ({ ...prev, visible: false }))}
+      />
     </SafeAreaView>
   );
 }
@@ -2072,6 +2968,75 @@ const styles = StyleSheet.create({
     flex: 1,
     letterSpacing: 1,
   },
+  safetyPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: C.greenBg,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 100,
+  },
+  safetyPillText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    color: C.green,
+    fontWeight: "700",
+  },
+  sequenceWordRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    padding: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+    backgroundColor: C.white,
+  },
+  sequenceWordText: {
+    fontFamily: fonts.mono,
+    fontSize: 15,
+    color: C.navy,
+    flex: 1,
+    letterSpacing: 1,
+  },
+  stepperWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: C.bg,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: C.border,
+    padding: 2,
+    gap: 2,
+  },
+  stepperBtn: {
+    width: 24,
+    height: 24,
+    borderRadius: 6,
+    backgroundColor: C.white,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  stepperBtnDisabled: {
+    opacity: 0.35,
+    backgroundColor: "transparent",
+  },
+  stepperBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+    paddingHorizontal: 6,
+    minWidth: 42,
+    justifyContent: "center",
+  },
+  stepperText: {
+    fontFamily: fonts.mono,
+    fontSize: 12,
+    color: C.navy,
+    fontWeight: "700",
+  },
   deleteBtn: { padding: 6, borderRadius: 8, backgroundColor: C.redBg },
   wordListActions: {
     flexDirection: "row",
@@ -2103,6 +3068,40 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   reorderBtnText: { fontFamily: fonts.heading, fontSize: 14, color: C.navy },
+  shuffleWordsBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    backgroundColor: C.blueWash,
+    borderWidth: 1.5,
+    borderColor: C.navy,
+    borderRadius: 14,
+    paddingVertical: 13,
+    paddingHorizontal: 16,
+  },
+  shuffleWordsBtnText: {
+    fontFamily: fonts.heading,
+    fontSize: 14,
+    color: C.navy,
+  },
+  shuffleHeaderBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: C.blueWash,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 100,
+    borderWidth: 1,
+    borderColor: "rgba(12,68,124,0.25)",
+  },
+  shuffleHeaderBtnText: {
+    fontFamily: fonts.mono,
+    fontSize: 11,
+    fontWeight: "700",
+    color: C.navy,
+  },
 
   // Manual session history
   historyRow: {
@@ -2477,6 +3476,103 @@ const styles = StyleSheet.create({
   },
   doneBtnText: { fontFamily: fonts.heading, fontSize: 14, color: C.white },
 
+  // Live Session manual pacing & prominent Clear Display styles
+  liveCardHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  livePacingBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: C.greenBg,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 100,
+  },
+  livePacingBadgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    fontWeight: "700",
+    color: C.green,
+  },
+  liveControlHint: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: C.muted,
+    lineHeight: 18,
+  },
+  sectionCardActiveLive: {
+    borderColor: C.navy,
+    borderWidth: 2,
+    backgroundColor: C.white,
+  },
+  activeDisplayBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    backgroundColor: C.greenBg,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 100,
+  },
+  activeDisplayBadgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    fontWeight: "700",
+    color: C.green,
+  },
+  activeLiveHero: {
+    backgroundColor: C.blueWash,
+    borderRadius: 14,
+    padding: 16,
+    alignItems: "center",
+    gap: 6,
+    borderWidth: 1.5,
+    borderColor: "rgba(12,68,124,0.2)",
+  },
+  activeLiveWordLabel: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    color: C.muted,
+    letterSpacing: 1.5,
+  },
+  activeLiveWordText: {
+    fontFamily: fonts.mono,
+    fontSize: 32,
+    fontWeight: "700",
+    color: C.navy,
+    letterSpacing: 4,
+  },
+  activeLiveWordSub: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: C.muted,
+    textAlign: "center",
+    lineHeight: 18,
+  },
+  clearDisplayBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    backgroundColor: C.navy,
+    borderRadius: 14,
+    paddingVertical: 15,
+    paddingHorizontal: 20,
+    shadowColor: C.navy,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    elevation: 3,
+  },
+  clearDisplayBtnText: {
+    fontFamily: fonts.heading,
+    fontSize: 15,
+    color: C.white,
+  },
+
   // Word list navigation
   wordNavRow: { flexDirection: "row", alignItems: "center", gap: 12 },
   navBtn: {
@@ -2496,6 +3592,183 @@ const styles = StyleSheet.create({
     fontSize: 22,
     color: C.navy,
     letterSpacing: 3,
+  },
+
+  // Active Timed Sequence playback card
+  timedCardHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  playbackStateBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 100,
+  },
+  playbackStateDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  playbackStateText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    fontWeight: "700",
+    letterSpacing: 0.3,
+  },
+  timedHeroBox: {
+    backgroundColor: C.bg,
+    borderRadius: 14,
+    padding: 16,
+    alignItems: "center",
+    gap: 10,
+    borderWidth: 1.5,
+    borderColor: C.border,
+  },
+  timedHeroBoxCooldown: {
+    backgroundColor: C.blueWash,
+    borderColor: "rgba(12,68,124,0.3)",
+  },
+  cooldownHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: C.white,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 100,
+    borderWidth: 1,
+    borderColor: "rgba(12,68,124,0.2)",
+  },
+  cooldownBadgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    fontWeight: "700",
+    color: C.navy,
+    letterSpacing: 0.8,
+  },
+  cooldownTitleText: {
+    fontFamily: fonts.heading,
+    fontSize: 22,
+    color: C.navy,
+    textAlign: "center",
+  },
+  cooldownSubText: {
+    fontFamily: fonts.body,
+    fontSize: 13,
+    color: C.muted,
+    textAlign: "center",
+  },
+  cooldownNextWordText: {
+    fontFamily: fonts.mono,
+    fontWeight: "700",
+    color: C.navy,
+  },
+  timedWordText: {
+    fontFamily: fonts.mono,
+    fontSize: 28,
+    color: C.navy,
+    letterSpacing: 3,
+    fontWeight: "700",
+  },
+  progressBarTrack: {
+    width: "100%",
+    height: 6,
+    backgroundColor: C.border,
+    borderRadius: 3,
+    overflow: "hidden",
+  },
+  progressBarFill: {
+    height: "100%",
+    backgroundColor: C.amber,
+    borderRadius: 3,
+  },
+  progressBarFillCooldown: {
+    backgroundColor: C.navy,
+  },
+  timerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    width: "100%",
+    paddingTop: 4,
+  },
+  timerMain: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  timerNumber: {
+    fontFamily: fonts.mono,
+    fontSize: 18,
+    color: C.navy,
+    fontWeight: "700",
+  },
+  timerUnit: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: C.muted,
+  },
+  hardwareLimitBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: C.white,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  hardwareLimitText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    color: C.muted,
+  },
+
+  playbackControlsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  playbackBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 4,
+    backgroundColor: C.white,
+    borderWidth: 1.5,
+    borderColor: C.border,
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+  },
+  playbackBtnDisabled: {
+    opacity: 0.35,
+  },
+  playbackBtnText: {
+    fontFamily: fonts.heading,
+    fontSize: 13,
+    color: C.navy,
+  },
+  playbackBtnPrimary: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    backgroundColor: C.amber,
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+  },
+  playbackBtnPrimaryText: {
+    fontFamily: fonts.heading,
+    fontSize: 14,
+    color: "#1A1200",
   },
 
   // Chunk display

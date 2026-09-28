@@ -13,7 +13,7 @@ type Props = {
   /** Optional bold detail shown on a second line (e.g. the session name). */
   detail?: string;
   visible: boolean;
-  variant?: "success" | "delete";
+  variant?: "success" | "delete" | "warning";
   /** Auto-dismiss after this many ms. Defaults to 3500. */
   duration?: number;
   onDismiss: () => void;
@@ -30,9 +30,15 @@ export function Toast({
   const translateY = useRef(new Animated.Value(120)).current;
   const opacity    = useRef(new Animated.Value(0)).current;
   const progress   = useRef(new Animated.Value(1)).current;
+  // Holds the auto-dismiss timer so we can clear it before starting a new one.
+  const timerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (!visible) return;
+
+    // Cancel any in-flight dismiss timer before starting a fresh one.
+    // This is what prevents rapid-fire toasts from being dismissed early.
+    if (timerRef.current) clearTimeout(timerRef.current);
 
     progress.setValue(1);
 
@@ -56,9 +62,13 @@ export function Toast({
       useNativeDriver: false,
     }).start();
 
-    const timer = setTimeout(slideOut, duration);
-    return () => clearTimeout(timer);
-  }, [visible]);
+    timerRef.current = setTimeout(slideOut, duration);
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  // Re-run (and reset the timer) whenever visible, message, or detail changes.
+  // This handles rapid successive toasts where visible stays `true`.
+  }, [visible, message, detail]);
 
   function slideOut() {
     Animated.parallel([
@@ -81,11 +91,12 @@ export function Toast({
 
   if (!visible) return null;
 
-  const isDelete      = variant === "delete";
-  const accentColor   = isDelete ? C.red   : C.green;
-  const iconName      = isDelete ? "trash" : "checkmark-circle";
+  const isDelete    = variant === "delete";
+  const isWarning   = variant === "warning";
+  const accentColor = isDelete ? C.red : isWarning ? C.amber : C.green;
+  const iconName    = isDelete ? "trash" : isWarning ? "shield-checkmark" : "checkmark-circle";
   // Icon pill: a tinted wash of the accent colour
-  const iconBg        = isDelete ? C.redBg : C.greenBg;
+  const iconBg      = isDelete ? C.redBg : isWarning ? C.brownBg : C.greenBg;
 
   return (
     <Animated.View

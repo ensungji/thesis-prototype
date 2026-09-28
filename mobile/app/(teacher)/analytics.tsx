@@ -1,7 +1,7 @@
 // mobile/app/(teacher)/analytics.tsx
 // Class performance overview — real data from Supabase word_attempts.
 
-import { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import {
   View, Text, Pressable, ScrollView, StyleSheet,
   ActivityIndicator, RefreshControl,
@@ -205,18 +205,26 @@ export default function AnalyticsScreen() {
   useEffect(() => { loadAnalytics(); }, [loadAnalytics]);
 
   // ── Realtime: re-compute analytics whenever a new attempt comes in ───────────
+  // FIX 1: Use Date.now() suffix — unique channel name per mount.
+  // FIX 2: Use a stable ref for the callback so the realtime useEffect only
+  // runs once on mount, not every time period changes (which would churn
+  // through channel create/destroy on every filter switch).
+  const loadAnalyticsRef = React.useRef(loadAnalytics);
+  useEffect(() => { loadAnalyticsRef.current = loadAnalytics; });
+
   useEffect(() => {
     const channel = supabase
-      .channel("analytics-realtime")
+      .channel(`analytics-realtime-${Date.now()}`)
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "word_attempts" },
-        () => { loadAnalytics(); }
+        () => { loadAnalyticsRef.current(); }
       )
       .subscribe();
 
     return () => { supabase.removeChannel(channel); };
-  }, [loadAnalytics]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   if (loading) {
     return (
