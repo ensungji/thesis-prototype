@@ -359,7 +359,7 @@ export default function SessionDetail() {
   // useFocusEffect / AppState cleanup callbacks always read the latest value.
   const appStateRef      = useRef(AppState.currentState);
   const sessionStatusRef = useRef<string | null>(null);
-  const clearDevicesRef = useRef<(commandType?: string) => Promise<void>>(async () => {});
+  const clearDevicesRef = useRef<() => Promise<void>>(async () => {});
   useEffect(() => {
     sessionStatusRef.current = session?.status ?? null;
   }, [session?.status]);
@@ -373,7 +373,7 @@ export default function SessionDetail() {
       ) {
         // Hardware safety: release solenoids before auto-pausing
         stopLiveSafetyTimer();
-        clearDevicesRef.current("session_paused");
+        clearDevicesRef.current();
         // Direct DB update + local state (ref-safe, no stale closure)
         await supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
         setSession((prev) => (prev ? { ...prev, status: "paused" } : prev));
@@ -609,7 +609,7 @@ export default function SessionDetail() {
         stopLiveSafetyTimer();
         if (sessionStatusRef.current === "in_progress") {
           // Hardware safety: release solenoids when leaving the screen
-          clearDevicesRef.current("session_paused");
+          clearDevicesRef.current();
           // Fire-and-forget — no await in cleanup
           supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
         }
@@ -773,7 +773,7 @@ export default function SessionDetail() {
   }
 
   // ── Clear braille devices (releases physical solenoids to prevent burnout) ──
-  async function clearDevices(commandType: string = "display_chunk") {
+  async function clearDevices() {
     const connectedDevices = allStudents
       .filter((s) => assignedIds.has(s.id) && s.device?.status === "connected")
       .map((s) => s.device!.id);
@@ -783,7 +783,7 @@ export default function SessionDetail() {
     const commands = connectedDevices.map((device_id) => ({
       device_id,
       session_id: id,
-      command_type: commandType,
+      command_type: "display_chunk" as const,
       payload: {
         word: "",
         chunk: "",
@@ -1047,7 +1047,6 @@ export default function SessionDetail() {
       .update({ status: "in_progress", started_at: new Date().toISOString() })
       .eq("id", id!);
     await loadData();
-    await clearDevices("session_started"); // start sound on every device
 
     // If timed sequence, start word 0 immediately with its clamped duration
     if (isTimedSequence(session?.type) && sessionWords.length > 0) {
@@ -1078,7 +1077,7 @@ export default function SessionDetail() {
       clearInterval(autoCycleTimer.current);
       autoCycleTimer.current = null;
     }
-    await clearDevices("session_paused"); // Release solenoids + pause sound
+    await clearDevices(); // Release solenoids immediately
     await supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
     // [REALTIME] Send pause command to all devices
     if (!auto) await loadData();
@@ -1114,7 +1113,6 @@ export default function SessionDetail() {
       .update({ status: "in_progress" })
       .eq("id", id!);
     await loadData();
-    await clearDevices("session_resumed"); // resume sound on every device
 
     if (isTimedSequence(session?.type) && sessionWords.length > 0) {
       const currentIdx = Math.min(sessionWords.length - 1, Math.max(0, wordListIndex));
@@ -1148,7 +1146,7 @@ export default function SessionDetail() {
       clearInterval(autoCycleTimer.current);
       autoCycleTimer.current = null;
     }
-    await clearDevices("session_finished"); // Release solenoids + finish sound
+    await clearDevices(); // Release solenoids immediately
     setActiveWordId(null);
     activeWordIdRef.current = null;
     setWordSent(false);
