@@ -26,6 +26,13 @@ import { BrailleLoader } from "../../../components/BrailleLoader";
 
 type Student = { id: string; full_name: string };
 type Device = { id: string; device_code: string; status: string } | null;
+type DeviceOption = {
+  id: string;
+  device_code: string;
+  status: string;
+  paired_student_id: string | null;
+  paired_name: string | null;
+};
 type WordAttempt = {
   id: string;
   word: string;
@@ -117,11 +124,16 @@ export default function StudentDetail() {
   // Edit modal
   const [editModal, setEditModal] = useState(false);
   const [editName, setEditName] = useState("");
+  const [editError, setEditError] = useState<string | null>(null);
 
   // Pair modal
   const [pairModal, setPairModal] = useState(false);
-  const [deviceCode, setDeviceCode] = useState("");
+  const [deviceList, setDeviceList] = useState<DeviceOption[]>([]);
+  const [loadingDevices, setLoadingDevices] = useState(false);
   const [pairError, setPairError] = useState<string | null>(null);
+
+  // Disconnect-device confirm modal
+  const [unpairModal, setUnpairModal] = useState(false);
 
   // ── Load data ────────────────────────────────────────────────────────────────
 
@@ -151,7 +163,7 @@ export default function StudentDetail() {
   useEffect(() => {
     loadData();
     const channel = supabase
-      .channel(`student-detail-${id}`)
+      .channel(`student-detail-${id}-${Date.now()}`)
       .on(
         "postgres_changes",
         {
@@ -199,13 +211,14 @@ export default function StudentDetail() {
   async function saveEdit() {
     if (!editName.trim() || !id) return;
     setSaving(true);
+    setEditError(null);
     const { error } = await supabase
       .from("students")
       .update({ full_name: editName.trim() })
       .eq("id", id);
     setSaving(false);
     if (error) {
-      Alert.alert("Error", error.message);
+      setEditError(error.message);
       return;
     }
     setEditModal(false);
@@ -214,23 +227,76 @@ export default function StudentDetail() {
 
   // ── Pair device ───────────────────────────────────────────────────────────────
 
-  async function pairDevice() {
-    if (!deviceCode.trim() || !id) return;
-    const code = deviceCode.trim().toUpperCase();
+  // Loads every registered device + who it's paired to
+  async function loadDeviceList() {
+    setLoadingDevices(true);
+    const { data: devs } = await supabase
+      .from("devices")
+      .select("id, device_code, status, paired_student_id")
+      .order("device_code");
+
+    const pairedIds = (devs ?? [])
+      .map((d) => d.paired_student_id)
+      .filter((x): x is string => !!x);
+
+    const { data: names } = pairedIds.length
+      ? await supabase.from("students").select("id, full_name").in("id", pairedIds)
+      : { data: [] as { id: string; full_name: string }[] };
+
+    setDeviceList(
+      (devs ?? []).map((d) => ({
+        ...d,
+        paired_name: names?.find((n) => n.id === d.paired_student_id)?.full_name ?? null,
+      })),
+    );
+    setLoadingDevices(false);
+  }
+
+  function openPairModal() {
+    setPairError(null);
+    loadDeviceList();
+    setPairModal(true);
+  }
+
+  async function pairWith(target: DeviceOption) {
+    if (!id) return;
     setSaving(true);
     setPairError(null);
-    const { error } = await supabase
+
+    // 1. Release this student's current device (if any)
+    await supabase
       .from("devices")
-      .upsert(
-        { device_code: code, paired_student_id: id },
-        { onConflict: "device_code" },
-      );
+      .update({ paired_student_id: null })
+      .eq("paired_student_id", id);
+
+    // 2. Claim the new one — only if it's still free
+    const { data, error } = await supabase
+      .from("devices")
+      .update({ paired_student_id: id })
+      .eq("id", target.id)
+      .is("paired_student_id", null)
+      .select("id");
+
     setSaving(false);
-    if (error) {
-      setPairError("This device code is already in use by another student.");
+    if (error || !data?.length) {
+      setPairError("That device was just paired to someone else. Pick another.");
+      loadDeviceList();
       return;
     }
     setPairModal(false);
+    loadData();
+  }
+
+  async function unpairDevice() {
+    if (!id) return;
+    setSaving(true);
+    await supabase
+      .from("devices")
+      .update({ paired_student_id: null })
+      .eq("paired_student_id", id);
+    setSaving(false);
+    setPairModal(false);
+    setUnpairModal(false);
     loadData();
   }
 
@@ -325,11 +391,7 @@ export default function StudentDetail() {
             </View>
           ) : (
             <Pressable
-              onPress={() => {
-                setDeviceCode("");
-                setPairError(null);
-                setPairModal(true);
-              }}
+              onPress={openPairModal}
               style={({ pressed }) => [
                 styles.pairChip,
                 pressed && { opacity: 0.8 },
@@ -486,9 +548,7 @@ export default function StudentDetail() {
             <Pressable
               onPress={() => {
                 setOptionsModal(false);
-                setDeviceCode(device?.device_code ?? "");
-                setPairError(null);
-                setTimeout(() => setPairModal(true), 300);
+                setTimeout(openPairModal, 300);
               }}
               style={({ pressed }) => [
                 styles.optionBtn,
@@ -507,6 +567,28 @@ export default function StudentDetail() {
               </Text>
               <Ionicons name="chevron-forward" size={16} color={C.muted} />
             </Pressable>
+
+            {/* Disconnect Device (only when paired) */}
+            {device && (
+              <Pressable
+                onPress={() => {
+                  setOptionsModal(false);
+                  setTimeout(() => setUnpairModal(true), 300);
+                }}
+                style={({ pressed }) => [
+                  styles.optionBtn,
+                  pressed && { backgroundColor: C.bg },
+                ]}
+              >
+                <View style={[styles.optionIcon, { backgroundColor: C.redBg }]}>
+                  <Ionicons name="unlink-outline" size={18} color={C.red} />
+                </View>
+                <Text style={[styles.optionText, { color: C.red }]}>
+                  Disconnect Device
+                </Text>
+                <Ionicons name="chevron-forward" size={16} color={C.muted} />
+              </Pressable>
+            )}
 
             {/* Remove Student — destructive */}
             <Pressable
@@ -629,12 +711,20 @@ export default function StudentDetail() {
               <TextInput
                 style={styles.sheetInput}
                 value={editName}
-                onChangeText={setEditName}
+                onChangeText={(v) => {
+                  setEditName(v);
+                  setEditError(null);
+                }}
                 autoFocus
                 autoCapitalize="words"
                 returnKeyType="done"
                 onSubmitEditing={saveEdit}
               />
+              {editError && (
+                <View style={styles.errorBox}>
+                  <Text style={styles.errorBoxText}>{editError}</Text>
+                </View>
+              )}
               <View style={styles.sheetActions}>
                 <Pressable
                   onPress={() => setEditModal(false)}
@@ -685,34 +775,83 @@ export default function StudentDetail() {
               <Text style={styles.sheetTitle}>
                 {device ? "Change Device" : "Pair Device"}
               </Text>
-              <Text style={styles.sheetLabel}>Device code</Text>
-              <TextInput
-                style={[
-                  styles.sheetInput,
-                  { fontFamily: fonts.mono, letterSpacing: 1.5 },
-                ]}
-                value={deviceCode}
-                onChangeText={(v) => {
-                  setDeviceCode(v.toUpperCase());
-                  setPairError(null);
-                }}
-                placeholder="e.g. DOTS-4F2A"
-                placeholderTextColor={C.muted}
-                autoFocus
-                autoCapitalize="characters"
-                autoCorrect={false}
-                returnKeyType="done"
-                onSubmitEditing={pairDevice}
-              />
               <Text style={styles.sheetHint}>
-                Find this code in the firmware serial monitor or on the device
-                label.
+                Devices appear here automatically once they are turned on.
               </Text>
+
+              {loadingDevices ? (
+                <ActivityIndicator color={C.navy} style={{ marginVertical: 16 }} />
+              ) : deviceList.length === 0 ? (
+                <Text style={styles.sheetHint}>
+                  No devices yet. Power on a device and wait a few seconds.
+                </Text>
+              ) : (
+                <ScrollView style={{ maxHeight: 320 }}>
+                  {deviceList.map((d) => {
+                    const isMine = d.paired_student_id === id;
+                    const isTaken = !!d.paired_student_id && !isMine;
+                    const online = d.status === "connected";
+                    return (
+                      <Pressable
+                        key={d.id}
+                        disabled={isTaken || isMine || saving}
+                        onPress={() => pairWith(d)}
+                        style={({ pressed }) => [
+                          styles.devRow,
+                          isMine && styles.devRowMine,
+                          isTaken && { opacity: 0.5 },
+                          pressed && { opacity: 0.7 },
+                        ]}
+                      >
+                        <View
+                          style={[
+                            styles.devDot,
+                            { backgroundColor: online ? C.green : C.muted },
+                          ]}
+                        />
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.devCode}>{d.device_code}</Text>
+                          <Text style={styles.devSub}>
+                            {online ? "Online" : "Offline"}
+                          </Text>
+                        </View>
+                        <View
+                          style={[
+                            styles.devBadge,
+                            {
+                              backgroundColor: isMine
+                                ? C.blueWash
+                                : isTaken
+                                  ? C.redBg
+                                  : C.greenBg,
+                            },
+                          ]}
+                        >
+                          <Text
+                            style={[
+                              styles.devBadgeText,
+                              { color: isMine ? C.navy : isTaken ? C.red : C.green },
+                            ]}
+                          >
+                            {isMine
+                              ? "Paired to this student"
+                              : isTaken
+                                ? `Paired · ${d.paired_name ?? "another student"}`
+                                : "Available"}
+                          </Text>
+                        </View>
+                      </Pressable>
+                    );
+                  })}
+                </ScrollView>
+              )}
+
               {pairError && (
                 <View style={styles.errorBox}>
                   <Text style={styles.errorBoxText}>{pairError}</Text>
                 </View>
               )}
+
               <View style={styles.sheetActions}>
                 <Pressable
                   onPress={() => setPairModal(false)}
@@ -722,26 +861,78 @@ export default function StudentDetail() {
                     pressed && { opacity: 0.7 },
                   ]}
                 >
-                  <Text style={styles.btnCancelText}>Cancel</Text>
+                  <Text style={styles.btnCancelText}>Close</Text>
                 </Pressable>
-                <Pressable
-                  onPress={pairDevice}
-                  disabled={saving}
-                  style={({ pressed }) => [
-                    styles.sheetBtn,
-                    styles.btnConfirm,
-                    pressed && { opacity: 0.85 },
-                  ]}
-                >
-                  {saving ? (
-                    <ActivityIndicator color="#1A1200" />
-                  ) : (
-                    <Text style={styles.btnConfirmText}>Pair Device</Text>
-                  )}
-                </Pressable>
+                {device && (
+                  <Pressable
+                    onPress={unpairDevice}
+                    disabled={saving}
+                    style={({ pressed }) => [
+                      styles.sheetBtn,
+                      styles.btnDelete,
+                      pressed && { opacity: 0.85 },
+                    ]}
+                  >
+                    {saving ? (
+                      <ActivityIndicator color={C.white} />
+                    ) : (
+                      <Text style={styles.btnDeleteText}>Unpair</Text>
+                    )}
+                  </Pressable>
+                )}
               </View>
             </View>
           </KeyboardAvoidingView>
+        </View>
+      </Modal>
+
+      {/* ── Disconnect device confirm ───────────────────────────────────────── */}
+      <Modal
+        visible={unpairModal}
+        animationType="slide"
+        transparent
+        onRequestClose={() => setUnpairModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <Pressable
+            style={styles.backdrop}
+            onPress={() => setUnpairModal(false)}
+          />
+          <View style={styles.sheet}>
+            <View style={styles.handle} />
+            <Text style={styles.sheetTitle}>Disconnect device?</Text>
+            <Text style={styles.sheetHint}>
+              {device?.device_code} will be unpaired from {student?.full_name}{" "}
+              and become available for other students. No data is deleted.
+            </Text>
+            <View style={styles.sheetActions}>
+              <Pressable
+                onPress={() => setUnpairModal(false)}
+                style={({ pressed }) => [
+                  styles.sheetBtn,
+                  styles.btnCancel,
+                  pressed && { opacity: 0.7 },
+                ]}
+              >
+                <Text style={styles.btnCancelText}>Keep</Text>
+              </Pressable>
+              <Pressable
+                onPress={unpairDevice}
+                disabled={saving}
+                style={({ pressed }) => [
+                  styles.sheetBtn,
+                  styles.btnDelete,
+                  pressed && { opacity: 0.85 },
+                ]}
+              >
+                {saving ? (
+                  <ActivityIndicator color={C.white} />
+                ) : (
+                  <Text style={styles.btnDeleteText}>Disconnect</Text>
+                )}
+              </Pressable>
+            </View>
+          </View>
         </View>
       </Modal>
     </SafeAreaView>
@@ -938,6 +1129,25 @@ const styles = StyleSheet.create({
     borderColor: C.red,
   },
   errorBoxText: { fontFamily: fonts.body, fontSize: 13, color: C.red },
+
+  // Device picker
+  devRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    padding: 14,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderColor: C.border,
+    backgroundColor: C.white,
+    marginBottom: 8,
+  },
+  devRowMine: { borderColor: C.navy, backgroundColor: C.blueWash },
+  devDot: { width: 10, height: 10, borderRadius: 5 },
+  devCode: { fontFamily: fonts.mono, fontSize: 15, color: C.ink, letterSpacing: 1 },
+  devSub: { fontFamily: fonts.body, fontSize: 12, color: C.muted },
+  devBadge: { borderRadius: 100, paddingHorizontal: 10, paddingVertical: 4 },
+  devBadgeText: { fontFamily: fonts.mono, fontSize: 11 },
 
   // Options sheet
   optionBtn: {

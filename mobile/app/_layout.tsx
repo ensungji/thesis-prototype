@@ -1,5 +1,6 @@
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { Stack } from "expo-router";
+import { ErrorBoundary } from "../components/ErrorBoundary";
 import { useFonts } from "expo-font";
 import {
   Nunito_700Bold,
@@ -33,7 +34,9 @@ export default function RootLayout() {
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <Stack screenOptions={{ headerShown: false }} />
+      <ErrorBoundary>
+        <Stack screenOptions={{ headerShown: false }} />
+      </ErrorBoundary>
     </GestureHandlerRootView>
   );
 }

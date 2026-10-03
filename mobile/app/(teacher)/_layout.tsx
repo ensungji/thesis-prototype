@@ -65,6 +65,19 @@ export default function TeacherLayout() {
           title: "Students",
           tabBarIcon: ({ color, size }) => <Ionicons name="people" color={color} size={size} />,
         }}
+        listeners={() => ({
+          tabPress: (e) => {
+            // FIX (nav-audit): Without this listener, pressing the Students tab
+            // from another tab lands on whatever screen is at the top of the
+            // students stack (e.g. a student detail), not the list root.
+            // e.preventDefault() suppresses that default jump-to-current-top
+            // behaviour, and router.navigate() resets the stack to the index.
+            // router.navigate (Expo Router) is used — NOT navigation.navigate
+            // (raw React Navigation) — to keep Expo Router's URL state in sync.
+            e.preventDefault();
+            router.navigate("/(teacher)/students");
+          },
+        })}
       />
       <Tabs.Screen
         name="sessions"
@@ -72,6 +85,19 @@ export default function TeacherLayout() {
           title: "Sessions",
           tabBarIcon: ({ color, size }) => <Ionicons name="book" color={color} size={size} />,
         }}
+        listeners={() => ({
+          tabPress: (e) => {
+            // FIX (prev-session): Without this listener, pressing the Sessions
+            // tab from another tab lands on sessions/[id] if that was previously
+            // pushed onto the stack (e.g. via a Recent Sessions deep link from
+            // the dashboard), hiding the session list and the Add Session button.
+            // router.navigate (Expo Router) is used — NOT navigation.navigate
+            // (raw React Navigation) — to prevent state divergence that caused
+            // the "Word Bank → Sessions → black screen" crash.
+            e.preventDefault();
+            router.navigate("/(teacher)/sessions");
+          },
+        })}
       />
       <Tabs.Screen
         name="analytics"
@@ -86,6 +112,16 @@ export default function TeacherLayout() {
           title: "Word Bank",
           tabBarIcon: ({ color, size }) => <Ionicons name="bookmarks" color={color} size={size} />,
         }}
+        listeners={() => ({
+          tabPress: (e) => {
+            // FIX (nav-audit): Without this listener, pressing the Word Bank
+            // tab from another tab lands on wordbank/new if the user previously
+            // tapped "+" inside the word bank, instead of returning to the
+            // word bank list. Same fix pattern as Students and Sessions tabs.
+            e.preventDefault();
+            router.navigate("/(teacher)/wordbank");
+          },
+        })}
       />
     </Tabs>
   );

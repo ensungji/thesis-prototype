@@ -1,5 +1,5 @@
 // mobile/app/(teacher)/wordbank/index.tsx
-// Teacher's personal word bank — search and delete words.
+// Teacher's personal word bank — search, filter by difficulty, and delete words.
 // Add words via the dedicated new.tsx screen.
 
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -18,11 +18,42 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
-import { colors as C, fonts } from "../../../lib/theme";
+import { colors as C, fonts, radius } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
 import { BrailleLoader } from "../../../components/BrailleLoader";
+import { Toast } from "../../../components/Toast";
+import {
+  type Difficulty,
+  DIFFICULTIES,
+  DIFFICULTY_META,
+} from "../../../lib/difficulty";
+import { wordbankToastBus } from "../../../lib/wordbank-toast";
 
-type Word = { id: string; word: string };
+type Word = { id: string; word: string; difficulty: string };
+
+// ─── Difficulty badge (tinted, subtle — sits on word cards) ──────────────────
+
+function DifficultyBadge({ difficulty }: { difficulty: string }) {
+  const meta = DIFFICULTY_META[difficulty as Difficulty];
+  if (!meta) return null;
+  return (
+    <View
+      style={[
+        styles.badge,
+        {
+          backgroundColor: meta.badgeBg,
+          borderColor: meta.badgeBorder,
+        },
+      ]}
+    >
+      <Text style={[styles.badgeText, { color: meta.badgeText }]}>
+        {meta.label}
+      </Text>
+    </View>
+  );
+}
+
+// ─── Screen ───────────────────────────────────────────────────────────────────
 
 export default function WordBankScreen() {
   const router = useRouter();
@@ -30,6 +61,7 @@ export default function WordBankScreen() {
   const [words, setWords] = useState<Word[]>([]);
   const [filtered, setFiltered] = useState<Word[]>([]);
   const [search, setSearch] = useState("");
+  const [diffFilter, setDiffFilter] = useState<Difficulty | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -38,6 +70,25 @@ export default function WordBankScreen() {
   const [wordToDelete, setWordToDelete] = useState<Word | null>(null);
   const [deleting, setDeleting] = useState(false);
 
+  // Unified toast state — single Toast instance handles both add and delete.
+  // toastKey forces a full remount on every showToast call so animation state
+  // always resets cleanly, even when overriding an already-visible toast.
+  const [toastKey, setToastKey] = useState(0);
+  const [toastVisible, setToastVisible] = useState(false);
+  const [toastData, setToastData] = useState<{
+    message: string;
+    detail: string;
+    variant: "success" | "delete";
+  }>({ message: "", detail: "", variant: "success" });
+
+  function showToast(message: string, detail: string, variant: "success" | "delete") {
+    setToastData({ message, detail, variant });
+    setToastVisible(true);
+    // Incrementing the key unmounts + remounts Toast, resetting all animation
+    // state. This guarantees a new toast always overrides the current one.
+    setToastKey((k) => k + 1);
+  }
+
   const loadWords = useCallback(async () => {
     const {
       data: { user },
@@ -45,39 +96,51 @@ export default function WordBankScreen() {
     if (!user) return;
     const { data } = await supabase
       .from("word_library")
-      .select("id, word")
+      .select("id, word, difficulty")
       .eq("teacher_id", user.id)
       .order("word");
     setWords(data ?? []);
-    setFiltered(data ?? []);
     setLoading(false);
     setRefreshing(false);
   }, []);
 
-  // Initial load
-  useEffect(() => {
-    loadWords();
-  }, [loadWords]);
+  useEffect(() => { loadWords(); }, [loadWords]);
 
-  // Reload when navigating back from add screen
   const loadWordsRef = useRef(loadWords);
   useEffect(() => { loadWordsRef.current = loadWords; });
   useFocusEffect(
-    useCallback(() => {
-      loadWordsRef.current();
-    }, [])
+    useCallback(() => { loadWordsRef.current(); }, [])
   );
 
-  // Live search filter
+  // Subscribe to the word bank event bus while this screen is mounted.
+  // new.tsx emits 'added' synchronously before unmounting, so the listener
+  // is already registered here and receives the event reliably.
   useEffect(() => {
-    if (!search.trim()) {
-      setFiltered(words);
-      return;
+    wordbankToastBus.on((event) => {
+      if (event.type === "added") {
+        showToast("Added to Word Bank", event.word, "success");
+      }
+    });
+    return () => wordbankToastBus.off();
+  }, []);
+
+  // Combined search + difficulty filter
+  useEffect(() => {
+    let result = words;
+    if (search.trim()) {
+      result = result.filter((w) =>
+        w.word.toLowerCase().includes(search.toLowerCase())
+      );
     }
-    setFiltered(
-      words.filter((w) => w.word.toLowerCase().includes(search.toLowerCase())),
-    );
-  }, [search, words]);
+    if (diffFilter) {
+      result = result.filter((w) => w.difficulty === diffFilter);
+    }
+    setFiltered(result);
+  }, [search, diffFilter, words]);
+
+  function toggleDiffFilter(d: Difficulty) {
+    setDiffFilter((prev) => (prev === d ? null : d));
+  }
 
   function confirmDelete(word: Word) {
     setWordToDelete(word);
@@ -88,11 +151,12 @@ export default function WordBankScreen() {
     if (!wordToDelete) return;
     setDeleting(true);
     await supabase.from("word_library").delete().eq("id", wordToDelete.id);
-    // Optimistic update — remove from local state immediately
+    const removed = wordToDelete.word;
     setWords((prev) => prev.filter((w) => w.id !== wordToDelete.id));
     setDeleting(false);
     setDeleteModal(false);
     setWordToDelete(null);
+    showToast("Removed from Word Bank", removed, "delete");
   }
 
   if (loading) {
@@ -107,7 +171,15 @@ export default function WordBankScreen() {
 
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
-      {/* Header */}
+      <Toast
+        key={toastKey}
+        visible={toastVisible}
+        variant={toastData.variant}
+        message={toastData.message}
+        detail={toastData.detail}
+        onDismiss={() => setToastVisible(false)}
+      />
+      {/* ── Header ── */}
       <View style={styles.header}>
         <Text style={styles.title}>Word Bank</Text>
         <Pressable
@@ -121,7 +193,7 @@ export default function WordBankScreen() {
         </Pressable>
       </View>
 
-      {/* Search */}
+      {/* ── Search ── */}
       <View style={styles.searchBar}>
         <Ionicons name="search" size={16} color={C.muted} />
         <TextInput
@@ -141,12 +213,70 @@ export default function WordBankScreen() {
         )}
       </View>
 
-      {/* Count */}
+      {/* ── Difficulty filter chips ── */}
+      <View style={styles.filterRow}>
+        {/* "All" chip */}
+        <Pressable
+          onPress={() => setDiffFilter(null)}
+          style={({ pressed }) => [
+            styles.chip,
+            diffFilter === null ? styles.chipAllActive : styles.chipInactive,
+            pressed && { opacity: 0.8 },
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel="Show all difficulties"
+        >
+          <Text
+            style={[
+              styles.chipLabel,
+              diffFilter === null
+                ? styles.chipAllActiveLabel
+                : styles.chipInactiveLabel,
+            ]}
+          >
+            All
+          </Text>
+        </Pressable>
+
+        {DIFFICULTIES.map((d) => {
+          const meta = DIFFICULTY_META[d];
+          const active = diffFilter === d;
+          return (
+            <Pressable
+              key={d}
+              onPress={() => toggleDiffFilter(d)}
+              style={({ pressed }) => [
+                styles.chip,
+                active
+                  ? [styles.chipActive, { backgroundColor: meta.chipBg }]
+                  : styles.chipInactive,
+                pressed && { opacity: 0.8 },
+              ]}
+              accessibilityRole="button"
+              accessibilityLabel={`Filter by ${meta.label}`}
+            >
+              <Text
+                style={[
+                  styles.chipLabel,
+                  active
+                    ? [styles.chipActiveLabel, { color: meta.chipText }]
+                    : styles.chipInactiveLabel,
+                ]}
+              >
+                {meta.label}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </View>
+
+      {/* ── Count ── */}
       <Text style={styles.countText}>
         {filtered.length} word{filtered.length !== 1 ? "s" : ""}
+        {diffFilter ? ` · ${DIFFICULTY_META[diffFilter].label}` : ""}
       </Text>
 
-      {/* Word list */}
+      {/* ── Word list ── */}
       <FlatList
         data={filtered}
         keyExtractor={(w) => w.id}
@@ -154,10 +284,7 @@ export default function WordBankScreen() {
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
-            onRefresh={() => {
-              setRefreshing(true);
-              loadWords();
-            }}
+            onRefresh={() => { setRefreshing(true); loadWords(); }}
             tintColor={C.navy}
           />
         }
@@ -170,7 +297,10 @@ export default function WordBankScreen() {
                 emptyColor="rgba(12,68,124,0.1)"
               />
             </View>
-            <Text style={styles.wordText}>{item.word}</Text>
+            <View style={styles.wordCardBody}>
+              <Text style={styles.wordText}>{item.word}</Text>
+              <DifficultyBadge difficulty={item.difficulty} />
+            </View>
             <Pressable
               onPress={() => confirmDelete(item)}
               hitSlop={8}
@@ -188,20 +318,20 @@ export default function WordBankScreen() {
           <View style={styles.empty}>
             <BrailleCell pattern={[]} size={16} emptyColor={C.border} />
             <Text style={styles.emptyTitle}>
-              {search.trim()
-                ? `No results for "${search}"`
+              {search.trim() || diffFilter
+                ? "No matching words"
                 : "Word bank is empty"}
             </Text>
             <Text style={styles.emptyBody}>
-              {search.trim()
-                ? "Try a different search."
+              {search.trim() || diffFilter
+                ? "Try a different search or filter."
                 : "Tap + Add to start building your personal word bank. Words saved here appear when building session word lists."}
             </Text>
           </View>
         }
       />
 
-      {/* Delete confirmation modal (kept as modal — it's just a quick confirm) */}
+      {/* ── Delete confirmation modal ── */}
       <Modal
         visible={deleteModal}
         animationType="slide"
@@ -215,16 +345,13 @@ export default function WordBankScreen() {
           />
           <View style={styles.sheet}>
             <View style={styles.handle} />
-
             <View style={styles.deleteWordPreview}>
               <Text style={styles.deleteWordText}>{wordToDelete?.word}</Text>
             </View>
-
             <Text style={styles.deleteTitle}>Remove from Word Bank?</Text>
             <Text style={styles.deleteSub}>
               {"This word will be removed from your bank. It won't affect sessions that have already used it."}
             </Text>
-
             <View style={styles.sheetActions}>
               <Pressable
                 onPress={() => setDeleteModal(false)}
@@ -259,10 +386,15 @@ export default function WordBankScreen() {
   );
 }
 
+// ─── Styles ───────────────────────────────────────────────────────────────────
+
+const CHIP_INACTIVE_BG = "#EDEDEB"; // slightly darker than bg — visible but quiet
+
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: C.bg },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 
+  // ── Header ──────────────────────────────────────────────────────────────────
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -285,12 +417,14 @@ const styles = StyleSheet.create({
   },
   addBtnText: { fontFamily: fonts.heading, fontSize: 14, color: "#1A1200" },
 
+  // ── Search ──────────────────────────────────────────────────────────────────
   searchBar: {
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
-    margin: 16,
-    marginBottom: 4,
+    marginHorizontal: 16,
+    marginTop: 16,
+    marginBottom: 12,
     backgroundColor: C.white,
     borderRadius: 12,
     borderWidth: 1.5,
@@ -305,6 +439,58 @@ const styles = StyleSheet.create({
     color: C.ink,
     letterSpacing: 1,
   },
+
+  // ── Filter chips ─────────────────────────────────────────────────────────────
+  filterRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",           // chips wrap to next line on small screens
+    justifyContent: "flex-start", // cluster left — no space-between stretch
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingBottom: 12,
+  },
+
+  // Shared chip base
+  chip: {
+    borderRadius: radius.pill,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  chipLabel: {
+    fontFamily: fonts.headingSemi,
+    fontSize: 13,
+    letterSpacing: 0.3,
+  },
+
+  // Inactive state — subtle muted gray, no border
+  chipInactive: {
+    backgroundColor: CHIP_INACTIVE_BG,
+  },
+  chipInactiveLabel: {
+    color: C.muted,
+  },
+
+  // Active "All" chip — sleek near-black
+  chipAllActive: {
+    backgroundColor: C.ink,
+  },
+  chipAllActiveLabel: {
+    color: C.white,
+  },
+
+  // Active difficulty chip — backgroundColor applied inline from meta.chipBg
+  chipActive: {
+    // backgroundColor set inline
+  },
+  chipActiveLabel: {
+    fontFamily: fonts.heading,
+    color: C.white,
+  },
+
+  // ── Count ───────────────────────────────────────────────────────────────────
   countText: {
     fontFamily: fonts.mono,
     fontSize: 11,
@@ -314,6 +500,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0.5,
   },
 
+  // ── Word list ────────────────────────────────────────────────────────────────
   list: { paddingHorizontal: 16, gap: 10, paddingBottom: 40 },
 
   wordCard: {
@@ -334,15 +521,33 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+  wordCardBody: {
+    flex: 1,
+    gap: 6,
+  },
   wordText: {
     fontFamily: fonts.mono,
     fontSize: 18,
     color: C.navy,
-    flex: 1,
     letterSpacing: 2,
   },
   deleteBtn: { padding: 6, borderRadius: 8, backgroundColor: C.redBg },
 
+  // ── Difficulty badge (tinted — on word cards) ────────────────────────────────
+  badge: {
+    alignSelf: "flex-start",
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+  },
+  badgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    letterSpacing: 0.8,
+  },
+
+  // ── Empty state ──────────────────────────────────────────────────────────────
   empty: {
     alignItems: "center",
     justifyContent: "center",
@@ -364,7 +569,7 @@ const styles = StyleSheet.create({
     lineHeight: 22,
   },
 
-  // Delete modal
+  // ── Delete modal ─────────────────────────────────────────────────────────────
   modalOverlay: { flex: 1, justifyContent: "flex-end" },
   backdrop: {
     ...StyleSheet.absoluteFillObject,
@@ -397,7 +602,6 @@ const styles = StyleSheet.create({
   btnCancelText: { fontFamily: fonts.heading, fontSize: 15, color: C.navy },
   btnDelete: { backgroundColor: C.red },
   btnDeleteText: { fontFamily: fonts.heading, fontSize: 15, color: C.white },
-
   deleteWordPreview: {
     alignSelf: "center",
     backgroundColor: C.redBg,

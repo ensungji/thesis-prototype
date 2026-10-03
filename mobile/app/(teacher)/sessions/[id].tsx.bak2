@@ -28,7 +28,6 @@ import { Toast } from "../../../components/Toast";
 import { wordToChunks, getPattern, isValidWord } from "../../../lib/braille";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useKeepAwake } from "expo-keep-awake";
-import { createAudioPlayer, type AudioPlayer } from "expo-audio";
 import {
   MIN_WORD_DURATION_SEC,
   MAX_WORD_DURATION_SEC,
@@ -70,10 +69,6 @@ type WordAttempt = {
   is_correct: boolean;
   response_time_ms: number | null;
   attempted_at: string;
-  transcript?: string | null;
-  needs_review?: boolean | null;
-  audio_path?: string | null;
-  graded_by?: string | null;
 };
 type StudentSessionStats = { student: Student; attempts: WordAttempt[] };
 
@@ -133,79 +128,6 @@ function FiveCellDisplay({ chunk }: { chunk: string }) {
         );
       })}
     </View>
-  );
-}
-
-// ── Voice answer grading helpers ──────────────────────────────────────────────
-
-type AttemptStatus = "correct" | "wrong" | "review";
-
-function attemptStatus(a: WordAttempt): AttemptStatus {
-  if (a.needs_review) return "review";
-  return a.is_correct ? "correct" : "wrong";
-}
-
-const STATUS_STYLE: Record<AttemptStatus, { bg: string; fg: string; label: string; short: string }> = {
-  correct: { bg: C.greenBg, fg: C.green, label: "✓ Correct", short: "Correct" },
-  wrong:   { bg: C.redBg,   fg: C.red,   label: "✗ Wrong",   short: "Wrong" },
-  review:  { bg: C.brownBg, fg: C.brown, label: "⚠ Review",  short: "Review" },
-};
-
-const cleanTranscript = (t?: string | null) => (t ?? "").replace(/[.!?,]/g, "").trim();
-
-// Plays a student's recording from the private "answers" bucket
-function PlayRecordingButton({ path }: { path: string | null }) {
-  const [loading, setLoading] = useState(false);
-  const [playing, setPlaying] = useState(false);
-  const playerRef = useRef<AudioPlayer | null>(null);
-
-  useEffect(() => {
-    return () => {
-      playerRef.current?.remove();
-      playerRef.current = null;
-    };
-  }, []);
-
-  async function toggle() {
-    if (!path) return;
-    if (playing && playerRef.current) {
-      playerRef.current.pause();
-      setPlaying(false);
-      return;
-    }
-    setLoading(true);
-    const { data } = await supabase.storage.from("answers").createSignedUrl(path, 600);
-    setLoading(false);
-    if (!data?.signedUrl) return;
-
-    playerRef.current?.remove();
-    const player = createAudioPlayer({ uri: data.signedUrl });
-    playerRef.current = player;
-    player.addListener("playbackStatusUpdate", (st) => {
-      if (st.didJustFinish) setPlaying(false);
-    });
-    player.play();
-    setPlaying(true);
-  }
-
-  return (
-    <Pressable
-      onPress={toggle}
-      disabled={!path || loading}
-      hitSlop={8}
-      style={({ pressed }) => [
-        styles.playBtn,
-        !path && { opacity: 0.3 },
-        pressed && { opacity: 0.7 },
-      ]}
-      accessibilityLabel={playing ? "Stop recording" : "Play recording"}
-    >
-      {loading ? (
-        <ActivityIndicator size="small" color={C.navy} />
-      ) : (
-        <Ionicons name={playing ? "stop" : "play"} size={12} color={C.navy} />
-      )}
-    </Pressable>
   );
 }
 
@@ -359,7 +281,6 @@ export default function SessionDetail() {
   // useFocusEffect / AppState cleanup callbacks always read the latest value.
   const appStateRef      = useRef(AppState.currentState);
   const sessionStatusRef = useRef<string | null>(null);
-  const clearDevicesRef = useRef<(commandType?: string) => Promise<void>>(async () => {});
   useEffect(() => {
     sessionStatusRef.current = session?.status ?? null;
   }, [session?.status]);
@@ -371,9 +292,6 @@ export default function SessionDetail() {
         appStateRef.current === "active" &&
         sessionStatusRef.current === "in_progress"
       ) {
-        // Hardware safety: release solenoids before auto-pausing
-        stopLiveSafetyTimer();
-        clearDevicesRef.current("session_paused");
         // Direct DB update + local state (ref-safe, no stale closure)
         await supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
         setSession((prev) => (prev ? { ...prev, status: "paused" } : prev));
@@ -608,8 +526,6 @@ export default function SessionDetail() {
       return () => {
         stopLiveSafetyTimer();
         if (sessionStatusRef.current === "in_progress") {
-          // Hardware safety: release solenoids when leaving the screen
-          clearDevicesRef.current("session_paused");
           // Fire-and-forget — no await in cleanup
           supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
         }
@@ -773,7 +689,7 @@ export default function SessionDetail() {
   }
 
   // ── Clear braille devices (releases physical solenoids to prevent burnout) ──
-  async function clearDevices(commandType: string = "display_chunk") {
+  async function clearDevices() {
     const connectedDevices = allStudents
       .filter((s) => assignedIds.has(s.id) && s.device?.status === "connected")
       .map((s) => s.device!.id);
@@ -783,7 +699,7 @@ export default function SessionDetail() {
     const commands = connectedDevices.map((device_id) => ({
       device_id,
       session_id: id,
-      command_type: commandType,
+      command_type: "display_chunk" as const,
       payload: {
         word: "",
         chunk: "",
@@ -793,7 +709,6 @@ export default function SessionDetail() {
     }));
     await supabase.from("device_commands").insert(commands);
   }
-  clearDevicesRef.current = clearDevices;
 
   // ── Live Session: Safety Kill-Switch Trigger ────────────────────────────────
   // Automatically triggers after 60s if the teacher hasn't manually clicked
@@ -1047,7 +962,6 @@ export default function SessionDetail() {
       .update({ status: "in_progress", started_at: new Date().toISOString() })
       .eq("id", id!);
     await loadData();
-    await clearDevices("session_started"); // start sound on every device
 
     // If timed sequence, start word 0 immediately with its clamped duration
     if (isTimedSequence(session?.type) && sessionWords.length > 0) {
@@ -1078,7 +992,7 @@ export default function SessionDetail() {
       clearInterval(autoCycleTimer.current);
       autoCycleTimer.current = null;
     }
-    await clearDevices("session_paused"); // Release solenoids + pause sound
+    await clearDevices(); // Release solenoids immediately
     await supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
     // [REALTIME] Send pause command to all devices
     if (!auto) await loadData();
@@ -1114,7 +1028,6 @@ export default function SessionDetail() {
       .update({ status: "in_progress" })
       .eq("id", id!);
     await loadData();
-    await clearDevices("session_resumed"); // resume sound on every device
 
     if (isTimedSequence(session?.type) && sessionWords.length > 0) {
       const currentIdx = Math.min(sessionWords.length - 1, Math.max(0, wordListIndex));
@@ -1148,7 +1061,7 @@ export default function SessionDetail() {
       clearInterval(autoCycleTimer.current);
       autoCycleTimer.current = null;
     }
-    await clearDevices("session_finished"); // Release solenoids + finish sound
+    await clearDevices(); // Release solenoids immediately
     setActiveWordId(null);
     activeWordIdRef.current = null;
     setWordSent(false);
@@ -1328,35 +1241,12 @@ export default function SessionDetail() {
     setStatsModal(true);
     const { data } = await supabase
       .from("word_attempts")
-      .select("id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by")
+      .select("id, word, is_correct, response_time_ms, attempted_at")
       .eq("student_id", student.id)
       .eq("session_id", id!)
       .order("attempted_at", { ascending: true });
     setStatsData({ student, attempts: data ?? [] });
     setLoadingStats(false);
-  }
-
-  // Teacher manually corrects an auto-graded answer
-  async function overrideAttempt(attempt: WordAttempt, correct: boolean) {
-    const patch = { is_correct: correct, needs_review: false, graded_by: "teacher" };
-    setStatsData((prev) =>
-      prev
-        ? {
-            ...prev,
-            attempts: prev.attempts.map((a) =>
-              a.id === attempt.id ? { ...a, ...patch } : a
-            ),
-          }
-        : prev
-    );
-    const { error } = await supabase
-      .from("word_attempts")
-      .update(patch)
-      .eq("id", attempt.id);
-    if (error) {
-      console.error("Override failed:", error.message);
-      if (statsData) openStudentStats(statsData.student); // reload real values
-    }
   }
 
   const assignedStudents = allStudents.filter((s) => assignedIds.has(s.id));
@@ -2220,10 +2110,8 @@ export default function SessionDetail() {
 
                       {/* Summary chips */}
                       {(() => {
-                        const graded  = statsData.attempts.filter((a) => !a.needs_review);
-                        const total   = graded.length;
-                        const correct = graded.filter((a) => a.is_correct).length;
-                        const pending = statsData.attempts.length - graded.length;
+                        const total   = statsData.attempts.length;
+                        const correct = statsData.attempts.filter((a) => a.is_correct).length;
                         const acc     = total > 0 ? Math.round((correct / total) * 100) : 0;
                         const timed   = statsData.attempts.filter((a) => (a.response_time_ms ?? 0) > 0);
                         const avgMs   = timed.length > 0
@@ -2247,9 +2135,7 @@ export default function SessionDetail() {
                               <Text style={[styles.statsChipValue, { color: C.brown }]}>
                                 {correct}/{total}
                               </Text>
-                              <Text style={styles.statsChipLabel}>
-                                {pending > 0 ? `Correct · ${pending} to review` : "Correct"}
-                              </Text>
+                              <Text style={styles.statsChipLabel}>Correct</Text>
                             </View>
                           </View>
                         );
@@ -2269,7 +2155,7 @@ export default function SessionDetail() {
                   }
                   renderItem={({ item: sw, index: i }) => {
                     // Find matching attempt for this word
-                    const attempt = [...statsData.attempts].reverse().find(
+                    const attempt = statsData.attempts.find(
                       (a) => a.word === sw.word
                     );
                     return (
@@ -2289,87 +2175,50 @@ export default function SessionDetail() {
                           {sw.word}
                         </Text>
 
-                        {/* Spoken input — recording + what Whisper heard */}
+                        {/* Spoken input — placeholder until STT/firmware ready */}
                         {attempt ? (
-                          <View style={{ flex: 2, flexDirection: "row", alignItems: "center", gap: 6 }}>
-                            <PlayRecordingButton path={attempt.audio_path ?? null} />
+                          <View style={{ flex: 2, flexDirection: "row", alignItems: "center", gap: 5 }}>
+                            <Ionicons
+                              name={attempt.is_correct ? "mic" : "mic-outline"}
+                              size={11}
+                              color={attempt.is_correct ? C.green : C.muted}
+                            />
                             <Text
-                              numberOfLines={2}
                               style={[styles.reviewCell, {
                                 flex: 1,
+                                color: attempt.is_correct ? C.green : C.red,
                                 fontFamily: fonts.body,
-                                color: STATUS_STYLE[attemptStatus(attempt)].fg,
                               }]}
                             >
-                              {attempt.transcript
-                                ? `"${cleanTranscript(attempt.transcript)}"`
-                                : "(no transcript)"}
+                              {attempt.is_correct ? sw.word : "(incorrect)"}
                             </Text>
                           </View>
                         ) : (
                           <View style={[styles.reviewVoicePlaceholder, { flex: 2 }]}>
                             <Ionicons name="mic-off-outline" size={11} color={C.muted} />
                             <Text style={styles.reviewVoicePlaceholderText}>
-                              no answer
+                              voice input soon
                             </Text>
                           </View>
                         )}
 
-                        {/* Result + teacher override */}
-                        <View style={{ flex: 1, alignItems: "center", gap: 4 }}>
-                          {attempt ? (
-                            <>
-                              <View
-                                style={[
-                                  styles.resultBadge,
-                                  { backgroundColor: STATUS_STYLE[attemptStatus(attempt)].bg },
-                                ]}
-                              >
-                                <Text
-                                  style={[
-                                    styles.resultBadgeText,
-                                    { color: STATUS_STYLE[attemptStatus(attempt)].fg },
-                                  ]}
-                                >
-                                  {STATUS_STYLE[attemptStatus(attempt)].label}
-                                </Text>
-                              </View>
-                              <View style={{ flexDirection: "row", gap: 6 }}>
-                                <Pressable
-                                  onPress={() => overrideAttempt(attempt, true)}
-                                  hitSlop={6}
-                                  style={({ pressed }) => [
-                                    styles.overrideBtn,
-                                    { borderColor: C.green },
-                                    pressed && { opacity: 0.6 },
-                                  ]}
-                                  accessibilityLabel="Mark correct"
-                                >
-                                  <Ionicons name="checkmark" size={12} color={C.green} />
-                                </Pressable>
-                                <Pressable
-                                  onPress={() => overrideAttempt(attempt, false)}
-                                  hitSlop={6}
-                                  style={({ pressed }) => [
-                                    styles.overrideBtn,
-                                    { borderColor: C.red },
-                                    pressed && { opacity: 0.6 },
-                                  ]}
-                                  accessibilityLabel="Mark wrong"
-                                >
-                                  <Ionicons name="close" size={12} color={C.red} />
-                                </Pressable>
-                              </View>
-                              {attempt.graded_by === "teacher" && (
-                                <Text style={styles.teacherTag}>by teacher</Text>
-                              )}
-                            </>
-                          ) : (
-                            <View style={[styles.resultBadge, { backgroundColor: C.border }]}>
-                              <Text style={[styles.resultBadgeText, { color: C.muted }]}>—</Text>
-                            </View>
-                          )}
-                        </View>
+                        {/* Result badge */}
+                        {attempt ? (
+                          <View
+                            style={[
+                              styles.resultBadge,
+                              { flex: 1, backgroundColor: attempt.is_correct ? C.greenBg : C.redBg },
+                            ]}
+                          >
+                            <Text style={[styles.resultBadgeText, { color: attempt.is_correct ? C.green : C.red }]}>
+                              {attempt.is_correct ? "✓ Correct" : "✗ Wrong"}
+                            </Text>
+                          </View>
+                        ) : (
+                          <View style={[styles.resultBadge, { flex: 1, backgroundColor: C.border }]}>
+                            <Text style={[styles.resultBadgeText, { color: C.muted }]}>—</Text>
+                          </View>
+                        )}
                       </View>
                     );
                   }}
@@ -2589,16 +2438,16 @@ export default function SessionDetail() {
                           <View
                             style={[
                               styles.attemptLiveBadge,
-                              { backgroundColor: STATUS_STYLE[attemptStatus(attempt)].bg },
+                              { backgroundColor: attempt.is_correct ? C.greenBg : C.redBg },
                             ]}
                           >
                             <Text
                               style={[
                                 styles.attemptLiveBadgeText,
-                                { color: STATUS_STYLE[attemptStatus(attempt)].fg },
+                                { color: attempt.is_correct ? C.green : C.red },
                               ]}
                             >
-                              {STATUS_STYLE[attemptStatus(attempt)].label}
+                              {attempt.is_correct ? "✓ Correct" : "✗ Wrong"}
                             </Text>
                           </View>
                         )}
@@ -2619,7 +2468,7 @@ export default function SessionDetail() {
                       <View
                         style={[
                           styles.responseDot,
-                          { backgroundColor: STATUS_STYLE[attemptStatus(a)].fg },
+                          { backgroundColor: a.is_correct ? C.green : C.red },
                         ]}
                       />
                       <Text style={styles.historyWord}>{a.word}</Text>
@@ -2627,11 +2476,10 @@ export default function SessionDetail() {
                       <Text
                         style={[
                           styles.responseLabel,
-                          { color: STATUS_STYLE[attemptStatus(a)].fg },
+                          { color: a.is_correct ? C.green : C.red },
                         ]}
                       >
-                        {STATUS_STYLE[attemptStatus(a)].short}
-                        {a.transcript ? ` · "${cleanTranscript(a.transcript)}"` : ""}
+                        {a.is_correct ? "Correct" : "Wrong"}
                       </Text>
                     </View>
                   ))}
@@ -2797,7 +2645,9 @@ export default function SessionDetail() {
                       style={[
                         styles.wordListAttemptBadge,
                         {
-                          backgroundColor: STATUS_STYLE[attemptStatus(attempt)].bg,
+                          backgroundColor: attempt.is_correct
+                            ? C.greenBg
+                            : C.redBg,
                           marginTop: 8,
                         },
                       ]}
@@ -2805,12 +2655,10 @@ export default function SessionDetail() {
                       <Text
                         style={[
                           styles.wordListAttemptText,
-                          { color: STATUS_STYLE[attemptStatus(attempt)].fg },
+                          { color: attempt.is_correct ? C.green : C.red },
                         ]}
                       >
-                        {attemptStatus(attempt) === "review"
-                          ? "⚠ Needs Teacher Review"
-                          : attempt.is_correct
+                        {attempt.is_correct
                           ? "✓ Student Answered Correctly"
                           : "✗ Incorrect Attempt"}
                       </Text>
@@ -2869,7 +2717,7 @@ export default function SessionDetail() {
                   <View
                     style={[
                       styles.responseDot,
-                      { backgroundColor: STATUS_STYLE[attemptStatus(a)].fg },
+                      { backgroundColor: a.is_correct ? C.green : C.red },
                     ]}
                   />
                   <Text style={styles.historyWord}>{a.word}</Text>
@@ -2877,11 +2725,10 @@ export default function SessionDetail() {
                   <Text
                     style={[
                       styles.responseLabel,
-                      { color: STATUS_STYLE[attemptStatus(a)].fg },
+                      { color: a.is_correct ? C.green : C.red },
                     ]}
                   >
-                    {STATUS_STYLE[attemptStatus(a)].short}
-                        {a.transcript ? ` · "${cleanTranscript(a.transcript)}"` : ""}
+                    {a.is_correct ? "Correct" : "Wrong"}
                   </Text>
                 </View>
               ))}
@@ -2935,7 +2782,7 @@ export default function SessionDetail() {
             <Text style={styles.deviceHint}>
               {isCooldown
                 ? "Display is cleared for a short break before the next word."
-                : "Use Prev / Next to move between chunks."}
+                : "Student presses Next / Back on the device to navigate chunks."}
             </Text>
           </View>
         )}
@@ -4168,28 +4015,6 @@ const styles = StyleSheet.create({
     fontFamily: fonts.mono,
     fontSize: 12,
     color: C.ink,
-  },
-  playBtn: {
-    width: 26,
-    height: 26,
-    borderRadius: 13,
-    backgroundColor: C.blueWash,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  overrideBtn: {
-    width: 24,
-    height: 22,
-    borderRadius: 6,
-    borderWidth: 1.2,
-    backgroundColor: C.white,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  teacherTag: {
-    fontFamily: fonts.mono,
-    fontSize: 8,
-    color: C.muted,
   },
   reviewVoicePlaceholder: {
     flexDirection: "row",

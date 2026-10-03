@@ -97,16 +97,26 @@ export default function Login() {
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
-          {/* Back button */}
-          <Pressable
-            onPress={() => router.back()}
-            accessibilityRole="button"
-            accessibilityLabel="Go back to home"
-            style={({ pressed }) => [styles.backBtn, pressed && { opacity: 0.6 }]}
-          >
-            <Ionicons name="arrow-back" size={20} color={C.navy} />
-            <Text style={styles.backText}>Back</Text>
-          </Pressable>
+          {/* Top bar: back + ? */}
+          <View style={styles.topBar}>
+            <Pressable
+              onPress={() => router.back()}
+              accessibilityRole="button"
+              accessibilityLabel="Go back to home"
+              style={({ pressed }) => [styles.backBtn, pressed && { opacity: 0.6 }]}
+            >
+              <Ionicons name="arrow-back" size={20} color={C.navy} />
+              <Text style={styles.backText}>Back</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => router.push("/about" as any)}
+              style={({ pressed }) => [styles.helpBtn, pressed && { opacity: 0.6 }]}
+              accessibilityRole="button"
+              accessibilityLabel="How it works"
+            >
+              <Ionicons name="help-circle" size={28} color={C.navy} />
+            </Pressable>
+          </View>
 
           {/* Brand */}
           <View style={styles.brandRow}>
@@ -223,8 +233,10 @@ const styles = StyleSheet.create({
   safe:   { flex: 1, backgroundColor: C.bg },
   scroll: { flexGrow: 1, padding: 24, paddingBottom: 40, gap: 32 },
 
-  backBtn:  { flexDirection: "row", alignItems: "center", gap: 6, alignSelf: "flex-start" },
+  topBar:   { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 0 },
+  backBtn:  { flexDirection: "row", alignItems: "center", gap: 6 },
   backText: { fontFamily: fonts.heading, fontSize: 15, color: C.navy },
+  helpBtn:  { padding: 4 },
 
   brandRow:  { flexDirection: "row", alignItems: "center", gap: 12 },
   brandName: { fontFamily: fonts.heading, fontSize: 18, color: C.navy },
