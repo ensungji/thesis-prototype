@@ -10,6 +10,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useOnline } from "../lib/network";
 import { usePendingCount } from "../lib/outbox";
+import { startAppLogging } from "../lib/logger";
 import { colors as C, fonts } from "../lib/theme";
 
 export function OfflineBanner() {
@@ -19,6 +20,10 @@ export function OfflineBanner() {
   const [mode, setMode] = useState<"hidden" | "offline" | "back">("hidden");
   const wasOffline = useRef(false);
   const slide = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    startAppLogging(); // records how long the phone was offline
+  }, []);
 
   useEffect(() => {
     let t: ReturnType<typeof setTimeout> | undefined;

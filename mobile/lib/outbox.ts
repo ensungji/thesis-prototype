@@ -183,6 +183,28 @@ export async function updateOrQueue(
   }
 }
 
+// A change the server kept refusing was thrown away — tell the admin.
+function queueDropLog(item: QueuedUpdate, err: unknown) {
+  const id = newId();
+  queue.push({
+    op: "insert",
+    key: "insert:system_logs:" + id,
+    table: "system_logs",
+    values: {
+      id,
+      created_at: new Date().toISOString(),
+      level: "error",
+      source: "app",
+      event: "sync_dropped",
+      message: `Gave up saving a change to ${item.table}: ${String((err as { message?: string })?.message ?? err)}`.slice(0, 500),
+      meta: { table: item.table, op: item.op ?? "update", match: item.match, values: item.values },
+    },
+    match: { id },
+    queuedAt: Date.now(),
+    tries: 0,
+  });
+}
+
 /** Send everything waiting in the outbox (oldest first). */
 export async function flushOutbox() {
   await load();
@@ -199,8 +221,10 @@ export async function flushOutbox() {
         // Real server error: retry a few times, then drop so it can't block the queue
         item.tries += 1;
         console.warn("Outbox item failed:", item.key, err);
-        if (item.tries >= 3) queue.shift();
-        else break;
+        if (item.tries >= 3) {
+          queue.shift();
+          if (item.table !== "system_logs") queueDropLog(item, err);
+        } else break;
       }
       await save();
     }

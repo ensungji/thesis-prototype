@@ -253,6 +253,20 @@ export default function AdminDashboard() {
           <Text style={styles.title}>Admin Panel</Text>
           <Text style={styles.subtitle}>Braille D.O.T.S</Text>
         </View>
+        <View style={{ flexDirection: "row", gap: 8 }}>
+        <Pressable
+          onPress={() => router.push("/admin/logs" as any)}
+          style={({ pressed }) => [
+            styles.signOutBtn,
+            { backgroundColor: C.blueWash },
+            pressed && { opacity: 0.7 },
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel="System logs"
+        >
+          <Ionicons name="document-text-outline" size={18} color={C.navy} />
+          <Text style={[styles.signOutText, { color: C.navy }]}>Logs</Text>
+        </Pressable>
         <Pressable
           onPress={signOut}
           style={({ pressed }) => [
@@ -264,6 +278,7 @@ export default function AdminDashboard() {
           <Ionicons name="log-out-outline" size={18} color={C.red} />
           <Text style={styles.signOutText}>Sign Out</Text>
         </Pressable>
+        </View>
       </View>
 
       {/* Summary row */}

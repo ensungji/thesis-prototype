@@ -22,6 +22,7 @@ import { useLocalSearchParams, useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
 import { updateOrQueue, insertOrQueue, newId } from "../../../lib/outbox";
+import { logEvent } from "../../../lib/logger";
 import { colors as C, fonts } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
 import { BrailleLoader } from "../../../components/BrailleLoader";
@@ -988,7 +989,13 @@ export default function SessionDetail() {
         total_chunks: 1,
       },
     }));
-    await supabase.from("device_commands").insert(commands);
+    const { error } = await supabase.from("device_commands").insert(commands);
+    if (error) {
+      logEvent("error", "device_command_failed", `Could not clear devices (${commandType}): ${error.message}`, {
+        session_id: id ?? null,
+        meta: { command_type: commandType, devices: connectedDevices },
+      });
+    }
   }
   clearDevicesRef.current = clearDevices;
 
@@ -997,6 +1004,10 @@ export default function SessionDetail() {
   // 'Clear Display', releasing solenoids to prevent burnout and notifying the teacher.
   async function triggerSafetyAutoClear() {
     liveSafetyTimerRef.current = null;
+    logEvent("warn", "safety_auto_clear", `Display auto-cleared after 60s ("${lastSentWordRef.current}")`, {
+      session_id: id ?? null,
+      meta: { word: lastSentWordRef.current },
+    });
     await clearDevices();
     const currentActiveId = activeWordIdRef.current;
     if (currentActiveId) {
@@ -1519,7 +1530,13 @@ export default function SessionDetail() {
         total_chunks: chunkArr.length,
       },
     }));
-    await supabase.from("device_commands").insert(commands);
+    const { error } = await supabase.from("device_commands").insert(commands);
+    if (error) {
+      logEvent("error", "device_command_failed", `Could not send "${word}" to devices: ${error.message}`, {
+        session_id: id ?? null,
+        meta: { word, chunk: chunkArr[idx], devices: connectedDevices },
+      });
+    }
   }
 
   // ── Render helpers ──────────────────────────────────────────────────────────
