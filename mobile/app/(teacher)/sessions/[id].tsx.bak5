@@ -21,7 +21,6 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams, useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
-import { updateOrQueue, insertOrQueue, newId } from "../../../lib/outbox";
 import { colors as C, fonts } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
 import { BrailleLoader } from "../../../components/BrailleLoader";
@@ -67,7 +66,6 @@ type SessionWord = {
 };
 type WordAttempt = {
   id: string;
-  student_id?: string | null;
   word: string;
   is_correct: boolean;
   response_time_ms: number | null;
@@ -210,109 +208,6 @@ function PlayRecordingButton({ path }: { path: string | null }) {
     </Pressable>
   );
 }
-
-// ── Teacher fallback grading (✓ / ✗ per student, current word) ─────────────
-
-function HandGradeCard({
-  word,
-  students,
-  attempts,
-  onGrade,
-}: {
-  word: string;
-  students: Student[];
-  attempts: WordAttempt[];
-  onGrade: (student: Student, word: string, correct: boolean, existing: WordAttempt | null) => void;
-}) {
-  if (!word || students.length === 0) return null;
-  const w = word.toUpperCase();
-  return (
-    <View style={styles.sectionCard}>
-      <Text style={styles.cardLabel}>GRADE BY HAND · {w}</Text>
-      <Text style={hg.hint}>
-        Tap ✓ or ✗ if the voice answer is missing or needs a check.
-      </Text>
-      <View style={{ gap: 8 }}>
-        {students.map((st) => {
-          // attempts are newest first → this is the student's latest answer
-          const a = attempts.find((x) => x.student_id === st.id && x.word?.toUpperCase() === w) ?? null;
-          const status = a ? attemptStatus(a) : null;
-          const byTeacher = a?.graded_by === "teacher";
-          return (
-            <View key={st.id} style={hg.row}>
-              <View style={{ flex: 1, gap: 2 }}>
-                <Text style={hg.name} numberOfLines={1}>{st.full_name}</Text>
-                <Text
-                  style={[hg.sub, status && { color: STATUS_STYLE[status].fg }]}
-                  numberOfLines={1}
-                >
-                  {!a
-                    ? "No answer yet"
-                    : STATUS_STYLE[status!].short +
-                      (byTeacher
-                        ? " · graded by you"
-                        : a.transcript
-                        ? ` · heard "${cleanTranscript(a.transcript)}"`
-                        : "")}
-                </Text>
-              </View>
-              {a?.audio_path ? <PlayRecordingButton path={a.audio_path} /> : null}
-              <Pressable
-                onPress={() => onGrade(st, w, true, a)}
-                hitSlop={6}
-                style={({ pressed }) => [
-                  hg.btn,
-                  status === "correct" && { backgroundColor: C.green, borderColor: C.green },
-                  pressed && { opacity: 0.7 },
-                ]}
-                accessibilityLabel={`Mark ${st.full_name} correct`}
-              >
-                <Ionicons name="checkmark" size={18} color={status === "correct" ? C.white : C.green} />
-              </Pressable>
-              <Pressable
-                onPress={() => onGrade(st, w, false, a)}
-                hitSlop={6}
-                style={({ pressed }) => [
-                  hg.btn,
-                  status === "wrong" && { backgroundColor: C.red, borderColor: C.red },
-                  pressed && { opacity: 0.7 },
-                ]}
-                accessibilityLabel={`Mark ${st.full_name} wrong`}
-              >
-                <Ionicons name="close" size={18} color={status === "wrong" ? C.white : C.red} />
-              </Pressable>
-            </View>
-          );
-        })}
-      </View>
-    </View>
-  );
-}
-
-const hg = StyleSheet.create({
-  hint: { fontFamily: fonts.body, fontSize: 12, color: C.muted, lineHeight: 17 },
-  row: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    backgroundColor: C.bg,
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-  },
-  name: { fontFamily: fonts.bodyBold, fontSize: 14, color: C.ink },
-  sub: { fontFamily: fonts.mono, fontSize: 10, color: C.muted },
-  btn: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
-    borderWidth: 1.5,
-    borderColor: C.border,
-    backgroundColor: C.white,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-});
 
 // ── Keep awake for active session ─────────────────────────────────────────────
 
@@ -480,7 +375,7 @@ export default function SessionDetail() {
         stopLiveSafetyTimer();
         clearDevicesRef.current("session_paused");
         // Direct DB update + local state (ref-safe, no stale closure)
-        await updateOrQueue("sessions", { status: "paused" }, { id: id! });
+        await supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
         setSession((prev) => (prev ? { ...prev, status: "paused" } : prev));
       }
       appStateRef.current = next;
@@ -558,13 +453,6 @@ export default function SessionDetail() {
           .eq("session_id", id)
           .order("order_index"),
       ]);
-
-    // Offline / network failure: keep what's already on screen
-    if (!sessionRes.data && sessionRes.error) {
-      setLoading(false);
-      setRefreshing(false);
-      return;
-    }
 
     const devicesData = devicesRes.data ?? [];
     const merged: Student[] = (studentsRes.data ?? []).map((s) => ({
@@ -723,7 +611,7 @@ export default function SessionDetail() {
           // Hardware safety: release solenoids when leaving the screen
           clearDevicesRef.current("session_paused");
           // Fire-and-forget — no await in cleanup
-          updateOrQueue("sessions", { status: "paused" }, { id: id! });
+          supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
         }
       };
     }, [loadData, id])
@@ -801,9 +689,7 @@ export default function SessionDetail() {
         { event: "INSERT", schema: "public", table: "word_attempts", filter: `session_id=eq.${id}` },
         (payload) => {
           const attempt = payload.new as WordAttempt;
-          setLiveAttempts((prev) =>
-            prev.some((a) => a.id === attempt.id) ? prev : [attempt, ...prev]
-          );
+          setLiveAttempts((prev) => [attempt, ...prev]);
         }
       )
       .subscribe();
@@ -815,62 +701,6 @@ export default function SessionDetail() {
     };
   }, [id]);
 
-
-  // ── Earlier answers (so the feed survives an app reload) ───────────────────
-  useEffect(() => {
-    if (!id) return;
-    supabase
-      .from("word_attempts")
-      .select("id, student_id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by")
-      .eq("session_id", id)
-      .order("attempted_at", { ascending: false })
-      .limit(200)
-      .then(({ data }) => {
-        if (!data) return;
-        setLiveAttempts((prev) => {
-          const seen = new Set(prev.map((a) => a.id));
-          return [...prev, ...(data as WordAttempt[]).filter((a) => !seen.has(a.id))];
-        });
-      });
-  }, [id]);
-
-  // ── Teacher fallback grading ────────────────────────────────────────────────
-  async function gradeByHand(
-    student: Student,
-    word: string,
-    correct: boolean,
-    existing: WordAttempt | null
-  ) {
-    const patch = { is_correct: correct, needs_review: false, graded_by: "teacher" };
-
-    if (existing) {
-      // Override the voice grade (or change your own earlier tap)
-      setLiveAttempts((prev) => prev.map((a) => (a.id === existing.id ? { ...a, ...patch } : a)));
-      const { error } = await updateOrQueue("word_attempts", patch, { id: existing.id });
-      if (error) {
-        setLiveAttempts((prev) => prev.map((a) => (a.id === existing.id ? existing : a)));
-        showValidationToast("Couldn't save grade", error);
-      }
-      return;
-    }
-
-    // No answer yet → add one (id made here so an offline retry can't duplicate it)
-    const row = {
-      id: newId(),
-      student_id: student.id,
-      session_id: id!,
-      word,
-      response_time_ms: null,
-      attempted_at: new Date().toISOString(),
-      ...patch,
-    };
-    setLiveAttempts((prev) => [row, ...prev]);
-    const { error } = await insertOrQueue("word_attempts", row);
-    if (error) {
-      setLiveAttempts((prev) => prev.filter((a) => a.id !== row.id));
-      showValidationToast("Couldn't save grade", error);
-    }
-  }
 
   // ── Student assignment ──────────────────────────────────────────────────────
 
@@ -1282,7 +1112,7 @@ export default function SessionDetail() {
       autoCycleTimer.current = null;
     }
     await clearDevices("session_paused"); // Release solenoids + pause sound
-    await updateOrQueue("sessions", { status: "paused" }, { id: id! });
+    await supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
     // [REALTIME] Send pause command to all devices
     if (!auto) await loadData();
     else setSession((prev) => (prev ? { ...prev, status: "paused" } : prev));
@@ -1362,11 +1192,13 @@ export default function SessionDetail() {
     // Instantly transition to finished view
     setSession((prev) => (prev ? { ...prev, status: "finished" } : prev));
     sessionStatusRef.current = "finished";
-    await updateOrQueue(
-      "sessions",
-      { status: "finished", finished_at: new Date().toISOString() },
-      { id: id! }
-    );
+    await supabase
+      .from("sessions")
+      .update({
+        status: "finished",
+        finished_at: new Date().toISOString(),
+      })
+      .eq("id", id!);
     await loadData();
     setFinishingSession(false);
     setFinishSessionModal(false);
@@ -1551,9 +1383,12 @@ export default function SessionDetail() {
           }
         : prev
     );
-    const { error } = await updateOrQueue("word_attempts", patch, { id: attempt.id });
+    const { error } = await supabase
+      .from("word_attempts")
+      .update(patch)
+      .eq("id", attempt.id);
     if (error) {
-      console.error("Override failed:", error);
+      console.error("Override failed:", error.message);
       if (statsData) openStudentStats(statsData.student); // reload real values
     }
   }
@@ -2765,14 +2600,6 @@ export default function SessionDetail() {
               </View>
             )}
 
-            {/* Teacher fallback: grade the current word by hand */}
-            <HandGradeCard
-              word={lastSentWord}
-              students={assignedStudents}
-              attempts={liveAttempts}
-              onGrade={gradeByHand}
-            />
-
             {/* Words sent history + live student responses */}
             {sessionWords.length > 0 && (
               <View style={styles.sectionCard}>
@@ -3096,16 +2923,6 @@ export default function SessionDetail() {
               </Pressable>
             </View>
           </View>
-        )}
-
-        {/* ── Timed Sequence: grade the current word by hand ─────────── */}
-        {isTimedSequence(session.type) && (
-          <HandGradeCard
-            word={sessionWords[wordListIndex]?.word ?? ""}
-            students={assignedStudents}
-            attempts={liveAttempts}
-            onGrade={gradeByHand}
-          />
         )}
 
         {/* ── Timed Sequence: live responses feed ───────────────────────── */}

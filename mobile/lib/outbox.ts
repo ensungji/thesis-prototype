@@ -6,8 +6,10 @@
 // stored on the phone and sent automatically when the connection returns.
 //
 // Rules:
-//   - Only UPDATEs are queued (status changes, grade overrides). They are
+//   - UPDATEs are queued (status changes, grade overrides). They are
 //     safe to send late and safe to send twice.
+//   - INSERTs can be queued too (teacher hand-grades), but only with an id
+//     made on the phone (newId()), so sending twice never makes duplicates.
 //   - Device commands (words, clears) are NEVER queued: a word arriving
 //     minutes later would raise the dots unexpectedly.
 //   - Several queued updates to the same row are merged (latest wins), so
@@ -23,6 +25,7 @@ import { isOnline, subscribeOnline, recheckOnline } from "./network";
 const KEY = "outbox_v1";
 
 type QueuedUpdate = {
+  op?: "update" | "insert";       // missing = update (older queued items)
   key: string;                    // table + row match, used for merging
   table: string;
   values: Record<string, unknown>;
@@ -90,9 +93,67 @@ async function enqueue(table: string, values: Record<string, unknown>, match: Re
   await save();
 }
 
-async function send(table: string, values: Record<string, unknown>, match: Record<string, string>) {
-  const { error } = await supabase.from(table).update(values).match(match);
+async function send(
+  table: string,
+  values: Record<string, unknown>,
+  match: Record<string, string>,
+  op: "update" | "insert" = "update",
+) {
+  const { error } =
+    op === "insert"
+      ? // ON CONFLICT DO NOTHING: a row that already arrived is not added twice
+        await supabase.from(table).upsert(values, { onConflict: "id", ignoreDuplicates: true })
+      : await supabase.from(table).update(values).match(match);
   if (error) throw error;
+}
+
+/** A random UUID made on the phone, so queued inserts can't duplicate. */
+export function newId(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (ch) => {
+    const r = (Math.random() * 16) | 0;
+    return (ch === "x" ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
+/**
+ * Insert a row now, or queue it if offline. The row MUST have an `id`
+ * from newId(). Returns { queued: true } when saved for later.
+ */
+export async function insertOrQueue(
+  table: string,
+  row: Record<string, unknown> & { id: string },
+): Promise<{ queued: boolean; error?: string }> {
+  start();
+  const queueIt = async () => {
+    await load();
+    queue.push({
+      op: "insert",
+      key: "insert:" + table + ":" + row.id,
+      table,
+      values: row,
+      match: { id: row.id },
+      queuedAt: Date.now(),
+      tries: 0,
+    });
+    await save();
+  };
+  if (!isOnline()) {
+    await queueIt();
+    return { queued: true };
+  }
+  try {
+    await send(table, row, { id: row.id }, "insert");
+    return { queued: false };
+  } catch (err) {
+    if (isNetworkError(err)) {
+      await queueIt();
+      recheckOnline();
+      return { queued: true };
+    }
+    return { queued: false, error: String((err as { message?: string })?.message ?? err) };
+  }
 }
 
 /**
@@ -131,7 +192,7 @@ export async function flushOutbox() {
     while (queue.length > 0) {
       const item = queue[0];
       try {
-        await send(item.table, item.values, item.match);
+        await send(item.table, item.values, item.match, item.op ?? "update");
         queue.shift(); // sent
       } catch (err) {
         if (isNetworkError(err)) break; // still offline — try again later
