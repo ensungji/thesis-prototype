@@ -1,8 +1,10 @@
 // mobile/app/login.tsx
 // Teacher login — real Supabase Auth, production ready.
+// Includes Interactive Override flow for concurrent session protection.
 
 import { useState, useEffect } from "react";
 import {
+  Alert,
   View,
   Text,
   TextInput,
@@ -19,6 +21,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../lib/supabase";
 import { colors as C, fonts } from "../lib/theme";
 import { BrailleCell } from "../components/BrailleCell";
+import { getDeviceId, resetDeviceId } from "../lib/device-id";
 
 export default function Login() {
   const router = useRouter();
@@ -36,6 +39,26 @@ export default function Login() {
       if (session) router.replace("/(teacher)/dashboard" as any);
     });
   }, [router]);
+
+  /** Claim this device as active and navigate to the correct screen. */
+  async function claimDeviceAndNavigate(
+    userId: string,
+    role: string,
+    deviceId: string
+  ) {
+    // Write our device ID to the profile so the Realtime listener can
+    // detect overrides on other devices.
+    await supabase
+      .from("profiles")
+      .update({ active_device_id: deviceId })
+      .eq("id", userId);
+
+    if (role === "admin") {
+      router.replace("/admin" as any);
+    } else {
+      router.replace("/(teacher)/dashboard" as any);
+    }
+  }
 
   async function signIn() {
     if (!email.trim() || !password) {
@@ -57,10 +80,10 @@ export default function Login() {
       return;
     }
 
-    // Fetch profile for role + active check
+    // Fetch profile for role + active check + concurrent session check
     const { data: profile, error: profileError } = await supabase
       .from("profiles")
-      .select("role, is_active")
+      .select("role, is_active, active_device_id")
       .eq("id", signInData.user!.id)
       .single();
 
@@ -68,7 +91,8 @@ export default function Login() {
 
     // If profile fetch failed entirely, let them in as teacher (don't lock out)
     if (profileError || !profile) {
-      router.replace("/(teacher)/dashboard" as any);
+      const deviceId = await getDeviceId();
+      await claimDeviceAndNavigate(signInData.user!.id, "teacher", deviceId);
       return;
     }
 
@@ -79,11 +103,44 @@ export default function Login() {
       return;
     }
 
-    if (profile.role === "admin") {
-      router.replace("/admin" as any);
-    } else {
-      router.replace("/(teacher)/dashboard" as any);
+    const localDeviceId = await getDeviceId();
+
+    // ── Interactive Override: concurrent session detection ──────────────────
+    // If another device already has an active session (active_device_id is set
+    // and doesn't match ours), pause and ask the user before overriding.
+    if (profile.active_device_id && profile.active_device_id !== localDeviceId) {
+      Alert.alert(
+        "Account in Use",
+        "Someone is currently using this account. Do you want to override their session and log in here?",
+        [
+          {
+            text: "Cancel",
+            style: "cancel",
+            onPress: async () => {
+              // Abort login — sign out silently so auth state is clean
+              await supabase.auth.signOut();
+            },
+          },
+          {
+            text: "Override",
+            style: "destructive",
+            onPress: async () => {
+              // Generate a fresh device ID so the old device's listener fires
+              const newDeviceId = await resetDeviceId();
+              await claimDeviceAndNavigate(
+                signInData.user!.id,
+                profile.role,
+                newDeviceId
+              );
+            },
+          },
+        ]
+      );
+      return; // Wait for the Alert callback
     }
+
+    // No conflict — claim the device and proceed
+    await claimDeviceAndNavigate(signInData.user!.id, profile.role, localDeviceId);
   }
 
   return (

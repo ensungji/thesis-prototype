@@ -114,6 +114,14 @@ export default function Dashboard() {
   }, [loadDashboard]);
 
   async function signOut() {
+    // Clear active device claim so next login doesn't falsely detect a conflict
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      await supabase
+        .from("profiles")
+        .update({ active_device_id: null })
+        .eq("id", user.id);
+    }
     await supabase.auth.signOut();
     router.replace("/");
   }

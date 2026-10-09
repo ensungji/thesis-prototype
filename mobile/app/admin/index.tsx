@@ -214,6 +214,14 @@ export default function AdminDashboard() {
 
   async function confirmSignOut() {
     setSigningOut(true);
+    // Clear active device claim so next login doesn't falsely detect a conflict
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      await supabase
+        .from("profiles")
+        .update({ active_device_id: null })
+        .eq("id", user.id);
+    }
     await supabase.auth.signOut();
     // router.replace("/") is handled automatically by the auth listener in _layout
     setSigningOut(false);

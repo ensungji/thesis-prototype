@@ -21,7 +21,6 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams, useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
-import { updateOrQueue } from "../../../lib/outbox";
 import { colors as C, fonts } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
 import { BrailleLoader } from "../../../components/BrailleLoader";
@@ -376,7 +375,7 @@ export default function SessionDetail() {
         stopLiveSafetyTimer();
         clearDevicesRef.current("session_paused");
         // Direct DB update + local state (ref-safe, no stale closure)
-        await updateOrQueue("sessions", { status: "paused" }, { id: id! });
+        await supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
         setSession((prev) => (prev ? { ...prev, status: "paused" } : prev));
       }
       appStateRef.current = next;
@@ -454,13 +453,6 @@ export default function SessionDetail() {
           .eq("session_id", id)
           .order("order_index"),
       ]);
-
-    // Offline / network failure: keep what's already on screen
-    if (!sessionRes.data && sessionRes.error) {
-      setLoading(false);
-      setRefreshing(false);
-      return;
-    }
 
     const devicesData = devicesRes.data ?? [];
     const merged: Student[] = (studentsRes.data ?? []).map((s) => ({
@@ -619,7 +611,7 @@ export default function SessionDetail() {
           // Hardware safety: release solenoids when leaving the screen
           clearDevicesRef.current("session_paused");
           // Fire-and-forget — no await in cleanup
-          updateOrQueue("sessions", { status: "paused" }, { id: id! });
+          supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
         }
       };
     }, [loadData, id])
@@ -1120,7 +1112,7 @@ export default function SessionDetail() {
       autoCycleTimer.current = null;
     }
     await clearDevices("session_paused"); // Release solenoids + pause sound
-    await updateOrQueue("sessions", { status: "paused" }, { id: id! });
+    await supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
     // [REALTIME] Send pause command to all devices
     if (!auto) await loadData();
     else setSession((prev) => (prev ? { ...prev, status: "paused" } : prev));
@@ -1200,11 +1192,13 @@ export default function SessionDetail() {
     // Instantly transition to finished view
     setSession((prev) => (prev ? { ...prev, status: "finished" } : prev));
     sessionStatusRef.current = "finished";
-    await updateOrQueue(
-      "sessions",
-      { status: "finished", finished_at: new Date().toISOString() },
-      { id: id! }
-    );
+    await supabase
+      .from("sessions")
+      .update({
+        status: "finished",
+        finished_at: new Date().toISOString(),
+      })
+      .eq("id", id!);
     await loadData();
     setFinishingSession(false);
     setFinishSessionModal(false);
@@ -1389,9 +1383,12 @@ export default function SessionDetail() {
           }
         : prev
     );
-    const { error } = await updateOrQueue("word_attempts", patch, { id: attempt.id });
+    const { error } = await supabase
+      .from("word_attempts")
+      .update(patch)
+      .eq("id", attempt.id);
     if (error) {
-      console.error("Override failed:", error);
+      console.error("Override failed:", error.message);
       if (statsData) openStudentStats(statsData.student); // reload real values
     }
   }

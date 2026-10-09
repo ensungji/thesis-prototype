@@ -9,6 +9,47 @@ Format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [2026-10-05] — Interactive Override for Concurrent Teacher Logins
+
+### Added
+
+#### Device Identity Module (`lib/device-id.ts`)
+- **Persistent Device ID**: Created `device-id.ts` utility that generates and persists a unique UUID-style device identifier per app install via AsyncStorage. The ID survives app restarts and is only regenerated on explicit override via `resetDeviceId()`.
+
+#### Login Concurrent-Session Check & Override Alert (`login.tsx`)
+- **Active Session Detection**: After successful authentication, the login flow now fetches `active_device_id` from the Supabase `profiles` table. If a different device already holds an active session, login is paused before navigation.
+- **Confirmation Alert**: Displays a native alert — *"Account in Use: Someone is currently using this account. Do you want to override their session and log in here?"* — giving the teacher an explicit choice.
+- **Cancel → Abort**: Tapping "Cancel" silently signs the user out and returns to the login form with no side effects.
+- **Override → Claim**: Tapping "Override" generates a fresh device ID via `resetDeviceId()`, writes it to `profiles.active_device_id`, and completes the login. This database update is what triggers the Realtime boot-out on the old device.
+
+#### Realtime Boot-Out Listener (`_layout.tsx`)
+- **Supabase Realtime Subscription**: The root layout now subscribes to `postgres_changes` (UPDATE) on the authenticated user's `profiles` row, filtered by `id=eq.{userId}`.
+- **Automatic Kick Detection**: When `active_device_id` changes to a value that no longer matches the local device's stored ID, the app recognizes it has been overridden.
+- **🔴 Critical Hardware Safety — `clearDevices()` Dispatch**: Before signing out, the boot-out handler explicitly fetches all of the teacher's students' connected devices and inserts empty `device_commands` rows to **instantly de-energize all active solenoids**. This prevents Braille display hardware from being left in an energized state with no controlling session, which could cause solenoid burnout.
+- **Forced Logout & Navigation**: After clearing devices, the app signs out via `supabase.auth.signOut()` and routes to `/login`. An informational alert notifies the kicked user: *"Another device has taken over this account. You have been signed out and all devices have been de-energized."*
+- **Auth-Aware Lifecycle**: The Realtime channel is set up on `SIGNED_IN` and torn down on `SIGNED_OUT`, preventing orphaned subscriptions.
+
+#### Clean Sign-Out Device Cleanup (`dashboard.tsx`, `admin/index.tsx`)
+- **Graceful `active_device_id` Clear**: Both the teacher dashboard and admin panel sign-out flows now set `active_device_id` to `null` before calling `supabase.auth.signOut()`, ensuring that the next login from any device does not falsely detect a session conflict.
+
+#### Student Hardware Device Validation (`sessions/[id].tsx`)
+- **Prevent Unpaired Student Selection**: In the session setup view, students without a linked physical hardware device (`student.device == null`) are disabled so they cannot be selected for a session. Attempting to assign an unlinked student is blocked with a validation toast.
+- **Clear UX Feedback & Badges**: Students without a paired device are rendered with reduced opacity (50%), muted text, and a distinct warning badge stating *"No Device Paired"*.
+- **Session Launch Protection**: `launchSession` enforces that at least one valid, device-paired student is selected. If no device-paired students are selected, the "Launch Session" button is disabled and displays an explanatory toast message upon validation.
+- **Realtime Device Pairing Updates**: Enhanced the Supabase Realtime subscription listener for device changes (`devices` UPDATE table event) to react to `paired_student_id` updates, ensuring student selection availability and badges update dynamically in real time without requiring a manual refresh.
+
+#### Decoupled Next & Back Navigation from Hardware (`sessions/[id].tsx`)
+- **Independent Teacher Preview**: Decoupled the 'Next' and 'Back' navigation buttons from physical hardware broadcasts. Removed `broadcastChunk()` and `device_commands` table insertions from `goToChunk()`.
+- **Protected Student Reading Pace**: Pressing 'Back' or 'Next' now strictly updates the teacher's local React Native state (`chunkIndex`) and local AsyncStorage position, allowing teachers to freely page through multi-chunk words on their screen without interrupting or re-actuating connected students' physical ESP32 displays.
+- **Clear UI Indicators**: Renamed 'Prev' to 'Back' with enhanced accessibility roles and updated the card hint text to clarify that chunk paging is an isolated local preview.
+
+### Database Prerequisites
+
+- **New column required**: `ALTER TABLE profiles ADD COLUMN active_device_id text;`
+- **Supabase Realtime** must be enabled for the `profiles` table (required for the boot-out listener).
+
+---
+
 ## [2026-09-28] — Timed Sequence Playback Engine, Hardware Safety & Educational Polish
 
 ### Added
