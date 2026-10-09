@@ -27,6 +27,7 @@
  * ================================================================
  */
 
+#include "secrets.h"   // Wi-Fi name + password (not on GitHub)
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -60,8 +61,6 @@ uint8_t* recBuf      = nullptr; // 44-byte WAV header + audio
 size_t   recCapacity = 0;       // audio bytes that fit in recBuf
 
 // ── WiFi credentials (fill in) ────────────────────────────────
-#define WIFI_SSID "thisisLAN"
-#define WIFI_PASS "choofeyy!!W1F1"
 
 // ── Supabase config ───────────────────────────────────────────
 #define SUPABASE_HOST "nacknvkbcjxuthtycdzj.supabase.co"
