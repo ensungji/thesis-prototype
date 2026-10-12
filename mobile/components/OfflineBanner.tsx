@@ -26,19 +26,21 @@ export function OfflineBanner() {
   }, []);
 
   useEffect(() => {
-    let t: ReturnType<typeof setTimeout> | undefined;
     if (!online) {
       wasOffline.current = true;
       setMode("offline");
     } else if (wasOffline.current || pending > 0) {
       wasOffline.current = false;
       setMode("back");
-      if (pending === 0) t = setTimeout(() => setMode("hidden"), 2500);
     }
-    return () => {
-      if (t) clearTimeout(t);
-    };
   }, [online, pending]);
+
+  // Hide the green bar 2.5s after everything is synced
+  useEffect(() => {
+    if (mode !== "back" || pending > 0) return;
+    const t = setTimeout(() => setMode("hidden"), 2500);
+    return () => clearTimeout(t);
+  }, [mode, pending]);
 
   useEffect(() => {
     Animated.timing(slide, {

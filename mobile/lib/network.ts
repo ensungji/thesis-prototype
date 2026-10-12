@@ -20,8 +20,8 @@ const SUPABASE_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ?? "";
 
 const ONLINE_INTERVAL_MS = 10000;
 const OFFLINE_INTERVAL_MS = 3000;
-const TIMEOUT_MS = 5000;
-const FAILS_BEFORE_OFFLINE = 2; // one slow ping shouldn't flash the banner
+const TIMEOUT_MS = 8000;
+const FAILS_BEFORE_OFFLINE = 3; // a couple of slow pings shouldn't flash the banner
 
 let online = true;
 let fails = 0;
@@ -64,7 +64,8 @@ async function check() {
 
 function schedule() {
   if (timer) clearTimeout(timer);
-  timer = setTimeout(check, online ? ONLINE_INTERVAL_MS : OFFLINE_INTERVAL_MS);
+  // After a missed check, look again quickly so going offline is noticed in ~6–9s
+  timer = setTimeout(check, online && fails === 0 ? ONLINE_INTERVAL_MS : OFFLINE_INTERVAL_MS);
 }
 
 function start() {

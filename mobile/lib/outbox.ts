@@ -205,32 +205,69 @@ function queueDropLog(item: QueuedUpdate, err: unknown) {
   });
 }
 
+// Retry timer: while changes are waiting, keep trying (3s, 6s, 12s … max 30s)
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+let retryDelay = 3000;
+
+function scheduleRetry() {
+  if (retryTimer || queue.length === 0) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    flushOutbox();
+  }, retryDelay);
+  retryDelay = Math.min(retryDelay * 2, 30000);
+}
+
+const MAX_TRIES = 5; // real server errors only; network errors never count
+
 /** Send everything waiting in the outbox (oldest first). */
 export async function flushOutbox() {
   await load();
   if (flushing || queue.length === 0 || !isOnline()) return;
   flushing = true;
+  let networkProblem = false;
   try {
-    while (queue.length > 0) {
-      const item = queue[0];
+    // The login token may have expired while offline — refresh it first
+    try {
+      await supabase.auth.getSession();
+    } catch {
+      // ignore — the requests below will tell us if something is wrong
+    }
+
+    // A failing item no longer blocks the ones behind it. But if an item fails,
+    // later items for the SAME row wait (so an update never runs before its insert).
+    const blockedRows = new Set<string>();
+    for (const item of [...queue]) {
+      const row = item.table + JSON.stringify(item.match);
+      if (blockedRows.has(row)) continue;
       try {
         await send(item.table, item.values, item.match, item.op ?? "update");
-        queue.shift(); // sent
+        queue = queue.filter((q) => q !== item); // sent
       } catch (err) {
-        if (isNetworkError(err)) break; // still offline — try again later
-        // Real server error: retry a few times, then drop so it can't block the queue
+        if (isNetworkError(err)) {
+          networkProblem = true; // connection dropped again — stop for now
+          break;
+        }
         item.tries += 1;
-        console.warn("Outbox item failed:", item.key, err);
-        if (item.tries >= 3) {
-          queue.shift();
+        blockedRows.add(row);
+        console.warn(`Outbox item failed (try ${item.tries}/${MAX_TRIES}):`, item.key, err);
+        if (item.tries >= MAX_TRIES) {
+          queue = queue.filter((q) => q !== item); // give up so it can't block forever
           if (item.table !== "system_logs") queueDropLog(item, err);
-        } else break;
+        }
       }
       await save();
     }
   } finally {
     flushing = false;
     await save();
+  }
+
+  if (queue.length === 0) {
+    retryDelay = 3000; // all sent — reset the backoff
+  } else {
+    if (networkProblem) recheckOnline();
+    scheduleRetry();
   }
 }
 

@@ -23,6 +23,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
 import { updateOrQueue, insertOrQueue, newId } from "../../../lib/outbox";
 import { logEvent } from "../../../lib/logger";
+import { isOnline } from "../../../lib/network";
 import { colors as C, fonts } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
 import { BrailleLoader } from "../../../components/BrailleLoader";
@@ -69,6 +70,7 @@ type SessionWord = {
 type WordAttempt = {
   id: string;
   student_id?: string | null;
+  session_word_id?: string | null;
   word: string;
   is_correct: boolean;
   response_time_ms: number | null;
@@ -156,6 +158,28 @@ const STATUS_STYLE: Record<AttemptStatus, { bg: string; fg: string; label: strin
 
 const cleanTranscript = (t?: string | null) => (t ?? "").replace(/[.!?,]/g, "").trim();
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const asWordId = (id?: string | null) => (id && UUID_RE.test(id) ? id : null);
+
+// Answers to ONE sending of a word. New answers are linked by session_word_id;
+// older ones (from before this fix) fall back to matching the word text.
+function attemptsForWord(attempts: WordAttempt[], sw: { id: string; word: string }) {
+  return attempts.filter((a) =>
+    a.session_word_id
+      ? a.session_word_id === sw.id
+      : a.word?.toUpperCase() === sw.word.toUpperCase()
+  );
+}
+
+// The newest answer in a list (the one that counts)
+function latestAttempt(list: WordAttempt[]): WordAttempt | null {
+  let best: WordAttempt | null = null;
+  for (const a of list) {
+    if (!best || Date.parse(a.attempted_at) > Date.parse(best.attempted_at)) best = a;
+  }
+  return best;
+}
+
 // Plays a student's recording from the private "answers" bucket
 function PlayRecordingButton({ path }: { path: string | null }) {
   const [loading, setLoading] = useState(false);
@@ -216,14 +240,22 @@ function PlayRecordingButton({ path }: { path: string | null }) {
 
 function HandGradeCard({
   word,
+  wordId,
   students,
   attempts,
   onGrade,
 }: {
   word: string;
+  wordId: string | null;
   students: Student[];
   attempts: WordAttempt[];
-  onGrade: (student: Student, word: string, correct: boolean, existing: WordAttempt | null) => void;
+  onGrade: (
+    student: Student,
+    word: string,
+    wordId: string | null,
+    correct: boolean,
+    existing: WordAttempt | null
+  ) => void;
 }) {
   if (!word || students.length === 0) return null;
   const w = word.toUpperCase();
@@ -236,7 +268,10 @@ function HandGradeCard({
       <View style={{ gap: 8 }}>
         {students.map((st) => {
           // attempts are newest first → this is the student's latest answer
-          const a = attempts.find((x) => x.student_id === st.id && x.word?.toUpperCase() === w) ?? null;
+          const mine = attempts.filter((x) => x.student_id === st.id);
+          const a = latestAttempt(
+            wordId ? attemptsForWord(mine, { id: wordId, word: w }) : mine.filter((x) => x.word?.toUpperCase() === w)
+          );
           const status = a ? attemptStatus(a) : null;
           const byTeacher = a?.graded_by === "teacher";
           return (
@@ -259,7 +294,7 @@ function HandGradeCard({
               </View>
               {a?.audio_path ? <PlayRecordingButton path={a.audio_path} /> : null}
               <Pressable
-                onPress={() => onGrade(st, w, true, a)}
+                onPress={() => onGrade(st, w, wordId, true, a)}
                 hitSlop={6}
                 style={({ pressed }) => [
                   hg.btn,
@@ -271,7 +306,7 @@ function HandGradeCard({
                 <Ionicons name="checkmark" size={18} color={status === "correct" ? C.white : C.green} />
               </Pressable>
               <Pressable
-                onPress={() => onGrade(st, w, false, a)}
+                onPress={() => onGrade(st, w, wordId, false, a)}
                 hitSlop={6}
                 style={({ pressed }) => [
                   hg.btn,
@@ -303,6 +338,7 @@ const hg = StyleSheet.create({
   },
   name: { fontFamily: fonts.bodyBold, fontSize: 14, color: C.ink },
   sub: { fontFamily: fonts.mono, fontSize: 10, color: C.muted },
+  who: { fontFamily: fonts.bodyBold, fontSize: 12, color: C.ink, maxWidth: 90 },
   btn: {
     width: 38,
     height: 38,
@@ -822,7 +858,7 @@ export default function SessionDetail() {
     if (!id) return;
     supabase
       .from("word_attempts")
-      .select("id, student_id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by")
+      .select("id, student_id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id")
       .eq("session_id", id)
       .order("attempted_at", { ascending: false })
       .limit(200)
@@ -839,6 +875,7 @@ export default function SessionDetail() {
   async function gradeByHand(
     student: Student,
     word: string,
+    wordId: string | null,
     correct: boolean,
     existing: WordAttempt | null
   ) {
@@ -861,6 +898,7 @@ export default function SessionDetail() {
       student_id: student.id,
       session_id: id!,
       word,
+      session_word_id: asWordId(wordId),
       response_time_ms: null,
       attempted_at: new Date().toISOString(),
       ...patch,
@@ -1216,6 +1254,10 @@ export default function SessionDetail() {
   // ── Session lifecycle ───────────────────────────────────────────────────────
 
   async function launchSession() {
+    if (!isOnline()) {
+      showValidationToast("You're offline", "Connect to the internet to launch.");
+      return;
+    }
     const validAssigned = allStudents.filter(
       (s) => assignedIds.has(s.id) && !!s.device
     );
@@ -1300,6 +1342,10 @@ export default function SessionDetail() {
   }
 
   async function resumeSession() {
+    if (!isOnline()) {
+      showValidationToast("You're offline", "Connect to the internet to resume.");
+      return;
+    }
     // Pre-flight check: block if another session is already active
     const {
       data: { user },
@@ -1387,6 +1433,10 @@ export default function SessionDetail() {
   // ── Send word to devices ────────────────────────────────────────────────────
 
   async function sendWord(word: string) {
+    if (!isOnline()) {
+      showValidationToast("You're offline", "Connect to the internet to send words.");
+      return;
+    }
     // Input Validation: Enforce strict A-Z only validation to prevent symbol errors
     const sanitized = word.replace(/[^a-zA-Z]/g, "").trim().toUpperCase();
     if (!sanitized || !isValidWord(sanitized)) {
@@ -1525,6 +1575,7 @@ export default function SessionDetail() {
       command_type: "display_chunk" as const,
       payload: {
         word,
+        session_word_id: asWordId(activeWordIdRef.current),
         chunk: chunkArr[idx],
         chunk_index: idx,
         total_chunks: chunkArr.length,
@@ -1547,7 +1598,7 @@ export default function SessionDetail() {
     setStatsModal(true);
     const { data } = await supabase
       .from("word_attempts")
-      .select("id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by")
+      .select("id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id")
       .eq("student_id", student.id)
       .eq("session_id", id!)
       .order("attempted_at", { ascending: true });
@@ -1576,6 +1627,8 @@ export default function SessionDetail() {
   }
 
   const assignedStudents = allStudents.filter((s) => assignedIds.has(s.id));
+  const studentName = (sid?: string | null) =>
+    allStudents.find((s) => s.id === sid)?.full_name.split(" ")[0] ?? "—";
   const validPairedAssignedCount = allStudents.filter(
     (s) => assignedIds.has(s.id) && !!s.device
   ).length;
@@ -2468,10 +2521,14 @@ export default function SessionDetail() {
 
                       {/* Summary chips */}
                       {(() => {
-                        const graded  = statsData.attempts.filter((a) => !a.needs_review);
+                        // One result per word sent: the student's latest answer to it
+                        const answers = sessionWords
+                          .map((sw) => latestAttempt(attemptsForWord(statsData.attempts, sw)))
+                          .filter((a): a is WordAttempt => !!a);
+                        const graded  = answers.filter((a) => !a.needs_review);
                         const total   = graded.length;
                         const correct = graded.filter((a) => a.is_correct).length;
-                        const pending = statsData.attempts.length - graded.length;
+                        const pending = answers.length - graded.length;
                         const acc     = total > 0 ? Math.round((correct / total) * 100) : 0;
                         const timed   = statsData.attempts.filter((a) => (a.response_time_ms ?? 0) > 0);
                         const avgMs   = timed.length > 0
@@ -2516,10 +2573,8 @@ export default function SessionDetail() {
                     <Text style={styles.emptyHint}>No words sent this session.</Text>
                   }
                   renderItem={({ item: sw, index: i }) => {
-                    // Find matching attempt for this word
-                    const attempt = [...statsData.attempts].reverse().find(
-                      (a) => a.word === sw.word
-                    );
+                    // The student's latest answer to THIS sending of the word
+                    const attempt = latestAttempt(attemptsForWord(statsData.attempts, sw));
                     return (
                       <View
                         style={[
@@ -2785,6 +2840,7 @@ export default function SessionDetail() {
             {/* Teacher fallback: grade the current word by hand */}
             <HandGradeCard
               word={lastSentWord}
+              wordId={[...sessionWords].reverse().find((sw) => sw.word === lastSentWord)?.id ?? null}
               students={assignedStudents}
               attempts={liveAttempts}
               onGrade={gradeByHand}
@@ -2798,10 +2854,6 @@ export default function SessionDetail() {
                   {[...sessionWords].reverse().map((sw, i) => {
                     const isActive = sw.id === activeWordId;
                     const isDone = completedWordIds.has(sw.id);
-                    // Find any live attempt for this word
-                    const attempt = liveAttempts.find(
-                      (a) => a.word === sw.word
-                    );
                     return (
                       <View
                         key={sw.id}
@@ -2841,23 +2893,6 @@ export default function SessionDetail() {
                             <Text style={styles.doneWordBadgeText}>Done</Text>
                           </View>
                         )}
-                        {attempt && (
-                          <View
-                            style={[
-                              styles.attemptLiveBadge,
-                              { backgroundColor: STATUS_STYLE[attemptStatus(attempt)].bg },
-                            ]}
-                          >
-                            <Text
-                              style={[
-                                styles.attemptLiveBadgeText,
-                                { color: STATUS_STYLE[attemptStatus(attempt)].fg },
-                              ]}
-                            >
-                              {STATUS_STYLE[attemptStatus(attempt)].label}
-                            </Text>
-                          </View>
-                        )}
                       </View>
                     );
                   })}
@@ -2878,6 +2913,7 @@ export default function SessionDetail() {
                           { backgroundColor: STATUS_STYLE[attemptStatus(a)].fg },
                         ]}
                       />
+                      <Text style={hg.who} numberOfLines={1}>{studentName(a.student_id)}</Text>
                       <Text style={styles.historyWord}>{a.word}</Text>
                       <View style={{ flex: 1 }} />
                       <Text
@@ -3043,36 +3079,6 @@ export default function SessionDetail() {
                   </View>
                 </View>
 
-                {/* Live student response for this active word */}
-                {(() => {
-                  const currentWord = sessionWords[wordListIndex]?.word;
-                  const attempt = liveAttempts.find((a) => a.word === currentWord);
-                  if (!attempt) return null;
-                  return (
-                    <View
-                      style={[
-                        styles.wordListAttemptBadge,
-                        {
-                          backgroundColor: STATUS_STYLE[attemptStatus(attempt)].bg,
-                          marginTop: 8,
-                        },
-                      ]}
-                    >
-                      <Text
-                        style={[
-                          styles.wordListAttemptText,
-                          { color: STATUS_STYLE[attemptStatus(attempt)].fg },
-                        ]}
-                      >
-                        {attemptStatus(attempt) === "review"
-                          ? "⚠ Needs Teacher Review"
-                          : attempt.is_correct
-                          ? "✓ Student Answered Correctly"
-                          : "✗ Incorrect Attempt"}
-                      </Text>
-                    </View>
-                  );
-                })()}
               </View>
             )}
 
@@ -3119,6 +3125,7 @@ export default function SessionDetail() {
         {isTimedSequence(session.type) && (
           <HandGradeCard
             word={sessionWords[wordListIndex]?.word ?? ""}
+            wordId={sessionWords[wordListIndex]?.id ?? null}
             students={assignedStudents}
             attempts={liveAttempts}
             onGrade={gradeByHand}
@@ -3138,6 +3145,7 @@ export default function SessionDetail() {
                       { backgroundColor: STATUS_STYLE[attemptStatus(a)].fg },
                     ]}
                   />
+                  <Text style={hg.who} numberOfLines={1}>{studentName(a.student_id)}</Text>
                   <Text style={styles.historyWord}>{a.word}</Text>
                   <View style={{ flex: 1 }} />
                   <Text
