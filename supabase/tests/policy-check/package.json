@@ -1,0 +1,12 @@
+{
+  "name": "policy-check",
+  "private": true,
+  "type": "module",
+  "description": "Runs supabase/migrations against a stand-in schema in PGlite (in-memory Postgres) and checks the policies. Never touches the real database.",
+  "scripts": {
+    "check": "node run.mjs ../../migrations"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "0.2.17"
+  }
+}
