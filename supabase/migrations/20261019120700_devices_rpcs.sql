@@ -6,29 +6,45 @@
 -- taken away from anon: by default every role, including anon, may call a
 -- new function.
 
--- Pair a device to one of YOUR students. Releases the student's previous
--- device. Fails (and changes nothing) if someone else got the device first.
+-- Pair a device to one of YOUR students. One device per student at a time,
+-- and any of your students can use any of your devices:
+--   - the student's previous device (if any) is released
+--   - a device that's with ANOTHER of your students moves to this one
+--   - a device that's with ANOTHER TEACHER's student is refused (nothing changes)
 create or replace function public.claim_device(p_device uuid, p_student uuid)
 returns void
 language plpgsql
 security definer
 set search_path = public
 as $$
+declare
+  v_holder uuid;
+  v_holder_teacher uuid;
 begin
   if not exists (select 1 from students where id = p_student and teacher_id = auth.uid()) then
     raise exception 'not your student' using errcode = '42501';
   end if;
 
+  -- Lock the device row: two teachers tapping at once can't both get it
+  select d.paired_student_id, s.teacher_id
+    into v_holder, v_holder_teacher
+    from devices d
+    left join students s on s.id = d.paired_student_id
+   where d.id = p_device
+     for update of d;
+
+  if not found then
+    raise exception 'no such device' using errcode = 'P0002';
+  end if;
+  if v_holder is not null and v_holder_teacher is distinct from auth.uid() then
+    raise exception 'device already paired' using errcode = 'P0001';
+  end if;
+
   update devices set paired_student_id = null
    where paired_student_id = p_student and id <> p_device;
 
-  update devices set paired_student_id = p_student
-   where id = p_device
-     and (paired_student_id is null or paired_student_id = p_student);
-
-  if not found then
-    raise exception 'device already paired' using errcode = 'P0001';
-  end if;
+  -- free, already this student's, or moved from another of your students
+  update devices set paired_student_id = p_student where id = p_device;
 end;
 $$;
 

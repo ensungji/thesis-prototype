@@ -6,8 +6,11 @@
 -- target a partial index. Rows with session_word_id = null never clash
 -- (NULLs are distinct), so old answers without a word id are unaffected.
 --
--- Existing duplicates are removed first, keeping the NEWEST answer per
--- student + word (by attempted_at, then id). The removed rows are copied to
+-- Existing duplicates are removed first. Per student + word the one kept is:
+--   1. the teacher's hand grade, if there is one (it beats a voice answer,
+--      same rule as grade-answer)
+--   2. otherwise the NEWEST answer (by attempted_at, then id)
+-- Rows without a student_id are left alone. The removed rows are copied to
 -- audit_backup.word_attempts_dupes_20261019 (a schema the API doesn't expose),
 -- and letter_attempts that pointed at a removed row are moved to the kept one.
 -- Their recordings stay in the "answers" bucket.
@@ -15,8 +18,10 @@
 -- Preview — how many rows will be removed:
 --   select count(*) from (
 --     select row_number() over (partition by session_word_id, student_id
---                               order by attempted_at desc nulls last, id desc) as rn
---     from public.word_attempts where session_word_id is not null
+--                               order by (graded_by = 'teacher') desc nulls last,
+--                                        attempted_at desc nulls last, id desc) as rn
+--     from public.word_attempts
+--     where session_word_id is not null and student_id is not null
 --   ) t where rn > 1;
 
 begin;
@@ -31,9 +36,11 @@ from (
          first_value(id) over w as keep_id,
          row_number()    over w as rn
   from public.word_attempts
-  where session_word_id is not null
+  where session_word_id is not null and student_id is not null
+  -- "nulls last": a row with no graded_by must not rank above a teacher grade
   window w as (partition by session_word_id, student_id
-               order by attempted_at desc nulls last, id desc)
+               order by (graded_by = 'teacher') desc nulls last,
+                        attempted_at desc nulls last, id desc)
 ) ranked
 where rn > 1;
 

@@ -263,7 +263,8 @@ export default function StudentDetail() {
     setPairError(null);
 
     // Releases this student's current device and claims the new one in one
-    // step on the server; fails (changing nothing) if it was just taken
+    // step on the server. A device with another of your students moves to
+    // this one; it fails (changing nothing) if another teacher has it
     const { error } = await supabase.rpc("claim_device", {
       p_device: target.id,
       p_student: id,
@@ -783,7 +784,11 @@ export default function StudentDetail() {
                 <ScrollView style={{ maxHeight: 320 }}>
                   {deviceList.map((d) => {
                     const isMine = d.paired_student_id === id;
-                    const isTaken = d.taken && !isMine;
+                    // With another of MY students: can be moved to this one.
+                    // (Another teacher's device has no student id: "Taken".)
+                    const isMovable = !!d.paired_student_id && !isMine;
+                    const isTaken = d.taken && !isMine && !isMovable;
+                    const holder = d.paired_name?.split(" ")[0] ?? "another student";
                     const online = d.status === "connected";
                     return (
                       <Pressable
@@ -817,23 +822,33 @@ export default function StudentDetail() {
                                 ? C.blueWash
                                 : isTaken
                                   ? C.redBg
-                                  : C.greenBg,
+                                  : isMovable
+                                    ? C.brownBg
+                                    : C.greenBg,
                             },
                           ]}
                         >
                           <Text
                             style={[
                               styles.devBadgeText,
-                              { color: isMine ? C.navy : isTaken ? C.red : C.green },
+                              {
+                                color: isMine
+                                  ? C.navy
+                                  : isTaken
+                                    ? C.red
+                                    : isMovable
+                                      ? C.brown
+                                      : C.green,
+                              },
                             ]}
                           >
                             {isMine
                               ? "Paired to this student"
                               : isTaken
-                                ? d.paired_name
-                                  ? `Paired · ${d.paired_name}`
-                                  : "Taken"
-                                : "Available"}
+                                ? "Taken"
+                                : isMovable
+                                  ? `With ${holder} — tap to move`
+                                  : "Available"}
                           </Text>
                         </View>
                       </Pressable>
