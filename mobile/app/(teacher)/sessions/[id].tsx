@@ -24,6 +24,7 @@ import { supabase } from "../../../lib/supabase";
 import { updateOrQueue, insertOrQueue, newId } from "../../../lib/outbox";
 import { logEvent } from "../../../lib/logger";
 import { isOnline } from "../../../lib/network";
+import { onDevicePresence, type PresenceEvent } from "../../../lib/device-presence";
 import { colors as C, fonts } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
 import { BrailleLoader } from "../../../components/BrailleLoader";
@@ -502,6 +503,103 @@ export default function SessionDetail() {
   const appStateRef      = useRef(AppState.currentState);
   const sessionStatusRef = useRef<string | null>(null);
   const clearDevicesRef = useRef<(commandType?: string) => Promise<void>>(async () => {});
+
+  // Latest chunk state for callbacks that outlive a render
+  const chunksRef = useRef<string[]>([]);
+  const chunkIndexRef = useRef(0);
+  useEffect(() => {
+    chunksRef.current = chunks;
+    chunkIndexRef.current = chunkIndex;
+  }, [chunks, chunkIndex]);
+
+  // ── Device power cut / comeback during a running session ───────────────────
+  const [deviceToast, setDeviceToast] = useState<{
+    visible: boolean;
+    message: string;
+    detail?: string;
+    online: boolean;
+  }>({ visible: false, message: "", online: true });
+  const presenceHandlerRef = useRef<(e: PresenceEvent) => void>(() => {});
+  presenceHandlerRef.current = (e: PresenceEvent) => {
+    if (sessionStatusRef.current !== "in_progress") return;
+    const student = allStudents.find((s) => assignedIds.has(s.id) && s.device?.id === e.deviceId);
+    if (!student) return;
+    const code = student.device?.device_code || e.code || "Device";
+    const first = student.full_name.split(" ")[0];
+
+    if (e.type === "offline") {
+      setDeviceToast({
+        visible: true,
+        online: false,
+        message: `${code} disconnected`,
+        detail: `${first}'s device went offline. Use Grade by hand until it's back.`,
+      });
+      logEvent("warn", "device_disconnected", `${code} (${first}) went offline during the session`, {
+        session_id: id ?? null,
+        device_id: e.deviceId,
+      });
+      return;
+    }
+
+    // Back online: what SHOULD it be showing right now?
+    const chunkArr = chunksRef.current;
+    const idx = chunkIndexRef.current;
+    const timedPaused =
+      isTimedSequence(session?.type) && (!isPlayingRef.current || isCooldownRef.current);
+    const want =
+      activeWordIdRef.current && chunkArr.length > 0 && !timedPaused ? chunkArr[idx] ?? "" : "";
+    if (!want || e.showing.toUpperCase() === want.toUpperCase()) {
+      // Nothing to re-send — just say it's back (if it had been offline)
+      if (e.wasOffline) {
+        setDeviceToast({
+          visible: true,
+          online: true,
+          message: `${code} is back online`,
+          detail: `${first}'s device reconnected.`,
+        });
+        logEvent("info", "device_rejoined", `${code} (${first}) came back online`, {
+          session_id: id ?? null,
+          device_id: e.deviceId,
+        });
+      }
+      return;
+    }
+
+    const word = lastSentWordRef.current;
+    supabase
+      .from("device_commands")
+      .insert({
+        device_id: e.deviceId,
+        session_id: id,
+        command_type: "display_chunk",
+        payload: {
+          word,
+          session_word_id: asWordId(activeWordIdRef.current),
+          chunk: want,
+          chunk_index: idx,
+          total_chunks: chunkArr.length,
+        },
+      })
+      .then(({ error }) => {
+        if (error) {
+          logEvent("error", "device_command_failed", `Could not re-send "${word}" to ${code}: ${error.message}`, {
+            session_id: id ?? null,
+            device_id: e.deviceId,
+          });
+        }
+      });
+    setDeviceToast({
+      visible: true,
+      online: true,
+      message: `${code} is back online`,
+      detail: `Re-sent "${word}" to ${first}'s device.`,
+    });
+    logEvent("info", "device_rejoined", `${code} (${first}) came back — re-sent "${word}"`, {
+      session_id: id ?? null,
+      device_id: e.deviceId,
+    });
+  };
+  useEffect(() => onDevicePresence((e) => presenceHandlerRef.current(e)), []);
   useEffect(() => {
     sessionStatusRef.current = session?.status ?? null;
   }, [session?.status]);
@@ -663,6 +761,7 @@ export default function SessionDetail() {
         chunkIndex: number;
         activeWordId?: string | null;
         completedWordIds?: string[];
+        sentAt?: number | null;
       };
 
       // Snap wordListIndex for timed sequence sessions
@@ -683,8 +782,11 @@ export default function SessionDetail() {
       setChunkIndex(pos.chunkIndex ?? 0);
       setWordSent(true);
 
-      // Restore active / completed word state
-      const restoredActiveId = pos.activeWordId ?? null;
+      // Restore active / completed word state. If the word went up more than
+      // 60 s ago, the device's own safety timer has already lowered it.
+      const ageMs = pos.sentAt ? Date.now() - pos.sentAt : 0;
+      const expired = !!pos.activeWordId && ageMs >= 60000;
+      const restoredActiveId = expired ? null : pos.activeWordId ?? null;
       setActiveWordId(restoredActiveId);
       activeWordIdRef.current = restoredActiveId;
       if (pos.completedWordIds?.length) {
@@ -711,7 +813,7 @@ export default function SessionDetail() {
         isLiveSession(activeType) &&
         activeStatus === "in_progress"
       ) {
-        startLiveSafetyTimer();
+        startLiveSafetyTimer(pos.sentAt ? Math.max(1000, 60000 - ageMs) : 60000);
       }
     } catch {
       // Silently ignore storage errors
@@ -733,6 +835,7 @@ export default function SessionDetail() {
           chunkIndex,
           activeWordId: opts?.activeWordId ?? null,
           completedWordIds: opts?.completedWordIds ? [...opts.completedWordIds] : [],
+          sentAt: opts?.activeWordId ? Date.now() : null, // when the dots went up
         }),
       );
     } catch {
@@ -1074,13 +1177,13 @@ export default function SessionDetail() {
     });
   }
 
-  function startLiveSafetyTimer() {
+  function startLiveSafetyTimer(ms = 60000) {
     if (liveSafetyTimerRef.current) {
       clearTimeout(liveSafetyTimerRef.current);
     }
     liveSafetyTimerRef.current = setTimeout(() => {
       triggerSafetyAutoClear();
-    }, 60000);
+    }, ms);
   }
 
   function stopLiveSafetyTimer() {
@@ -1272,6 +1375,25 @@ export default function SessionDetail() {
     if (isTimedSequence(session?.type) && sessionWords.length === 0) {
       showValidationToast("No words in sequence", "Add at least one word before launching.");
       return;
+    }
+
+    // At least one device must be ON (devices report themselves via presence)
+    const onlineAssigned = validAssigned.filter((s) => s.device?.status === "connected");
+    if (onlineAssigned.length === 0) {
+      showValidationToast(
+        "No devices online",
+        "Turn on at least one student's device, wait for its ready sound, then launch."
+      );
+      return;
+    }
+    const offlineCodes = validAssigned
+      .filter((s) => s.device?.status !== "connected")
+      .map((s) => s.device?.device_code ?? "?");
+    if (offlineCodes.length > 0) {
+      showValidationToast(
+        `${offlineCodes.join(", ")} offline`,
+        "Launching anyway — they'll get the current word when they turn on."
+      );
     }
 
     // ── Pre-flight check: block if another session is already active ──────────
@@ -2853,7 +2975,8 @@ export default function SessionDetail() {
                 <View style={{ gap: 8 }}>
                   {[...sessionWords].reverse().map((sw, i) => {
                     const isActive = sw.id === activeWordId;
-                    const isDone = completedWordIds.has(sw.id);
+                    // Live: every sent word that's no longer on the display is done
+                    const isDone = !isActive;
                     return (
                       <View
                         key={sw.id}
@@ -3235,6 +3358,16 @@ export default function SessionDetail() {
         visible={!!finishToast}
         variant="success"
         onDismiss={() => setFinishToast(null)}
+      />
+      {/* ── Device online / offline toast ─────────────────────────────── */}
+      <Toast
+        message={deviceToast.message}
+        detail={deviceToast.detail}
+        visible={deviceToast.visible}
+        variant={deviceToast.online ? "success" : "warning"}
+        icon={deviceToast.online ? "cloud-done-outline" : "cloud-offline-outline"}
+        duration={deviceToast.online ? 3500 : 6000}
+        onDismiss={() => setDeviceToast((t) => ({ ...t, visible: false }))}
       />
       {/* ── Hardware Safety Kill-Switch Toast (60s inactivity) ───────────── */}
       <Toast

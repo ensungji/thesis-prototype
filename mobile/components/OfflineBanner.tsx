@@ -11,6 +11,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { useOnline } from "../lib/network";
 import { usePendingCount } from "../lib/outbox";
 import { startAppLogging } from "../lib/logger";
+import { startDevicePresence } from "../lib/device-presence";
 import { colors as C, fonts } from "../lib/theme";
 
 export function OfflineBanner() {
@@ -23,6 +24,7 @@ export function OfflineBanner() {
 
   useEffect(() => {
     startAppLogging(); // records how long the phone was offline
+    startDevicePresence(); // live device online/offline + comeback events
   }, []);
 
   useEffect(() => {

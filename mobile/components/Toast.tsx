@@ -14,6 +14,8 @@ type Props = {
   detail?: string;
   visible: boolean;
   variant?: "success" | "delete" | "warning";
+  /** Optional icon instead of the variant's default. */
+  icon?: keyof typeof Ionicons.glyphMap;
   /** Auto-dismiss after this many ms. Defaults to 3500. */
   duration?: number;
   onDismiss: () => void;
@@ -24,6 +26,7 @@ export function Toast({
   detail,
   visible,
   variant = "success",
+  icon,
   duration = 3500,
   onDismiss,
 }: Props) {
@@ -94,7 +97,7 @@ export function Toast({
   const isDelete    = variant === "delete";
   const isWarning   = variant === "warning";
   const accentColor = isDelete ? C.red : isWarning ? C.amber : C.green;
-  const iconName    = isDelete ? "trash" : isWarning ? "shield-checkmark" : "checkmark-circle";
+  const iconName    = icon ?? (isDelete ? "trash" : isWarning ? "shield-checkmark" : "checkmark-circle");
   // Icon pill: a tinted wash of the accent colour
   const iconBg      = isDelete ? C.redBg : isWarning ? C.brownBg : C.greenBg;
 

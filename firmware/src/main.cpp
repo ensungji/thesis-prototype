@@ -1,8 +1,20 @@
 /*
  * ================================================================
- * BRAILLE D.O.T.S. — FIRMWARE v6.11 (Supabase Realtime + Voice)
+ * BRAILLE D.O.T.S. — FIRMWARE v7.1 (Supabase Realtime + Voice)
  * File: src/main.cpp
  *
+ * v7.1: "alive" signal every 3 s → the app notices a power cut in ~10 s
+ *       (instead of waiting 30–60 s for the server to time out)
+ * v7.0: - answers up to 15 s: audio is streamed to the server WHILE the
+ *         student speaks (no more 2 s RAM limit)
+ *       - Wi-Fi setup page: if no known Wi-Fi works (or NEXT+BACK are held
+ *         at power-on), the device opens hotspot "DOTS-000X-SETUP" where the
+ *         teacher picks the classroom Wi-Fi. Saved on the device, no reflash.
+ *       - never freezes on Wi-Fi failure; restarts itself if Wi-Fi is lost
+ *         for 2 minutes
+ *       - presence: tells the app it's online + what it's showing, so the
+ *         app can mark it offline and re-send the word after a power cut
+ *       - coils drop to hold power before recording
  * v6.11: pairing sounds (paired / unpaired); connection sounds now optional
  * v6.10: connection sounds (disconnected / reconnected)
  * v6.9: session sounds (started, paused, resumed, finished)
@@ -23,13 +35,16 @@
  *   row.device_id          = this device's UUID
  *   row.payload.chunk      = "HELLO" (up to 5 letters) or "" (kill-switch)
  *
- * ⚠  UNPLUG GPIO5 (PIN_LATCH) before every upload!
+ * Libraries: WebSockets, ArduinoJson, WiFiManager (see platformio.ini)
  * ================================================================
  */
 
-#include "secrets.h"   // Wi-Fi name + password (not on GitHub)
+#if __has_include("secrets.h")
+#include "secrets.h"   // optional default Wi-Fi (not on GitHub)
+#endif
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <WiFiClientSecure.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
@@ -44,8 +59,10 @@
 #define MIC_CHANNEL     I2S_CHANNEL_FMT_ONLY_RIGHT // L/R tied to GND (ESP32 quirk: data lands in the RIGHT slot)
 #define MIC_SHIFT       14      // 32-bit mic sample → 16-bit. Lower = louder (13 = 2x louder)
 #define SAMPLE_RATE     16000   // what Whisper expects
-#define MAX_REC_SEC     2       // longest answer kept (64 KB of RAM)
+#define MAX_ANSWER_SEC  15      // longest answer (streamed while recording)
+#define RING_SEC        2       // RAM buffer that covers the connection set-up (64 KB)
 #define MIN_REC_MS      300     // shorter presses are ignored
+#define STREAM_ANSWERS  1       // 1 = stream (long answers). 0 = old way (2 s max)
 
 // ── Speaker (MAX98357A on I2S1) ───────────────────────────────
 #define SPK_PORT        I2S_NUM_1
@@ -54,13 +71,24 @@
 #define SPK_DIN         22
 #define SPK_RATE        16000
 #define SPK_VOLUME      0.25f   // 0.0 – 1.0  (classroom-friendly default)
-#define SPK_TEST_ON_BOOT 1      // 1 = play a 2-second test tone at boot (set 0 when done)
+#define SPK_TEST_ON_BOOT 0      // 1 = play a 2-second test tone at boot
 #define CONNECTION_SOUNDS 0     // 1 = also beep on Wi-Fi/server disconnect & reconnect
 
 uint8_t* recBuf      = nullptr; // 44-byte WAV header + audio
 size_t   recCapacity = 0;       // audio bytes that fit in recBuf
 
-// ── WiFi credentials (fill in) ────────────────────────────────
+// ── Wi-Fi ─────────────────────────────────────────────────────
+// Order at power-on:
+//   1. the network saved through the setup page
+//   2. WIFI_SSID / WIFI_PASS from secrets.h (optional default)
+//   3. BACKUP_SSID / BACKUP_PASS from secrets.h (optional, e.g. a teacher hotspot)
+//   4. setup page: hotspot "<DEVICE_CODE>-SETUP", password SETUP_AP_PASS
+// Hold NEXT + BACK while powering on (3 s) to open the setup page directly.
+#define SETUP_AP_PASS        "dots1234" // min 8 characters
+#define WIFI_TRY_MS          20000UL    // per network
+#define PORTAL_TIMEOUT_S     300        // setup page closes after 5 min, then retries
+#define WIFI_LOST_RESTART_MS 120000UL   // Wi-Fi gone this long → restart
+#define REG_FAILS_TO_SETUP   12         // ~1 min without reaching Supabase → setup page
 
 // ── Supabase config ───────────────────────────────────────────
 #define SUPABASE_HOST "nacknvkbcjxuthtycdzj.supabase.co"
@@ -83,6 +111,7 @@ bool registerDevice();  // defined below
 // Channels
 #define CHAN_COMMANDS "realtime:public:device_commands"
 #define CHAN_EVENTS "realtime:public:device_events"
+#define CHAN_PRESENCE "realtime:dots-presence" // app watches this to see who's online
 
 // ── Shift register pins ───────────────────────────────────────
 #define PIN_DATA 23
@@ -109,6 +138,7 @@ bool registerDevice();  // defined below
 // ── Timing ───────────────────────────────────────────────────
 #define PUNCH_MS 100
 #define HEARTBEAT_MS 25000
+#define ALIVE_MS 3000     // "I'm alive" to the app (silence for 10 s = offline)
 #define SAFETY_MS 60000UL // firmware-side kill-switch
 
 #define OE_FULL 0
@@ -159,6 +189,9 @@ bool rtPaused = false; // socket closed ON PURPOSE (answer upload) — keep the 
 bool rtDropped = false; // connection was LOST (not paused) — play "reconnected" when back
 unsigned long lastHeartbeat = 0;
 int joinRef = 1;
+String presenceJoinRef = ""; // ref of our presence join → track when it's accepted
+bool presenceReady = false;   // joined → send "alive" signals
+unsigned long lastAlive = 0;
 
 // ── State machine ─────────────────────────────────────────────
 enum State
@@ -372,6 +405,9 @@ const Note SND_PAUSED[]   = {{784, 150, SINE, false}, {523, 280, SINE, true}};
 const Note SND_RESUMED[]  = {{523, 150, SINE, false}, {784, 280, SINE, true}};
 const Note SND_FINISHED[] = {{523, 120, SINE, false}, {659, 120, SINE, false},
                              {784, 120, SINE, false}, {1047, 480, SINE, true}};
+// Wi-Fi setup page is open (teacher must pick a network)
+const Note SND_SETUP[]    = {{440, 150, SINE, false}, {660, 150, SINE, false},
+                             {440, 150, SINE, false}, {660, 300, SINE, true}};
 
 #define PLAY(snd) playMelody(snd, sizeof(snd) / sizeof(snd[0]))
 
@@ -505,6 +541,72 @@ void joinEventsChannel()
                "\"ref\":\"" +
                String(joinRef++) + "\"}";
   rtSend(msg);
+}
+
+// Same as rtSend, without printing (for the frequent "alive" signal)
+void rtSendQuiet(const String &json)
+{
+  if (wsConnected)
+    wsClient.sendTXT(json.c_str());
+}
+
+// "I'm alive" broadcast every ALIVE_MS. busy = "answer" just before the
+// socket closes on purpose for an answer upload (app waits longer then).
+void sendAlive(const char *busy = "")
+{
+  if (!presenceReady)
+    return;
+  JsonDocument d;
+  d["topic"] = CHAN_PRESENCE;
+  d["event"] = "broadcast";
+  d["ref"] = String(joinRef++);
+  JsonObject p = d["payload"].to<JsonObject>();
+  p["type"] = "broadcast";
+  p["event"] = "alive";
+  JsonObject m = p["payload"].to<JsonObject>();
+  m["id"] = deviceId;
+  m["code"] = DEVICE_CODE;
+  m["showing"] = chunkBuf;
+  if (busy[0])
+    m["busy"] = busy;
+  String out;
+  serializeJson(d, out);
+  rtSendQuiet(out);
+}
+
+// Presence: the app sees this device as "online" while this channel is joined.
+// Key = our UUID. Payload says what we're showing, so the app can re-send
+// the word after a power cut / reconnect.
+void joinPresenceChannel()
+{
+  presenceJoinRef = String(joinRef++);
+  String msg = String("{\"topic\":\"" CHAN_PRESENCE "\",\"event\":\"phx_join\","
+                      "\"payload\":{\"config\":{\"broadcast\":{\"self\":false},"
+                      "\"presence\":{\"key\":\"") +
+               deviceId + "\",\"enabled\":true},\"private\":false},"
+                          "\"access_token\":\"" SUPABASE_KEY "\"},"
+                          "\"ref\":\"" + presenceJoinRef + "\"}";
+  rtSend(msg);
+}
+
+void trackPresence(const char *busy = "")
+{
+  JsonDocument d;
+  d["topic"] = CHAN_PRESENCE;
+  d["event"] = "presence";
+  d["ref"] = String(joinRef++);
+  JsonObject p = d["payload"].to<JsonObject>();
+  p["type"] = "presence";
+  p["event"] = "track";
+  JsonObject m = p["payload"].to<JsonObject>();
+  m["device_id"] = deviceId;
+  m["code"] = DEVICE_CODE;
+  m["showing"] = chunkBuf; // "" = display is clear
+  if (busy[0])
+    m["busy"] = busy;      // e.g. "answer": socket closes for a while on purpose
+  String out;
+  serializeJson(d, out);
+  rtSend(out);
 }
 
 void sendHeartbeat()
@@ -661,6 +763,7 @@ void onWsEvent(WStype_t type, uint8_t *payload, size_t length)
     //  open runs out of RAM. Boot registration already set status.)
     joinCommandsChannel();
     joinEventsChannel();
+    joinPresenceChannel(); // tracked once the join is accepted (see phx_reply)
     lastHeartbeat = millis();
     break;
 
@@ -668,6 +771,7 @@ void onWsEvent(WStype_t type, uint8_t *payload, size_t length)
   {
     bool wasConnected = wsConnected; // reconnect attempts also fire this event
     wsConnected = false;
+    presenceReady = false;
     if (rtPaused)
     {
       // Planned pause for an answer upload: keep the word on the display.
@@ -713,6 +817,14 @@ void onWsEvent(WStype_t type, uint8_t *payload, size_t length)
     {
       const char *status = doc["payload"]["status"];
       Serial.printf("[RT] Join/reply status: %s\n", status ? status : "?");
+      const char *ref = doc["ref"] | "";
+      if (presenceJoinRef.length() && presenceJoinRef == ref && status && strcmp(status, "ok") == 0)
+      {
+        trackPresence(); // "I'm online, showing <chunk>"
+        presenceReady = true;
+        sendAlive();
+        lastAlive = millis();
+      }
       break;
     }
 
@@ -789,10 +901,71 @@ bool registerDevice()
 // VOICE ANSWER (hold ANSWER → record → upload → grade)
 // ═════════════════════════════════════════════════════════════
 
+// ── Streaming recorder ────────────────────────────────────────
+// micTask (core 0) fills the ring while micOn; the main loop sends it
+// to the server at the same time. The ring only has to cover the ~1 s
+// it takes to open the secure connection, so answers can be 15 s long.
+int16_t *ring = nullptr;
+size_t ringCap = 0;                // samples
+volatile size_t ringHead = 0;      // total samples written
+volatile size_t ringTail = 0;      // total samples sent
+volatile bool micOn = false;
+volatile bool ringOverflow = false;
+volatile int32_t micPeak = 0;
+
+void micTask(void *)
+{
+  int32_t raw[256];
+  size_t br = 0;
+  bool wasOn = false;
+  int skip = 0;
+  for (;;)
+  {
+    if (!micOn)
+    {
+      wasOn = false;
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+    if (!wasOn)
+    {
+      wasOn = true;
+      skip = 4; // drop ~60 ms of old DMA data / start-up noise
+    }
+    i2s_read(MIC_PORT, raw, sizeof(raw), &br, pdMS_TO_TICKS(50));
+    if (skip > 0)
+    {
+      skip--;
+      continue;
+    }
+    int count = br / 4;
+    size_t head = ringHead;
+    for (int i = 0; i < count; i++)
+    {
+      if (head - ringTail >= ringCap)
+      {
+        ringOverflow = true; // network too slow: drop the rest of this block
+        break;
+      }
+      int32_t v = raw[i] >> MIC_SHIFT;
+      if (v > 32767)
+        v = 32767;
+      if (v < -32768)
+        v = -32768;
+      ring[head % ringCap] = (int16_t)v;
+      head++;
+      if (abs(v) > micPeak)
+        micPeak = abs(v);
+    }
+    __sync_synchronize(); // samples are in RAM before the head moves
+    ringHead = head;
+  }
+}
+
 void micInit()
 {
-  // Grab the biggest buffer we can (MAX_REC_SEC → ... → 1s)
-  for (int sec = MAX_REC_SEC; sec >= 1 && !recBuf; sec--)
+  // Grab the biggest buffer we can (RING_SEC → ... → 1s)
+  for (int sec = RING_SEC; sec >= 1 && !recBuf; sec--)
   {
     recCapacity = (size_t)SAMPLE_RATE * 2 * sec;
     recBuf = (uint8_t *)malloc(44 + recCapacity);
@@ -830,6 +1003,13 @@ void micInit()
     return;
   }
   Serial.println("[MIC] INMP441 ready on I2S0");
+
+#if STREAM_ANSWERS
+  // The same RAM is used as a ring buffer while streaming
+  ring = (int16_t *)(recBuf + 44);
+  ringCap = recCapacity / 2;
+  xTaskCreatePinnedToCore(micTask, "mic", 4096, NULL, 3, NULL, 0);
+#endif
 }
 
 void writeWavHeader(uint8_t *h, uint32_t dataBytes)
@@ -968,6 +1148,259 @@ void uploadAnswer(size_t dataBytes)
   }
 }
 
+// One HTTP "chunk" (Transfer-Encoding: chunked)
+bool sendChunk(WiFiClientSecure &c, const uint8_t *data, size_t len)
+{
+  char hdr[12];
+  int h = snprintf(hdr, sizeof(hdr), "%X\r\n", (unsigned)len);
+  if (c.write((const uint8_t *)hdr, h) != (size_t)h)
+    return false;
+  size_t off = 0;
+  while (off < len)
+  {
+    size_t w = c.write(data + off, len - off);
+    if (w == 0)
+      return false;
+    off += w;
+  }
+  return c.write((const uint8_t *)"\r\n", 2) == 2;
+}
+
+// Reads one line (without \r\n). Returns false on timeout / closed.
+bool readLine(WiFiClientSecure &c, String &line, unsigned long deadline)
+{
+  line = "";
+  while ((long)(deadline - millis()) > 0)
+  {
+    while (c.available())
+    {
+      char ch = c.read();
+      if (ch == '\n')
+      {
+        line.trim();
+        return true;
+      }
+      if (line.length() < 512)
+        line += ch;
+    }
+    if (!c.connected())
+      return line.length() > 0;
+    delay(2);
+  }
+  return false;
+}
+
+// Reads the HTTP response; returns the status code (−1 on failure)
+int readResponse(WiFiClientSecure &c, String &body, unsigned long timeoutMs)
+{
+  unsigned long deadline = millis() + timeoutMs;
+  String line;
+  if (!readLine(c, line, deadline) || !line.startsWith("HTTP/"))
+    return -1;
+  int code = line.substring(9, 12).toInt();
+
+  bool chunked = false;
+  long contentLength = -1;
+  while (readLine(c, line, deadline) && line.length() > 0)
+  {
+    String low = line;
+    low.toLowerCase();
+    if (low.startsWith("transfer-encoding:") && low.indexOf("chunked") > 0)
+      chunked = true;
+    else if (low.startsWith("content-length:"))
+      contentLength = low.substring(15).toInt();
+  }
+
+  body = "";
+  auto readN = [&](long n)
+  {
+    while (n > 0 && (long)(deadline - millis()) > 0)
+    {
+      if (c.available())
+      {
+        char ch = c.read();
+        if (body.length() < 2048)
+          body += ch;
+        n--;
+      }
+      else if (!c.connected())
+        break;
+      else
+        delay(2);
+    }
+  };
+
+  if (chunked)
+  {
+    while (readLine(c, line, deadline))
+    {
+      long n = strtol(line.c_str(), nullptr, 16);
+      if (n <= 0)
+        break;
+      readN(n);
+      readLine(c, line, deadline); // CRLF after the chunk
+    }
+  }
+  else if (contentLength >= 0)
+    readN(contentLength);
+  else
+    readN(4096); // until the server closes
+  return code;
+}
+
+void playResult(int code, const String &resp)
+{
+  Serial.printf("[ANS] HTTP %d: %s\n", code, resp.c_str());
+  JsonDocument doc;
+  if (code == 200 && !deserializeJson(doc, resp))
+  {
+    const char *result = doc["result"] | "?";
+    const char *heard = doc["transcript"] | "";
+    Serial.printf("[ANS] >>> %s  (heard: \"%s\")\n", result, heard);
+    if (strcmp(result, "correct") == 0)
+      PLAY(SND_CORRECT);
+    else if (strcmp(result, "wrong") == 0)
+      PLAY(SND_WRONG);
+    else if (strcmp(result, "review") == 0)
+      PLAY(SND_REVIEW);
+    else
+      PLAY(SND_ERROR); // e.g. "no_word"
+  }
+  else
+    PLAY(SND_ERROR); // upload / network / server problem
+}
+
+// Hold ANSWER → record and upload at the same time → grade.
+void streamAnswer()
+{
+  PLAY(SND_REC_ON); // "I'm listening" — speak after the beep
+
+  ringOverflow = false;
+  micPeak = 0;
+  ringTail = 0;
+  ringHead = 0;
+  micOn = true;
+  unsigned long t0 = millis();
+  digitalWrite(PIN_LED, LOW); // LED off = recording
+  Serial.println("[MIC] Recording + streaming... (release ANSWER to stop)");
+
+  // Release detection (steady release only — ignores noise spikes)
+  unsigned long relSince = 0;
+  bool released = false;
+  auto checkRelease = [&]()
+  {
+    if (released)
+      return true;
+    if (!isDown(btnAnswer))
+    {
+      if (!relSince)
+        relSince = millis();
+      else if (millis() - relSince >= RELEASE_MS)
+        released = true;
+    }
+    else
+      relSince = 0;
+    return released;
+  };
+
+  // Tell the app we're going quiet on purpose, then free the realtime
+  // connection's memory for the upload (it reconnects by itself).
+  trackPresence("answer");
+  sendAlive("answer");
+  delay(30);
+  rtPaused = true;
+  wsClient.disconnect();
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(10);
+  bool ok = client.connect(SUPABASE_HOST, 443);
+
+  if (ok)
+  {
+    String req = String("POST /functions/v1/grade-answer?device=") + deviceId + " HTTP/1.1\r\n" +
+                 "Host: " SUPABASE_HOST "\r\n"
+                 "Authorization: Bearer " SUPABASE_KEY "\r\n"
+                 "apikey: " SUPABASE_KEY "\r\n"
+                 "Content-Type: audio/wav\r\n"
+                 "Transfer-Encoding: chunked\r\n"
+                 "Connection: close\r\n\r\n";
+    ok = client.print(req) == req.length();
+    uint8_t wav[44];
+    writeWavHeader(wav, (uint32_t)SAMPLE_RATE * 2 * MAX_ANSWER_SEC); // server fixes the sizes
+    ok = ok && sendChunk(client, wav, sizeof(wav));
+  }
+  if (!ok)
+    Serial.println("[ANS] Could not open the upload connection");
+
+  // Send audio while recording, until released (or the time limit)
+  bool hitLimit = false;
+  while (true)
+  {
+    if (micOn && (checkRelease() || millis() - t0 >= (unsigned long)MAX_ANSWER_SEC * 1000))
+    {
+      hitLimit = !released;
+      micOn = false;
+      delay(60); // let the mic task store its last block
+    }
+    size_t head = ringHead;
+    __sync_synchronize();
+    size_t avail = head - ringTail;
+    if (avail == 0)
+    {
+      if (!micOn)
+        break;
+      delay(5);
+      continue;
+    }
+    if (!ok)
+    {
+      ringTail = head; // nowhere to send: just keep the ring empty
+      continue;
+    }
+    size_t idx = ringTail % ringCap;
+    size_t n = avail;
+    if (n > ringCap - idx)
+      n = ringCap - idx; // up to the end of the ring
+    if (n > 2048)
+      n = 2048;          // 4 KB per chunk
+    ok = sendChunk(client, (const uint8_t *)(ring + idx), n * 2);
+    ringTail += n;
+    if (!ok)
+      Serial.println("[ANS] Upload interrupted");
+  }
+
+  PLAY(SND_REC_OFF); // "got it, checking.."
+  digitalWrite(PIN_LED, chunkLen > 0 ? HIGH : LOW);
+
+  size_t samples = ringHead;
+  unsigned long ms = (unsigned long)(samples * 1000ULL / SAMPLE_RATE);
+  Serial.printf("[MIC] Captured %lu ms, peak level %d/32767%s%s%s\n", ms, (int)micPeak,
+                micPeak < 500 ? "  <-- very quiet! check wiring / MIC_CHANNEL" : "",
+                ringOverflow ? "  <-- network too slow, some audio dropped" : "",
+                hitLimit ? "  (time limit reached)" : "");
+
+  if (!ok)
+  {
+    client.stop();
+    PLAY(SND_ERROR);
+    return;
+  }
+  if (ms < MIN_REC_MS)
+  {
+    client.stop(); // abort the request — nothing to grade
+    Serial.println("[ANS] Too short — hold ANSWER while speaking");
+    PLAY(SND_ERROR);
+    return;
+  }
+
+  client.print("0\r\n\r\n"); // end of the chunked upload
+  String resp;
+  int code = readResponse(client, resp, 25000);
+  client.stop();
+  playResult(code, resp);
+}
+
 void handleAnswerButton()
 {
   if (!recBuf)
@@ -980,6 +1413,17 @@ void handleAnswerButton()
     Serial.println("[ANS] No word on the display — nothing to answer");
     PLAY(SND_ERROR);
   }
+#if STREAM_ANSWERS
+  else
+  {
+    if (devState == PUNCHING)
+    { // don't keep the coils at full power while the student answers
+      oeHoldPower();
+      devState = HOLDING;
+    }
+    streamAnswer();
+  }
+#else
   else
   {
     unsigned long t0 = millis();
@@ -994,8 +1438,102 @@ void handleAnswerButton()
       uploadAnswer(bytes);
     }
   }
+#endif
   waitForRelease(btnAnswer);
   btnAnswer.stable = btnAnswer.raw = RELEASED_LVL(btnAnswer); // re-arm cleanly
+}
+
+// ═════════════════════════════════════════════════════════════
+// WI-FI (saved network → defaults → setup page; never gives up)
+// ═════════════════════════════════════════════════════════════
+
+bool waitForWiFi(unsigned long ms)
+{
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < ms)
+  {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// Try one network WITHOUT overwriting the saved one
+bool tryNetwork(const char *ssid, const char *pass)
+{
+  Serial.printf("[WiFi] Trying '%s'", ssid);
+  WiFi.persistent(false);
+  WiFi.begin(ssid, pass);
+  bool ok = waitForWiFi(WIFI_TRY_MS);
+  WiFi.persistent(true);
+  if (!ok)
+    WiFi.disconnect();
+  return ok;
+}
+
+// NEXT + BACK held together for 3 s at power-on → open the setup page
+bool setupButtonsHeld()
+{
+  unsigned long t0 = millis();
+  while (millis() - t0 < 3000)
+  {
+    if (!(isDown(btnNext) && isDown(btnBack)))
+      return false;
+    delay(20);
+  }
+  return true;
+}
+
+void connectWiFi(bool openSetup)
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); // smaller current spikes → fewer brownouts
+  WiFi.setAutoReconnect(true);
+
+  WiFiManager wm;
+  wm.setDebugOutput(false);
+  wm.setConfigPortalTimeout(PORTAL_TIMEOUT_S);
+  wm.setConnectTimeout(20);
+  wm.setTitle("Braille D.O.T.S. Wi-Fi setup");
+  char apName[32];
+  snprintf(apName, sizeof(apName), "%s-SETUP", DEVICE_CODE);
+
+  while (true)
+  {
+    if (!openSetup)
+    {
+      if (wm.getWiFiIsSaved())
+      {
+        Serial.printf("[WiFi] Connecting to saved network '%s'", wm.getWiFiSSID().c_str());
+        WiFi.begin();
+        if (waitForWiFi(WIFI_TRY_MS))
+          break;
+        WiFi.disconnect();
+      }
+#ifdef WIFI_SSID
+      if (tryNetwork(WIFI_SSID, WIFI_PASS))
+        break;
+#endif
+#ifdef BACKUP_SSID
+      if (tryNetwork(BACKUP_SSID, BACKUP_PASS))
+        break;
+#endif
+    }
+    openSetup = false;
+
+    allCoilsOff();
+    Serial.printf("\n[WiFi] SETUP PAGE OPEN — on a phone, join Wi-Fi '%s' (password: %s),\n"
+                  "       then pick the classroom network. Closes after %d min.\n",
+                  apName, SETUP_AP_PASS, PORTAL_TIMEOUT_S / 60);
+    PLAY(SND_SETUP);
+    WiFi.persistent(true);
+    if (wm.startConfigPortal(apName, SETUP_AP_PASS))
+      break; // connected and saved
+    Serial.println("[WiFi] Setup page timed out — trying the known networks again");
+  }
+  Serial.printf("[WiFi] Connected to '%s'! IP: %s\n", WiFi.SSID().c_str(),
+                WiFi.localIP().toString().c_str());
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -1006,7 +1544,7 @@ void setup()
 {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== BRAILLE D.O.T.S. v6.11 (voice + sound) — Supabase Realtime ===");
+  Serial.println("\n=== BRAILLE D.O.T.S. v7.1 (voice + sound) — Supabase Realtime ===");
 
   pinMode(PIN_DATA, OUTPUT);
   pinMode(PIN_CLOCK, OUTPUT);
@@ -1033,36 +1571,25 @@ void setup()
   Serial.println("[SPK] TEST: done");
 #endif
 
-  // ── WiFi ───────────────────────────────────────────────────
-  Serial.printf("\n[WiFi] Connecting to '%s'", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm); // smaller current spikes → fewer brownouts
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30)
-  {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    Serial.printf("\n[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-  }
-  else
-  {
-    Serial.println("\n[WiFi] FAILED. Check SSID/password, then restart.");
-    while (true)
-      delay(1000);
-  }
+  // ── Wi-Fi (opens the setup page if nothing works) ──────────
+  bool wantSetup = setupButtonsHeld();
+  if (wantSetup)
+    Serial.println("[WiFi] NEXT + BACK held → opening the Wi-Fi setup page");
+  connectWiFi(wantSetup);
 
   // ── Register device (get UUID, set status = connected) ─────
   Serial.printf("\n[DEV] Pairing code: %s\n", DEVICE_CODE);
+  int regFails = 0;
   while (!registerDevice())
   {
-    Serial.println("[REG] Failed — retrying in 5s (check RLS policies)");
+    Serial.println("[REG] Failed — retrying in 5s");
+    if (++regFails >= REG_FAILS_TO_SETUP)
+    {
+      // Wi-Fi works but Supabase can't be reached (no internet on this network?)
+      Serial.println("[REG] Can't reach the server from this Wi-Fi — opening the setup page");
+      connectWiFi(true);
+      regFails = 0;
+    }
     delay(5000);
   }
   Serial.printf("[DEV] Registered. UUID: %s\n", deviceId);
@@ -1093,6 +1620,36 @@ void loop()
 {
   wsClient.loop();
   unsigned long now = millis();
+
+  // ── Wi-Fi watchdog: lost for 2 min → restart (clean reconnect / setup) ──
+  static unsigned long wifiLostAt = 0;
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    if (!wifiLostAt)
+    {
+      wifiLostAt = now;
+      Serial.println("[WiFi] Lost — reconnecting...");
+    }
+    else if (now - wifiLostAt >= WIFI_LOST_RESTART_MS)
+    {
+      Serial.println("[WiFi] Still lost after 2 min — restarting");
+      clearDisplay();
+      delay(100);
+      ESP.restart();
+    }
+  }
+  else if (wifiLostAt)
+  {
+    Serial.println("[WiFi] Back");
+    wifiLostAt = 0;
+  }
+
+  // ── "Alive" signal for the app ────────────────────────────
+  if (presenceReady && now - lastAlive >= ALIVE_MS)
+  {
+    sendAlive();
+    lastAlive = now;
+  }
 
   // ── Heartbeat ─────────────────────────────────────────────
   if (wsConnected && now - lastHeartbeat >= HEARTBEAT_MS)
