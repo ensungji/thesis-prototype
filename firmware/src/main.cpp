@@ -3,6 +3,9 @@
  * BRAILLE D.O.T.S. — FIRMWARE v7.1 (Supabase Realtime + Voice)
  * File: src/main.cpp
  *
+ * v7.3: per-device secret (AUDIT 3.4), only when built with DEVICE_SECRET
+ *       (firmware/secrets.ini): registers through the register-device
+ *       function and sends x-device-secret with every answer
  * v7.2: production-audit fixes
  *       - per-coil heat budget across words; forced cooldown when used up
  *       - "new word" sound plays BEFORE the pins go up (no long full power)
@@ -109,6 +112,16 @@ size_t   recCapacity = 0;       // audio bytes that fit in recBuf
 // Set per device in platformio.ini ([env:dots1], [env:dots2], ...).
 #ifndef DEVICE_CODE
 #define DEVICE_CODE "DOTS-0001"
+#endif
+
+// ── Device secret (AUDIT 3.4) ─────────────────────────────────
+// Set per device in firmware/secrets.ini (never commit it). Proves to the
+// server that answers really come from this device. Without it the device
+// works as before (anon registration, no secret header).
+#ifdef DEVICE_SECRET
+#define DEVICE_SECRET_HEADER "x-device-secret: " DEVICE_SECRET "\r\n"
+#else
+#define DEVICE_SECRET_HEADER ""
 #endif
 
 char deviceId[40] = ""; // UUID from the devices table, fetched at boot
@@ -940,6 +953,18 @@ bool registerDevice()
   client.setInsecure(); // prototype: skip certificate check
   HTTPClient http;
 
+#ifdef DEVICE_SECRET
+  // The register-device function checks our secret, sets status = connected
+  // and answers with the same [{id, paired_student_id}] as the REST call.
+  String url = String("https://") + SUPABASE_HOST + "/functions/v1/register-device";
+  if (!http.begin(client, url))
+    return false;
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-device-secret", DEVICE_SECRET);
+  String body = String("{\"device_code\":\"") + DEVICE_CODE + "\"}";
+#else
   String url = String("https://") + SUPABASE_HOST +
                "/rest/v1/devices?on_conflict=device_code&select=id,paired_student_id";
   if (!http.begin(client, url))
@@ -952,6 +977,7 @@ bool registerDevice()
 
   String body = String("{\"device_code\":\"") + DEVICE_CODE +
                 "\",\"status\":\"connected\"}";
+#endif
   int code = http.POST(body);
   String resp = http.getString();
   http.end();
@@ -1200,6 +1226,9 @@ void uploadAnswer(size_t dataBytes)
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
   http.addHeader("apikey", SUPABASE_KEY);
   http.addHeader("Content-Type", "audio/wav");
+#ifdef DEVICE_SECRET
+  http.addHeader("x-device-secret", DEVICE_SECRET);
+#endif
 
   Serial.printf("[ANS] Uploading %u bytes...\n", (unsigned)(dataBytes + 44));
   int code = http.POST(recBuf, dataBytes + 44);
@@ -1411,6 +1440,7 @@ void streamAnswer()
                  "Host: " SUPABASE_HOST "\r\n"
                  "Authorization: Bearer " SUPABASE_KEY "\r\n"
                  "apikey: " SUPABASE_KEY "\r\n"
+                 DEVICE_SECRET_HEADER
                  "Content-Type: audio/wav\r\n"
                  "Transfer-Encoding: chunked\r\n"
                  "Connection: close\r\n\r\n";
@@ -1645,7 +1675,7 @@ void setup()
 
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== BRAILLE D.O.T.S. v7.2 (voice + sound) — Supabase Realtime ===");
+  Serial.println("\n=== BRAILLE D.O.T.S. v7.3 (voice + sound) — Supabase Realtime ===");
 
   pinMode(PIN_LED, OUTPUT);
   buttonInit(btnNext);

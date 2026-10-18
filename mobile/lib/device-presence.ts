@@ -73,11 +73,9 @@ async function loggedIn() {
 // Only writes when the value really changes (the DB trigger logs each change)
 async function writeStatus(deviceId: string, status: "connected" | "offline") {
   if (!(await loggedIn())) return;
-  const { error } = await supabase
-    .from("devices")
-    .update({ status })
-    .eq("id", deviceId)
-    .neq("status", status);
+  // Server-side function: only for free devices or this teacher's own
+  // (migration 07); it also skips writes that change nothing
+  const { error } = await supabase.rpc("set_device_status", { p_device: deviceId, p_status: status });
   if (error) console.warn("device status update failed:", error.message);
 }
 

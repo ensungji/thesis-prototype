@@ -1,9 +1,21 @@
 // supabase/functions/grade-answer/index.ts
-// Braille D.O.T.S. — voice answer grading  (v5)
+// Braille D.O.T.S. — voice answer grading  (v6)
 //
 // ESP32 → POST raw audio (WAV) to:
-//   https://<project>.supabase.co/functions/v1/grade-answer?device=<device uuid>
-//   headers: Authorization: Bearer <anon key>, Content-Type: audio/wav
+//   https://<project>.supabase.co/functions/v1/grade-answer?device=<device uuid>[&sw=<session word uuid>]
+//   headers: Authorization: Bearer <anon key>, Content-Type: audio/wav,
+//            x-device-secret: <secret>  (firmware v7.3+ built with DEVICE_SECRET)
+//
+// v6: - (AUDIT 4.1) firmware v7.2+ sends &sw=<session_word_id> of the word it
+//       showed. The answer is graded against THAT word, never "whatever is
+//       showing now". If it's no longer the device's current word (a Timed
+//       word expired, the teacher moved on), it's saved against it anyway as
+//       needs_review = true, result "review".
+//     - (AUDIT 4.4) one answer per student per word (unique index, migration
+//       04). A second voice answer to the same word replaces the first; if
+//       the teacher already graded it by hand, their grade stands and only
+//       the transcript / recording are added.
+//     - (AUDIT 3.4) per-device secret (see _shared/device-auth.ts)
 //
 // Optional query params (for answers saved offline and uploaded later):
 //   &word=CAT&session=<session uuid>&ts=<unix ms when recorded>&sw=<session word uuid>
@@ -27,6 +39,7 @@
 // Secrets needed: GROQ_API_KEY  (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are built in)
 
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { checkDeviceSecret } from "../_shared/device-auth.ts";
 
 const GROQ_MODEL = "whisper-large-v3";
 
@@ -147,8 +160,15 @@ Deno.serve(async (req) => {
   if (req.method !== "POST") return json({ error: "POST only" }, 405);
 
   const params = new URL(req.url).searchParams;
-  const deviceId = params.get("device");
+  const deviceId = asUuid(params.get("device"));
   if (!deviceId) return json({ error: "missing ?device=" }, 400);
+
+  // ── 0. Is this really that device? (AUDIT 3.4) ───────────────────────
+  const auth = await checkDeviceSecret(supabase, deviceId, req);
+  if (!auth.ok) {
+    await log("warn", "answer_rejected", `Answer refused: ${auth.reason}`, { device_id: deviceId });
+    return json({ error: "forbidden" }, 403);
+  }
 
   let audio = new Uint8Array(0); // (type inferred — works on every Deno version)
   try {
@@ -186,7 +206,16 @@ Deno.serve(async (req) => {
   let sessionId = "";
   let responseTimeMs: number | null = null;
   let sessionWordId: string | null = null;
+  let late = false; // answered a word that's no longer on the device (AUDIT 4.1)
   const queued = !!params.get("word");
+  const swParam = asUuid(params.get("sw"));
+  const swRow = swParam && !queued
+    ? (await supabase
+        .from("session_words")
+        .select("id, word, session_id")
+        .eq("id", swParam)
+        .maybeSingle()).data
+    : null;
 
   if (queued) {
     // Answer recorded offline and uploaded later: the device tells us the word
@@ -194,6 +223,41 @@ Deno.serve(async (req) => {
     sessionId = params.get("session") ?? "";
     sessionWordId = asUuid(params.get("sw"));
     if (!sessionId) return json({ error: "queued answer needs &session=" }, 400);
+  } else if (swRow) {
+    // The device told us which word it was showing: grade against that word
+    word = swRow.word ?? "";
+    sessionId = swRow.session_id ?? "";
+    sessionWordId = swRow.id;
+
+    // Is it still the device's current word? (newest command for this device)
+    const { data: cmd, error: cmdErr } = await supabase
+      .from("device_commands")
+      .select("payload, created_at")
+      .eq("device_id", deviceId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (cmdErr) {
+      await log("error", "grade_failed", `Command lookup failed: ${cmdErr.message}`, { device_id: deviceId });
+      return json({ error: cmdErr.message }, 500);
+    }
+    const stillShowing = !!cmd?.payload?.chunk && cmd?.payload?.session_word_id === sessionWordId;
+    late = !stillShowing;
+
+    // Response time: from when THIS word was sent to the device
+    const { data: shown } = stillShowing
+      ? { data: cmd }
+      : await supabase
+          .from("device_commands")
+          .select("created_at")
+          .eq("device_id", deviceId)
+          .eq("payload->>session_word_id", sessionWordId)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+    if (shown?.created_at) {
+      responseTimeMs = Math.max(0, Date.now() - new Date(shown.created_at).getTime());
+    }
   } else {
     // Live answer: the most recent command for this device. If it was a
     // clear (chunk ""), there is no active word to answer.
@@ -311,10 +375,11 @@ Deno.serve(async (req) => {
       result = confidence >= CLEAR_WRONG_MIN_CONFIDENCE ? "wrong" : "review";
     }
   }
+  if (late) result = "review"; // graded against the right word, but the teacher checks it
   const needsReview = result === "review";
 
   // ── 6. Save attempt (app shows it live via Realtime) ─────────────────
-  const { error: insErr } = await supabase.from("word_attempts").insert({
+  const attempt = {
     student_id: device.paired_student_id,
     session_id: sessionId,
     session_word_id: sessionWordId,
@@ -326,7 +391,28 @@ Deno.serve(async (req) => {
     audio_path: audioPath,
     needs_review: needsReview,
     graded_by: "auto",
-  });
+  };
+  let { error: insErr } = await supabase.from("word_attempts").insert(attempt);
+
+  // 23505 = this student already has an answer for this word (unique index)
+  let teacherGradeKept = false;
+  if (insErr?.code === "23505" && sessionWordId) {
+    const { data: prev } = await supabase
+      .from("word_attempts")
+      .select("id, graded_by")
+      .eq("session_word_id", sessionWordId)
+      .eq("student_id", device.paired_student_id)
+      .maybeSingle();
+    if (prev) {
+      teacherGradeKept = prev.graded_by === "teacher";
+      const patch = teacherGradeKept
+        ? // the teacher graded it by hand: their grade stands, add what we heard
+          { transcript, confidence, audio_path: audioPath, response_time_ms: responseTimeMs }
+        : // an earlier voice answer: the newest one counts
+          { ...attempt, attempted_at: new Date().toISOString() };
+      ({ error: insErr } = await supabase.from("word_attempts").update(patch).eq("id", prev.id));
+    }
+  }
   if (insErr) {
     await log("error", "grade_failed", `Could not save the answer: ${insErr.message}`, {
       device_id: deviceId,
@@ -351,6 +437,9 @@ Deno.serve(async (req) => {
         no_speech: Math.round(noSpeech * 100) / 100,
         spelled: saidSpelled,
         queued,
+        late,
+        teacher_grade_kept: teacherGradeKept,
+        session_word_id: sessionWordId,
         student_id: device.paired_student_id,
         audio_path: audioPath,
       },
@@ -364,5 +453,6 @@ Deno.serve(async (req) => {
     confidence,
     spelled: saidSpelled || (saidLetters && !saidWord),
     queued,
+    late,
   });
 });

@@ -89,10 +89,11 @@ export default function Login() {
 
     setLoading(false);
 
-    // If profile fetch failed entirely, let them in as teacher (don't lock out)
+    // No profile = we can't tell the role or whether the account is active:
+    // don't let them in (a deactivated teacher must not slip through)
     if (profileError || !profile) {
-      const deviceId = await getDeviceId();
-      await claimDeviceAndNavigate(signInData.user!.id, "teacher", deviceId);
+      await supabase.auth.signOut();
+      setError("Couldn't load your account. Check your connection and try again.");
       return;
     }
 

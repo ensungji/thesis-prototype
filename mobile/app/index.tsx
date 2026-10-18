@@ -272,9 +272,16 @@ export default function Intro() {
         if (session) {
           const { data: profile } = await supabase
             .from("profiles")
-            .select("role")
+            .select("role, is_active")
             .eq("id", session.user.id)
             .single();
+          // Deactivated since the last login: sign out. (If the profile can't
+          // load, e.g. offline, carry on as before; the server bans the login.)
+          if (profile?.is_active === false) {
+            await supabase.auth.signOut();
+            setReady(true);
+            return;
+          }
           if (profile?.role === "admin") {
             router.replace("/admin" as any);
           } else {

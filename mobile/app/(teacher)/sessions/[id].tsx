@@ -969,6 +969,20 @@ export default function SessionDetail() {
           );
         }
       )
+      // One answer per student per word: a second voice answer (or the
+      // transcript for a hand grade) UPDATES the existing row
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "word_attempts", filter: `session_id=eq.${id}` },
+        (payload) => {
+          const attempt = payload.new as WordAttempt;
+          setLiveAttempts((prev) =>
+            prev.some((a) => a.id === attempt.id)
+              ? prev.map((a) => (a.id === attempt.id ? { ...a, ...attempt } : a))
+              : [attempt, ...prev]
+          );
+        }
+      )
       .subscribe();
 
     return () => {
@@ -1179,36 +1193,25 @@ export default function SessionDetail() {
 
     // 2. Persist new order_index in background to Supabase
     setShuffling(true);
-    let failed = 0;
-    let firstError = "";
+    // One server call: every position is saved, or none (reorder_session_words)
+    let saveError = "";
     try {
-      const results = await Promise.all(
-        reindexed.map((sw) =>
-          supabase
-            .from("session_words")
-            .update({ order_index: sw.order_index })
-            .eq("id", sw.id)
-        )
-      );
-      for (const r of results) {
-        if (r.error) {
-          failed++;
-          firstError ||= r.error.message;
-        }
-      }
+      const { error } = await supabase.rpc("reorder_session_words", {
+        p_session: id,
+        p_ids: reindexed.map((sw) => sw.id),
+      });
+      if (error) saveError = error.message;
     } catch (err) {
-      failed = reindexed.length;
-      firstError = String((err as { message?: string })?.message ?? err);
+      saveError = String((err as { message?: string })?.message ?? err);
     } finally {
       setShuffling(false);
     }
-    if (failed > 0) {
-      // Part of the order may be saved: show what the server really has
-      logEvent("error", "shuffle_save_failed", `Shuffle: ${failed} of ${reindexed.length} positions not saved: ${firstError}`, {
+    if (saveError) {
+      logEvent("error", "shuffle_save_failed", `Shuffle not saved: ${saveError}`, {
         session_id: id ?? null,
       });
-      showValidationToast("Couldn't save the new order", "Showing the order that was saved. Try shuffling again.");
-      await loadData();
+      showValidationToast("Couldn't save the new order", "The order is unchanged. Try shuffling again.");
+      await loadData(); // back to the saved order
     }
   }
 
