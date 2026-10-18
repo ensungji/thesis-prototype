@@ -159,9 +159,10 @@ export default function AdminDashboard() {
         router.setParams({ updated: undefined });
       }
 
-      // Realtime — re-fetch the full list on any change to the profiles table
+      // Realtime — re-fetch the full list on any change to the profiles table.
+      // Unique name per mount — prevents Supabase channel cache collisions.
       const channel = supabase
-        .channel("admin-profiles-realtime")
+        .channel(`admin-profiles-realtime-${Date.now()}`)
         .on(
           "postgres_changes",
           { event: "*", schema: "public", table: "profiles" },
@@ -213,6 +214,14 @@ export default function AdminDashboard() {
 
   async function confirmSignOut() {
     setSigningOut(true);
+    // Clear active device claim so next login doesn't falsely detect a conflict
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      await supabase
+        .from("profiles")
+        .update({ active_device_id: null })
+        .eq("id", user.id);
+    }
     await supabase.auth.signOut();
     // router.replace("/") is handled automatically by the auth listener in _layout
     setSigningOut(false);
@@ -244,6 +253,20 @@ export default function AdminDashboard() {
           <Text style={styles.title}>Admin Panel</Text>
           <Text style={styles.subtitle}>Braille D.O.T.S</Text>
         </View>
+        <View style={{ flexDirection: "row", gap: 8 }}>
+        <Pressable
+          onPress={() => router.push("/admin/logs" as any)}
+          style={({ pressed }) => [
+            styles.signOutBtn,
+            { backgroundColor: C.blueWash },
+            pressed && { opacity: 0.7 },
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel="System logs"
+        >
+          <Ionicons name="document-text-outline" size={18} color={C.navy} />
+          <Text style={[styles.signOutText, { color: C.navy }]}>Logs</Text>
+        </Pressable>
         <Pressable
           onPress={signOut}
           style={({ pressed }) => [
@@ -255,6 +278,7 @@ export default function AdminDashboard() {
           <Ionicons name="log-out-outline" size={18} color={C.red} />
           <Text style={styles.signOutText}>Sign Out</Text>
         </Pressable>
+        </View>
       </View>
 
       {/* Summary row */}
@@ -436,6 +460,31 @@ export default function AdminDashboard() {
                 <Ionicons name="pencil-outline" size={18} color={C.navy} />
               </View>
               <Text style={styles.optionText}>Edit Info</Text>
+              <Ionicons name="chevron-forward" size={16} color={C.muted} />
+            </Pressable>
+
+            {/* Reset Password */}
+            <Pressable
+              onPress={() => {
+                setOptionsModal(false);
+                router.push({
+                  pathname: "/admin/reset-password" as any,
+                  params: {
+                    id: selected?.id,
+                    full_name: selected?.full_name ?? "",
+                    email: selected?.email ?? "",
+                  },
+                });
+              }}
+              style={({ pressed }) => [
+                styles.optionBtn,
+                pressed && { backgroundColor: C.bg },
+              ]}
+            >
+              <View style={[styles.optionIcon, { backgroundColor: "#FFF4E0" }]}>
+                <Ionicons name="lock-closed-outline" size={18} color="#B45309" />
+              </View>
+              <Text style={styles.optionText}>Reset Password</Text>
               <Ionicons name="chevron-forward" size={16} color={C.muted} />
             </Pressable>
 

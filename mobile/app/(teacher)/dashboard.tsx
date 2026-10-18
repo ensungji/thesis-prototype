@@ -11,6 +11,7 @@ import { useRouter } from "expo-router";
 import { supabase } from "../../lib/supabase";
 import { colors as C, fonts } from "../../lib/theme";
 import { BrailleCell } from "../../components/BrailleCell";
+import { getSessionTypeLabel } from "../../lib/session-timer";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -102,8 +103,9 @@ export default function Dashboard() {
   useEffect(() => {
     loadDashboard();
 
+    // Unique name per mount — prevents Supabase channel cache collisions.
     const channel = supabase
-      .channel("dashboard-realtime")
+      .channel(`dashboard-realtime-${Date.now()}`)
       .on("postgres_changes", { event: "*", schema: "public", table: "sessions" }, loadDashboard)
       .on("postgres_changes", { event: "*", schema: "public", table: "students" }, loadDashboard)
       .subscribe();
@@ -112,6 +114,14 @@ export default function Dashboard() {
   }, [loadDashboard]);
 
   async function signOut() {
+    // Clear active device claim so next login doesn't falsely detect a conflict
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      await supabase
+        .from("profiles")
+        .update({ active_device_id: null })
+        .eq("id", user.id);
+    }
     await supabase.auth.signOut();
     router.replace("/");
   }
@@ -222,7 +232,12 @@ export default function Dashboard() {
               return (
                 <Pressable
                   key={s.id}
-                  onPress={() => router.push("/(teacher)/sessions" as any)}
+                  onPress={() =>
+                    router.push({
+                      pathname: "/(teacher)/sessions/[id]" as any,
+                      params: { id: s.id },
+                    })
+                  }
                   style={({ pressed }) => [styles.sessionRow, pressed && { opacity: 0.85 }]}
                 >
                   <View style={{ flex: 1, gap: 4 }}>
@@ -236,7 +251,7 @@ export default function Dashboard() {
                       </Text>
                     </View>
                     <Text style={styles.typeText}>
-                      {s.type === "word_list" ? "Word List" : "Manual"}
+                      {getSessionTypeLabel(s.type)}
                     </Text>
                   </View>
                 </Pressable>

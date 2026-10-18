@@ -15,20 +15,38 @@ import {
   StyleSheet,
   ActivityIndicator,
   RefreshControl,
-  Alert,
   AppState,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams, useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
+import { updateOrQueue, insertOrQueue, newId } from "../../../lib/outbox";
+import { logEvent } from "../../../lib/logger";
+import { isOnline } from "../../../lib/network";
 import { colors as C, fonts } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
 import { BrailleLoader } from "../../../components/BrailleLoader";
 import { Toast } from "../../../components/Toast";
 import { wordToChunks, getPattern, isValidWord } from "../../../lib/braille";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { useKeepAwake } from "expo-keep-awake";
+import { createAudioPlayer, type AudioPlayer } from "expo-audio";
+import {
+  MIN_WORD_DURATION_SEC,
+  MAX_WORD_DURATION_SEC,
+  DEFAULT_WORD_DURATION_SEC,
+  clampDuration,
+  isTimedSequence,
+  isLiveSession,
+  getSessionTypeLabel,
+  loadWordDurations,
+  saveWordDurations,
+  SessionType,
+} from "../../../lib/session-timer";
 
+// Mandatory 10-second hardware cooldown between words to prevent solenoid burnout
+const COOLDOWN_DURATION_SEC = 10;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -36,21 +54,31 @@ type Session = {
   id: string;
   name: string;
   purpose: string | null;
-  type: "manual" | "word_list";
+  type: SessionType | "manual" | "word_list";
   status: string;
   started_at: string | null;
   finished_at: string | null;
 };
 type Device = { id: string; device_code: string; status: string } | null;
 type Student = { id: string; full_name: string; device: Device };
-type SessionWord = { id: string; word: string; order_index: number };
-type WordBankItem = { id: string; word: string; category: string };
+type SessionWord = {
+  id: string;
+  word: string;
+  order_index: number;
+  duration_seconds?: number;
+};
 type WordAttempt = {
   id: string;
+  student_id?: string | null;
+  session_word_id?: string | null;
   word: string;
   is_correct: boolean;
   response_time_ms: number | null;
   attempted_at: string;
+  transcript?: string | null;
+  needs_review?: boolean | null;
+  audio_path?: string | null;
+  graded_by?: string | null;
 };
 type StudentSessionStats = { student: Student; attempts: WordAttempt[] };
 
@@ -70,6 +98,21 @@ const DEVICE_COLOR: Record<string, string> = {
   pending: C.navy,
   offline: C.red,
 };
+
+// Fisher-Yates algorithm for unbiased, true randomization
+function fisherYatesShuffle<T extends { id: string }>(items: T[]): T[] {
+  if (items.length <= 1) return [...items];
+  const shuffled = [...items];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    const isSameOrder = shuffled.every((item, idx) => item.id === items[idx].id);
+    if (!isSameOrder) break;
+  }
+  return shuffled;
+}
 
 // ── Five-cell display ─────────────────────────────────────────────────────────
 
@@ -98,6 +141,223 @@ function FiveCellDisplay({ chunk }: { chunk: string }) {
   );
 }
 
+// ── Voice answer grading helpers ──────────────────────────────────────────────
+
+type AttemptStatus = "correct" | "wrong" | "review";
+
+function attemptStatus(a: WordAttempt): AttemptStatus {
+  if (a.needs_review) return "review";
+  return a.is_correct ? "correct" : "wrong";
+}
+
+const STATUS_STYLE: Record<AttemptStatus, { bg: string; fg: string; label: string; short: string }> = {
+  correct: { bg: C.greenBg, fg: C.green, label: "✓ Correct", short: "Correct" },
+  wrong:   { bg: C.redBg,   fg: C.red,   label: "✗ Wrong",   short: "Wrong" },
+  review:  { bg: C.brownBg, fg: C.brown, label: "⚠ Review",  short: "Review" },
+};
+
+const cleanTranscript = (t?: string | null) => (t ?? "").replace(/[.!?,]/g, "").trim();
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const asWordId = (id?: string | null) => (id && UUID_RE.test(id) ? id : null);
+
+// Answers to ONE sending of a word. New answers are linked by session_word_id;
+// older ones (from before this fix) fall back to matching the word text.
+function attemptsForWord(attempts: WordAttempt[], sw: { id: string; word: string }) {
+  return attempts.filter((a) =>
+    a.session_word_id
+      ? a.session_word_id === sw.id
+      : a.word?.toUpperCase() === sw.word.toUpperCase()
+  );
+}
+
+// The newest answer in a list (the one that counts)
+function latestAttempt(list: WordAttempt[]): WordAttempt | null {
+  let best: WordAttempt | null = null;
+  for (const a of list) {
+    if (!best || Date.parse(a.attempted_at) > Date.parse(best.attempted_at)) best = a;
+  }
+  return best;
+}
+
+// Plays a student's recording from the private "answers" bucket
+function PlayRecordingButton({ path }: { path: string | null }) {
+  const [loading, setLoading] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const playerRef = useRef<AudioPlayer | null>(null);
+
+  useEffect(() => {
+    return () => {
+      playerRef.current?.remove();
+      playerRef.current = null;
+    };
+  }, []);
+
+  async function toggle() {
+    if (!path) return;
+    if (playing && playerRef.current) {
+      playerRef.current.pause();
+      setPlaying(false);
+      return;
+    }
+    setLoading(true);
+    const { data } = await supabase.storage.from("answers").createSignedUrl(path, 600);
+    setLoading(false);
+    if (!data?.signedUrl) return;
+
+    playerRef.current?.remove();
+    const player = createAudioPlayer({ uri: data.signedUrl });
+    playerRef.current = player;
+    player.addListener("playbackStatusUpdate", (st) => {
+      if (st.didJustFinish) setPlaying(false);
+    });
+    player.play();
+    setPlaying(true);
+  }
+
+  return (
+    <Pressable
+      onPress={toggle}
+      disabled={!path || loading}
+      hitSlop={8}
+      style={({ pressed }) => [
+        styles.playBtn,
+        !path && { opacity: 0.3 },
+        pressed && { opacity: 0.7 },
+      ]}
+      accessibilityLabel={playing ? "Stop recording" : "Play recording"}
+    >
+      {loading ? (
+        <ActivityIndicator size="small" color={C.navy} />
+      ) : (
+        <Ionicons name={playing ? "stop" : "play"} size={12} color={C.navy} />
+      )}
+    </Pressable>
+  );
+}
+
+// ── Teacher fallback grading (✓ / ✗ per student, current word) ─────────────
+
+function HandGradeCard({
+  word,
+  wordId,
+  students,
+  attempts,
+  onGrade,
+}: {
+  word: string;
+  wordId: string | null;
+  students: Student[];
+  attempts: WordAttempt[];
+  onGrade: (
+    student: Student,
+    word: string,
+    wordId: string | null,
+    correct: boolean,
+    existing: WordAttempt | null
+  ) => void;
+}) {
+  if (!word || students.length === 0) return null;
+  const w = word.toUpperCase();
+  return (
+    <View style={styles.sectionCard}>
+      <Text style={styles.cardLabel}>GRADE BY HAND · {w}</Text>
+      <Text style={hg.hint}>
+        Tap ✓ or ✗ if the voice answer is missing or needs a check.
+      </Text>
+      <View style={{ gap: 8 }}>
+        {students.map((st) => {
+          // attempts are newest first → this is the student's latest answer
+          const mine = attempts.filter((x) => x.student_id === st.id);
+          const a = latestAttempt(
+            wordId ? attemptsForWord(mine, { id: wordId, word: w }) : mine.filter((x) => x.word?.toUpperCase() === w)
+          );
+          const status = a ? attemptStatus(a) : null;
+          const byTeacher = a?.graded_by === "teacher";
+          return (
+            <View key={st.id} style={hg.row}>
+              <View style={{ flex: 1, gap: 2 }}>
+                <Text style={hg.name} numberOfLines={1}>{st.full_name}</Text>
+                <Text
+                  style={[hg.sub, status && { color: STATUS_STYLE[status].fg }]}
+                  numberOfLines={1}
+                >
+                  {!a
+                    ? "No answer yet"
+                    : STATUS_STYLE[status!].short +
+                      (byTeacher
+                        ? " · graded by you"
+                        : a.transcript
+                        ? ` · heard "${cleanTranscript(a.transcript)}"`
+                        : "")}
+                </Text>
+              </View>
+              {a?.audio_path ? <PlayRecordingButton path={a.audio_path} /> : null}
+              <Pressable
+                onPress={() => onGrade(st, w, wordId, true, a)}
+                hitSlop={6}
+                style={({ pressed }) => [
+                  hg.btn,
+                  status === "correct" && { backgroundColor: C.green, borderColor: C.green },
+                  pressed && { opacity: 0.7 },
+                ]}
+                accessibilityLabel={`Mark ${st.full_name} correct`}
+              >
+                <Ionicons name="checkmark" size={18} color={status === "correct" ? C.white : C.green} />
+              </Pressable>
+              <Pressable
+                onPress={() => onGrade(st, w, wordId, false, a)}
+                hitSlop={6}
+                style={({ pressed }) => [
+                  hg.btn,
+                  status === "wrong" && { backgroundColor: C.red, borderColor: C.red },
+                  pressed && { opacity: 0.7 },
+                ]}
+                accessibilityLabel={`Mark ${st.full_name} wrong`}
+              >
+                <Ionicons name="close" size={18} color={status === "wrong" ? C.white : C.red} />
+              </Pressable>
+            </View>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+const hg = StyleSheet.create({
+  hint: { fontFamily: fonts.body, fontSize: 12, color: C.muted, lineHeight: 17 },
+  row: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: C.bg,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  name: { fontFamily: fonts.bodyBold, fontSize: 14, color: C.ink },
+  sub: { fontFamily: fonts.mono, fontSize: 10, color: C.muted },
+  who: { fontFamily: fonts.bodyBold, fontSize: 12, color: C.ink, maxWidth: 90 },
+  btn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    borderWidth: 1.5,
+    borderColor: C.border,
+    backgroundColor: C.white,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+});
+
+// ── Keep awake for active session ─────────────────────────────────────────────
+
+function ActiveSessionKeepAwake() {
+  useKeepAwake();
+  return null;
+}
+
 // ── Screen ────────────────────────────────────────────────────────────────────
 
 export default function SessionDetail() {
@@ -112,6 +372,7 @@ export default function SessionDetail() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [shuffling, setShuffling] = useState(false);
 
   // ── Word list builder ───────────────────────────────────────────────────────
   // (add-word logic lives in add-word.tsx; reloaded via useFocusEffect)
@@ -123,10 +384,84 @@ export default function SessionDetail() {
   const [wordListIndex, setWordListIndex] = useState(0);
   const [wordSent, setWordSent] = useState(false);
 
+  // ── Timed Sequence Auto-Cycle playback state ────────────────────────────────
+  const [isPlaying, setIsPlaying] = useState(true);
+  const [isCooldown, setIsCooldown] = useState(false);
+  const [timerSecondsLeft, setTimerSecondsLeft] = useState<number>(DEFAULT_WORD_DURATION_SEC);
+  const [totalWordSeconds, setTotalWordSeconds] = useState<number>(DEFAULT_WORD_DURATION_SEC);
+  const autoCycleTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isPlayingRef = useRef(true);
+  const isCooldownRef = useRef(false);
+  const timerSecondsLeftRef = useRef(DEFAULT_WORD_DURATION_SEC);
+  const wordListIndexRef = useRef(0);
+  const sessionWordsRef = useRef<SessionWord[]>([]);
+
+  useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
+
+  useEffect(() => {
+    isCooldownRef.current = isCooldown;
+  }, [isCooldown]);
+
+  useEffect(() => {
+    timerSecondsLeftRef.current = timerSecondsLeft;
+  }, [timerSecondsLeft]);
+
+  useEffect(() => {
+    wordListIndexRef.current = wordListIndex;
+  }, [wordListIndex]);
+
+  useEffect(() => {
+    sessionWordsRef.current = sessionWords;
+  }, [sessionWords]);
+
+  // Tracks the word currently active (just sent, awaiting teacher "Done" or "Clear Display").
+  // null means no word is active and the teacher may type/send the next word.
+  const [activeWordId, setActiveWordId] = useState<string | null>(null);
+
+  // Tracks which words have been marked done (completed) this run.
+  const [completedWordIds, setCompletedWordIds] = useState<Set<string>>(new Set());
+
   // The most recently *sent* word — used on the Paused card for context recovery.
   // Set in doSendWord() and restored from AsyncStorage in restoreWordPosition().
   // Distinct from manualWord (text input value) and wordListIndex (list position).
   const [lastSentWord, setLastSentWord] = useState("");
+
+  // ── Live Session: 60-Second Hardware Safety Kill-Switch Refs ────────────────
+  const liveSafetyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeWordIdRef = useRef<string | null>(null);
+  const lastSentWordRef = useRef<string>("");
+  const completedWordIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    activeWordIdRef.current = activeWordId;
+  }, [activeWordId]);
+
+  useEffect(() => {
+    lastSentWordRef.current = lastSentWord;
+  }, [lastSentWord]);
+
+  useEffect(() => {
+    completedWordIdsRef.current = completedWordIds;
+  }, [completedWordIds]);
+
+  // Clean up safety timer on screen unmount
+  useEffect(() => {
+    return () => {
+      if (liveSafetyTimerRef.current) {
+        clearTimeout(liveSafetyTimerRef.current);
+        liveSafetyTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Hardware safety auto-clear notification toast
+  const [safetyToast, setSafetyToast] = useState<{
+    visible: boolean;
+    message: string;
+    detail?: string;
+  }>({ visible: false, message: "" });
 
   // Tracks which words have been broadcast this session run (for dup detection)
   const sentWords = useRef<Set<string>>(new Set()).current;
@@ -156,11 +491,17 @@ export default function SessionDetail() {
   const [statsData, setStatsData] = useState<StudentSessionStats | null>(null);
   const [loadingStats, setLoadingStats] = useState(false);
 
+  // ── Finish session modal ────────────────────────────────────────────────────
+  const [finishSessionModal, setFinishSessionModal] = useState(false);
+  const [finishingSession, setFinishingSession] = useState(false);
+  const [finishToast, setFinishToast] = useState<{ name: string } | null>(null);
+
   // ── Auto-pause: app background + navigation away ────────────────────────────
   // sessionStatusRef mirrors session.status without stale-closure issues so
   // useFocusEffect / AppState cleanup callbacks always read the latest value.
   const appStateRef      = useRef(AppState.currentState);
   const sessionStatusRef = useRef<string | null>(null);
+  const clearDevicesRef = useRef<(commandType?: string) => Promise<void>>(async () => {});
   useEffect(() => {
     sessionStatusRef.current = session?.status ?? null;
   }, [session?.status]);
@@ -172,20 +513,17 @@ export default function SessionDetail() {
         appStateRef.current === "active" &&
         sessionStatusRef.current === "in_progress"
       ) {
+        // Hardware safety: release solenoids before auto-pausing
+        stopLiveSafetyTimer();
+        clearDevicesRef.current("session_paused");
         // Direct DB update + local state (ref-safe, no stale closure)
-        await supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
+        await updateOrQueue("sessions", { status: "paused" }, { id: id! });
         setSession((prev) => (prev ? { ...prev, status: "paused" } : prev));
       }
       appStateRef.current = next;
     });
     return () => sub.remove();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
-
-  // ── Finish session modal ────────────────────────────────────────────────────
-  const [finishSessionModal, setFinishSessionModal] = useState(false);
-  const [finishingSession, setFinishingSession] = useState(false);
-  const [finishToast, setFinishToast] = useState<{ name: string } | null>(null);
 
   // ── Delete session modal ────────────────────────────────────────────────────
   const [deleteSessionModal, setDeleteSessionModal] = useState(false);
@@ -204,17 +542,37 @@ export default function SessionDetail() {
   const [deleteWordModal, setDeleteWordModal] = useState(false);
   const [wordToRemove, setWordToRemove] = useState<SessionWord | null>(null);
 
+  // ── Remove-word success toast ───────────────────────────────────────────────
+  const [removeWordToast, setRemoveWordToast] = useState<{ word: string } | null>(null);
+
+  // ── Validation toast (replaces Alert.alert for launch/send-word checks) ─────
+  // Non-blocking, consistent with the rest of the app's feedback style.
+  const [validationToast, setValidationToast] = useState<{
+    visible: boolean; message: string; detail?: string;
+  }>({ visible: false, message: "" });
+
+  function showValidationToast(message: string, detail?: string) {
+    setValidationToast({ visible: true, message, detail });
+  }
+
 
 
 
   // ── Load data ───────────────────────────────────────────────────────────────
 
   const loadData = useCallback(async () => {
-    if (!id) return;
+    if (!id) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
     const {
       data: { user },
     } = await supabase.auth.getUser();
-    if (!user) return;
+    if (!user) {
+      setLoading(false);
+      return;
+    }
 
     const [sessionRes, studentsRes, devicesRes, assignedRes, wordsRes] =
       await Promise.all([
@@ -233,10 +591,17 @@ export default function SessionDetail() {
           .eq("session_id", id),
         supabase
           .from("session_words")
-          .select("id, word, order_index")
+          .select("*")
           .eq("session_id", id)
           .order("order_index"),
       ]);
+
+    // Offline / network failure: keep what's already on screen
+    if (!sessionRes.data && sessionRes.error) {
+      setLoading(false);
+      setRefreshing(false);
+      return;
+    }
 
     const devicesData = devicesRes.data ?? [];
     const merged: Student[] = (studentsRes.data ?? []).map((s) => ({
@@ -245,7 +610,18 @@ export default function SessionDetail() {
     }));
 
     const fetchedSession = sessionRes.data;
-    const fetchedWords: SessionWord[] = wordsRes.data ?? [];
+    const rawWords = (wordsRes.data ?? []) as SessionWord[];
+    const cachedDurations = await loadWordDurations(id);
+    const fetchedWords: SessionWord[] = rawWords.map((sw) => {
+      const dur =
+        sw.duration_seconds ??
+        cachedDurations[sw.id] ??
+        DEFAULT_WORD_DURATION_SEC;
+      return {
+        ...sw,
+        duration_seconds: clampDuration(dur),
+      };
+    });
 
     setSession(fetchedSession);
     setAllStudents(merged);
@@ -260,19 +636,24 @@ export default function SessionDetail() {
         fetchedSession?.status === "paused") &&
       fetchedWords.length > 0
     ) {
-      await restoreWordPosition(id, fetchedWords);
+      await restoreWordPosition(id, fetchedWords, fetchedSession);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   // ── Restore last-sent word from AsyncStorage ────────────────────────────────
   // Reads the per-session key saved on every broadcastChunk (or sendWord when
   // no devices are connected) so the teacher UI always reflects the last word,
   // regardless of device connectivity or app restart.
-  async function restoreWordPosition(sessionId: string, words: SessionWord[]) {
+  async function restoreWordPosition(
+    sessionId: string,
+    words: SessionWord[],
+    sessionObj?: Session | null
+  ) {
     try {
       const raw = await AsyncStorage.getItem(`session_word_pos_${sessionId}`);
 
-      // Pre-populate sentWords from DB records (manual sessions track history)
+      // Pre-populate sentWords from DB records (live sessions track history)
       words.forEach((sw) => sentWords.add(sw.word));
 
       if (!raw) return;
@@ -280,11 +661,21 @@ export default function SessionDetail() {
       const pos = JSON.parse(raw) as {
         word: string;
         chunkIndex: number;
+        activeWordId?: string | null;
+        completedWordIds?: string[];
       };
 
-      // Snap wordListIndex for word_list sessions
+      // Snap wordListIndex for timed sequence sessions
       const idx = words.findIndex((sw) => sw.word === pos.word);
-      if (idx !== -1) setWordListIndex(idx);
+      const activeIdx = idx !== -1 ? idx : 0;
+      setWordListIndex(activeIdx);
+      if (words[activeIdx]) {
+        const dur = clampDuration(
+          words[activeIdx].duration_seconds ?? DEFAULT_WORD_DURATION_SEC
+        );
+        setTotalWordSeconds(dur);
+        setTimerSecondsLeft(dur);
+      }
 
       // Restore braille display state
       const restoredChunks = wordToChunks(pos.word);
@@ -292,54 +683,113 @@ export default function SessionDetail() {
       setChunkIndex(pos.chunkIndex ?? 0);
       setWordSent(true);
 
-      // Restore manual word input
-      setManualWord(pos.word);
+      // Restore active / completed word state
+      const restoredActiveId = pos.activeWordId ?? null;
+      setActiveWordId(restoredActiveId);
+      activeWordIdRef.current = restoredActiveId;
+      if (pos.completedWordIds?.length) {
+        const cSet = new Set(pos.completedWordIds);
+        setCompletedWordIds(cSet);
+        completedWordIdsRef.current = cSet;
+      }
 
-      // Fix 3: restore lastSentWord so the Paused card always shows the correct
-      // word regardless of session type (manual or word_list).
+      const activeType = sessionObj?.type ?? session?.type;
+      const activeStatus = sessionObj?.status ?? session?.status;
+
+      // Only re-fill the manual input when not active and NOT in a live session
+      if (!restoredActiveId && !isLiveSession(activeType)) {
+        setManualWord(pos.word);
+      }
+
+      // Restore lastSentWord so the Paused card always shows the correct word
       setLastSentWord(pos.word);
+      lastSentWordRef.current = pos.word;
+
+      // If this is an active live session word that was restored, restart safety kill-switch
+      if (
+        restoredActiveId &&
+        isLiveSession(activeType) &&
+        activeStatus === "in_progress"
+      ) {
+        startLiveSafetyTimer();
+      }
     } catch {
       // Silently ignore storage errors
     }
   }
 
   // ── Persist word position to AsyncStorage ─────────────────────────────────
-  async function saveWordPosition(sessionId: string, word: string, chunkIndex: number) {
+  async function saveWordPosition(
+    sessionId: string,
+    word: string,
+    chunkIndex: number,
+    opts?: { activeWordId?: string | null; completedWordIds?: Set<string> },
+  ) {
     try {
       await AsyncStorage.setItem(
         `session_word_pos_${sessionId}`,
-        JSON.stringify({ word, chunkIndex }),
+        JSON.stringify({
+          word,
+          chunkIndex,
+          activeWordId: opts?.activeWordId ?? null,
+          completedWordIds: opts?.completedWordIds ? [...opts.completedWordIds] : [],
+        }),
       );
     } catch {
       // Silently ignore storage errors
     }
   }
 
-  useEffect(() => {
-    loadData();
-  }, [loadData]);
-
-  // On focus: reload data. On blur (navigate away): auto-pause if in_progress.
-  // The cleanup return fires for every navigation-away event (back, tab switch,
-  // dashboard tap, etc.) — this is the primary pause trigger.
+  // ── Data loading on mount + every re-focus ──────────────────────────────────
+  // FIX (nav-audit): A useEffect(() => { loadData() }, [loadData]) was removed
+  // from here. It was redundant because useFocusEffect already fires loadData()
+  // on the initial mount, AND again every time the screen re-gains focus (e.g.
+  // after returning from add-word or switching back from another tab).
+  // Having both running simultaneously on mount created a race condition:
+  // two concurrent async fetches both called setLoading(true) then raced to
+  // call setLoading(false) + setSession(), with the slower one silently
+  // discarding the faster one's state update.
+  //
+  // On blur (navigating away): the cleanup fn auto-pauses an in_progress session.
   useFocusEffect(
     useCallback(() => {
       loadData();
       return () => {
+        stopLiveSafetyTimer();
         if (sessionStatusRef.current === "in_progress") {
+          // Hardware safety: release solenoids when leaving the screen
+          clearDevicesRef.current("session_paused");
           // Fire-and-forget — no await in cleanup
-          supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
+          updateOrQueue("sessions", { status: "paused" }, { id: id! });
         }
       };
     }, [loadData, id])
   );
 
   // ── Realtime subscriptions ──────────────────────────────────────────────────
+  // FIX: supabase.channel("name") returns the CACHED existing channel object if
+  // a channel with that name is still alive in Supabase's internal registry
+  // (removeChannel is async — the old channel may still be unsubscribing when
+  // the component remounts). Calling .on() on an already-subscribed channel
+  // immediately throws "cannot add postgres_changes callbacks after subscribe()".
+  //
+  // Solution: append Date.now() so every effect invocation gets a guaranteed
+  // unique channel name. Supabase then always creates a fresh channel, making
+  // the in-flight cleanup of the previous one completely irrelevant.
+  //
+  // The realtimeChannelRef guard has been removed — it only protected against
+  // the same effect instance double-subscribing (which React Strict Mode can
+  // trigger), but it did not protect against Supabase's channel cache. With
+  // unique names, Strict Mode double-invocation is also safe: each run gets
+  // its own name, and the cleanup correctly removes only that specific channel.
   useEffect(() => {
     if (!id) return;
 
+    // Unique channel name per mount — never collides with a stale cached channel.
+    const channelName = `session-detail-${id}-${Date.now()}`;
+
     const channel = supabase
-      .channel(`session-detail-${id}`)
+      .channel(channelName)
       // Session row changes (status, started_at, finished_at)
       .on(
         "postgres_changes",
@@ -348,18 +798,37 @@ export default function SessionDetail() {
           setSession((prev) => prev ? { ...prev, ...(payload.new as Session) } : prev);
         }
       )
-      // Device connection-status changes (shows live dot colour changes)
+      // Device connection-status changes (shows live dot colour changes and pairing updates)
       .on(
         "postgres_changes",
         { event: "UPDATE", schema: "public", table: "devices" },
         (payload) => {
-          const updated = payload.new as { id: string; status: string };
+          const updated = payload.new as {
+            id: string;
+            status: string;
+            paired_student_id?: string | null;
+            device_code?: string;
+          };
           setAllStudents((prev) =>
-            prev.map((s) =>
-              s.device?.id === updated.id
-                ? { ...s, device: { ...s.device!, status: updated.status } }
-                : s
-            )
+            prev.map((s) => {
+              if (updated.paired_student_id === s.id) {
+                return {
+                  ...s,
+                  device: {
+                    id: updated.id,
+                    device_code: updated.device_code ?? s.device?.device_code ?? "",
+                    status: updated.status,
+                  },
+                };
+              }
+              if (s.device?.id === updated.id) {
+                if (updated.paired_student_id !== s.id) {
+                  return { ...s, device: null };
+                }
+                return { ...s, device: { ...s.device, status: updated.status } };
+              }
+              return s;
+            })
           );
         }
       )
@@ -369,14 +838,78 @@ export default function SessionDetail() {
         { event: "INSERT", schema: "public", table: "word_attempts", filter: `session_id=eq.${id}` },
         (payload) => {
           const attempt = payload.new as WordAttempt;
-          setLiveAttempts((prev) => [attempt, ...prev]);
+          setLiveAttempts((prev) =>
+            prev.some((a) => a.id === attempt.id) ? prev : [attempt, ...prev]
+          );
         }
       )
       .subscribe();
 
-    return () => { supabase.removeChannel(channel); };
+    return () => {
+      // Removes only THIS invocation's channel — the unique name ensures we
+      // never accidentally remove a channel belonging to a newer mount.
+      supabase.removeChannel(channel);
+    };
   }, [id]);
 
+
+  // ── Earlier answers (so the feed survives an app reload) ───────────────────
+  useEffect(() => {
+    if (!id) return;
+    supabase
+      .from("word_attempts")
+      .select("id, student_id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id")
+      .eq("session_id", id)
+      .order("attempted_at", { ascending: false })
+      .limit(200)
+      .then(({ data }) => {
+        if (!data) return;
+        setLiveAttempts((prev) => {
+          const seen = new Set(prev.map((a) => a.id));
+          return [...prev, ...(data as WordAttempt[]).filter((a) => !seen.has(a.id))];
+        });
+      });
+  }, [id]);
+
+  // ── Teacher fallback grading ────────────────────────────────────────────────
+  async function gradeByHand(
+    student: Student,
+    word: string,
+    wordId: string | null,
+    correct: boolean,
+    existing: WordAttempt | null
+  ) {
+    const patch = { is_correct: correct, needs_review: false, graded_by: "teacher" };
+
+    if (existing) {
+      // Override the voice grade (or change your own earlier tap)
+      setLiveAttempts((prev) => prev.map((a) => (a.id === existing.id ? { ...a, ...patch } : a)));
+      const { error } = await updateOrQueue("word_attempts", patch, { id: existing.id });
+      if (error) {
+        setLiveAttempts((prev) => prev.map((a) => (a.id === existing.id ? existing : a)));
+        showValidationToast("Couldn't save grade", error);
+      }
+      return;
+    }
+
+    // No answer yet → add one (id made here so an offline retry can't duplicate it)
+    const row = {
+      id: newId(),
+      student_id: student.id,
+      session_id: id!,
+      word,
+      session_word_id: asWordId(wordId),
+      response_time_ms: null,
+      attempted_at: new Date().toISOString(),
+      ...patch,
+    };
+    setLiveAttempts((prev) => [row, ...prev]);
+    const { error } = await insertOrQueue("word_attempts", row);
+    if (error) {
+      setLiveAttempts((prev) => prev.filter((a) => a.id !== row.id));
+      showValidationToast("Couldn't save grade", error);
+    }
+  }
 
   // ── Student assignment ──────────────────────────────────────────────────────
 
@@ -395,6 +928,14 @@ export default function SessionDetail() {
         return s;
       });
     } else {
+      const student = allStudents.find((s) => s.id === studentId);
+      if (!student?.device) {
+        showValidationToast(
+          "No Device Paired",
+          "This student cannot be selected because they do not have a paired hardware device."
+        );
+        return;
+      }
       await supabase
         .from("session_students")
         .insert({ session_id: id, student_id: studentId });
@@ -402,9 +943,10 @@ export default function SessionDetail() {
     }
   }
 
-  async function removeWord(wordId: string) {
+  async function removeWord(wordId: string, wordText?: string) {
     await supabase.from("session_words").delete().eq("id", wordId);
     setSessionWords((prev) => prev.filter((w) => w.id !== wordId));
+    if (wordText) setRemoveWordToast({ word: wordText });
   }
 
   function deleteSession() {
@@ -432,29 +974,352 @@ export default function SessionDetail() {
     });
   }
 
+  // ── Shuffle words in Timed Sequence (strictly available during 'pending') ───
+  async function shuffleWords() {
+    if (session?.status !== "pending" || sessionWords.length <= 1 || shuffling) {
+      return;
+    }
+
+    const shuffled = fisherYatesShuffle(sessionWords);
+    const reindexed: SessionWord[] = shuffled.map((sw, index) => ({
+      ...sw,
+      order_index: index,
+    }));
+
+    // 1. Immediately update local state so teacher sees randomized order in UI
+    setSessionWords(reindexed);
+    sessionWordsRef.current = reindexed;
+
+    // 2. Persist new order_index in background to Supabase
+    setShuffling(true);
+    try {
+      await Promise.all(
+        reindexed.map((sw) =>
+          supabase
+            .from("session_words")
+            .update({ order_index: sw.order_index })
+            .eq("id", sw.id)
+        )
+      );
+    } catch (err) {
+      console.error("Failed to persist shuffled word order to database:", err);
+    } finally {
+      setShuffling(false);
+    }
+  }
+
+  // ── Clear braille devices (releases physical solenoids to prevent burnout) ──
+  async function clearDevices(commandType: string = "display_chunk") {
+    const connectedDevices = allStudents
+      .filter((s) => assignedIds.has(s.id) && s.device?.status === "connected")
+      .map((s) => s.device!.id);
+
+    if (connectedDevices.length === 0) return;
+
+    const commands = connectedDevices.map((device_id) => ({
+      device_id,
+      session_id: id,
+      command_type: commandType,
+      payload: {
+        word: "",
+        chunk: "",
+        chunk_index: 0,
+        total_chunks: 1,
+      },
+    }));
+    const { error } = await supabase.from("device_commands").insert(commands);
+    if (error) {
+      logEvent("error", "device_command_failed", `Could not clear devices (${commandType}): ${error.message}`, {
+        session_id: id ?? null,
+        meta: { command_type: commandType, devices: connectedDevices },
+      });
+    }
+  }
+  clearDevicesRef.current = clearDevices;
+
+  // ── Live Session: Safety Kill-Switch Trigger ────────────────────────────────
+  // Automatically triggers after 60s if the teacher hasn't manually clicked
+  // 'Clear Display', releasing solenoids to prevent burnout and notifying the teacher.
+  async function triggerSafetyAutoClear() {
+    liveSafetyTimerRef.current = null;
+    logEvent("warn", "safety_auto_clear", `Display auto-cleared after 60s ("${lastSentWordRef.current}")`, {
+      session_id: id ?? null,
+      meta: { word: lastSentWordRef.current },
+    });
+    await clearDevices();
+    const currentActiveId = activeWordIdRef.current;
+    if (currentActiveId) {
+      setCompletedWordIds((prev) => {
+        const next = new Set(prev).add(currentActiveId);
+        completedWordIdsRef.current = next;
+        return next;
+      });
+    }
+    setActiveWordId(null);
+    activeWordIdRef.current = null;
+    setWordSent(false);
+    setChunks([]);
+
+    if (id && lastSentWordRef.current) {
+      await saveWordPosition(id, lastSentWordRef.current, 0, {
+        activeWordId: null,
+        completedWordIds: completedWordIdsRef.current,
+      });
+    }
+
+    setSafetyToast({
+      visible: true,
+      message: "Display auto-cleared for hardware safety",
+      detail: "Solenoids released after 60s inactivity",
+    });
+  }
+
+  function startLiveSafetyTimer() {
+    if (liveSafetyTimerRef.current) {
+      clearTimeout(liveSafetyTimerRef.current);
+    }
+    liveSafetyTimerRef.current = setTimeout(() => {
+      triggerSafetyAutoClear();
+    }, 60000);
+  }
+
+  function stopLiveSafetyTimer() {
+    if (liveSafetyTimerRef.current) {
+      clearTimeout(liveSafetyTimerRef.current);
+      liveSafetyTimerRef.current = null;
+    }
+  }
+
+  // ── Live Session: Manual Clear Display (Teacher Pacing Control) ──────────────
+  // Triggered when teacher clicks 'Clear Display' when the student is done reading.
+  // Instantly drops solenoids, stops the 60s timer, marks word completed, and
+  // restores the text input for the next word.
+  async function handleClearDisplay() {
+    stopLiveSafetyTimer();
+    await clearDevices();
+    if (activeWordId) {
+      const newCompleted = new Set(completedWordIds).add(activeWordId);
+      setCompletedWordIds(newCompleted);
+      completedWordIdsRef.current = newCompleted;
+    }
+    setActiveWordId(null);
+    activeWordIdRef.current = null;
+    setWordSent(false);
+    setChunks([]);
+    setManualWord("");
+
+    if (id && lastSentWord) {
+      await saveWordPosition(id, lastSentWord, chunkIndex, {
+        activeWordId: null,
+        completedWordIds: completedWordIdsRef.current,
+      });
+    }
+  }
+
+  // ── Per-word duration stepper logic (strictly 5s - 60s hard-capped) ─────────
+  async function updateWordDuration(wordId: string, newSec: number) {
+    const clamped = clampDuration(newSec);
+    setSessionWords((prev) =>
+      prev.map((w) => (w.id === wordId ? { ...w, duration_seconds: clamped } : w))
+    );
+
+    if (id) {
+      const updatedMap: Record<string, number> = {};
+      sessionWords.forEach((w) => {
+        updatedMap[w.id] =
+          w.id === wordId
+            ? clamped
+            : (w.duration_seconds ?? DEFAULT_WORD_DURATION_SEC);
+      });
+      await saveWordDurations(id, updatedMap);
+    }
+
+    try {
+      await supabase
+        .from("session_words")
+        .update({ duration_seconds: clamped })
+        .eq("id", wordId);
+    } catch {
+      // Local cache fallback handles it if column not yet in DB
+    }
+  }
+
+  // ── Auto-cycle word transition helper ──────────────────────────────────────
+  async function advanceToWord(newIdx: number, autoPlay = true) {
+    const words = sessionWordsRef.current;
+    if (newIdx < 0 || newIdx >= words.length) return;
+    await clearDevices();
+    const targetWord = words[newIdx];
+    const dur = clampDuration(
+      targetWord.duration_seconds ?? DEFAULT_WORD_DURATION_SEC
+    );
+    isCooldownRef.current = false;
+    wordListIndexRef.current = newIdx;
+    timerSecondsLeftRef.current = dur;
+    setIsCooldown(false);
+    setWordListIndex(newIdx);
+    setTotalWordSeconds(dur);
+    setTimerSecondsLeft(dur);
+    if (id) {
+      await saveWordPosition(id, targetWord.word, 0);
+    }
+    await doSendWord(targetWord.word);
+    if (autoPlay) {
+      setIsPlaying(true);
+    }
+  }
+
+  // ── Timed Sequence Auto-Cycle Interval Engine ───────────────────────────────
+  useEffect(() => {
+    if (
+      session?.status !== "in_progress" ||
+      !isTimedSequence(session?.type) ||
+      !isPlaying ||
+      sessionWords.length === 0
+    ) {
+      if (autoCycleTimer.current) {
+        clearInterval(autoCycleTimer.current);
+        autoCycleTimer.current = null;
+      }
+      return;
+    }
+
+    autoCycleTimer.current = setInterval(() => {
+      const prev = timerSecondsLeftRef.current;
+      if (prev <= 1) {
+        if (isCooldownRef.current) {
+          // ── Cooldown phase completed: advance to next word ──
+          isCooldownRef.current = false;
+          setIsCooldown(false);
+          const currentIdx = wordListIndexRef.current;
+          const words = sessionWordsRef.current;
+          const nextIdx = currentIdx + 1;
+
+          if (nextIdx < words.length) {
+            const nextDur = clampDuration(
+              words[nextIdx]?.duration_seconds ?? DEFAULT_WORD_DURATION_SEC
+            );
+            advanceToWord(nextIdx, true);
+            setTimerSecondsLeft(nextDur);
+            timerSecondsLeftRef.current = nextDur;
+          } else {
+            // Safety fallback: if no next word, auto-finish
+            if (autoCycleTimer.current) {
+              clearInterval(autoCycleTimer.current);
+              autoCycleTimer.current = null;
+            }
+            executeFinishSession();
+          }
+        } else {
+          // ── Word active duration completed ──
+          clearDevices(); // Immediately de-energize solenoids
+
+          const currentIdx = wordListIndexRef.current;
+          const words = sessionWordsRef.current;
+          const nextIdx = currentIdx + 1;
+
+          if (nextIdx < words.length) {
+            // Enter 10-second hardware cooldown phase
+            isCooldownRef.current = true;
+            setIsCooldown(true);
+            setTotalWordSeconds(COOLDOWN_DURATION_SEC);
+            setTimerSecondsLeft(COOLDOWN_DURATION_SEC);
+            timerSecondsLeftRef.current = COOLDOWN_DURATION_SEC;
+          } else {
+            // Final word in sequence completed active duration:
+            // No cooldown needed after the last word -> Auto-finish session!
+            if (autoCycleTimer.current) {
+              clearInterval(autoCycleTimer.current);
+              autoCycleTimer.current = null;
+            }
+            executeFinishSession();
+          }
+        }
+      } else {
+        const nextVal = prev - 1;
+        timerSecondsLeftRef.current = nextVal;
+        setTimerSecondsLeft(nextVal);
+      }
+    }, 1000);
+
+    return () => {
+      if (autoCycleTimer.current) {
+        clearInterval(autoCycleTimer.current);
+        autoCycleTimer.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.status, session?.type, isPlaying, sessionWords.length]);
+
   // ── Session lifecycle ───────────────────────────────────────────────────────
 
   async function launchSession() {
-    if (assignedIds.size === 0) {
-      Alert.alert(
-        "No students",
-        "Assign at least one student before launching.",
-      );
+    if (!isOnline()) {
+      showValidationToast("You're offline", "Connect to the internet to launch.");
       return;
     }
-    if (session?.type === "word_list" && sessionWords.length === 0) {
-      Alert.alert(
-        "No words",
-        "Add at least one word to the list before launching.",
-      );
+    const validAssigned = allStudents.filter(
+      (s) => assignedIds.has(s.id) && !!s.device
+    );
+    if (validAssigned.length === 0) {
+      if (assignedIds.size === 0) {
+        showValidationToast("No students assigned", "Assign at least one student before launching.");
+      } else {
+        showValidationToast("No device paired", "At least one selected student must have a paired hardware device.");
+      }
       return;
     }
+    if (isTimedSequence(session?.type) && sessionWords.length === 0) {
+      showValidationToast("No words in sequence", "Add at least one word before launching.");
+      return;
+    }
+
+    // ── Pre-flight check: block if another session is already active ──────────
+    // A "pending" session can only be started when no other session (owned by
+    // this teacher) is currently in_progress, paused, or active. Exclude the
+    // current session itself in case of edge-case double-taps.
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (user) {
+      const { count } = await supabase
+        .from("sessions")
+        .select("id", { count: "exact", head: true })
+        .eq("teacher_id", user.id)
+        .in("status", ["in_progress", "paused", "active"])
+        .neq("id", id!);
+      if ((count ?? 0) > 0) {
+        showValidationToast(
+          "Cannot start: Another session is already active. Please end it first."
+        );
+        return;
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     setSaving(true);
     await supabase
       .from("sessions")
       .update({ status: "in_progress", started_at: new Date().toISOString() })
       .eq("id", id!);
     await loadData();
+    await clearDevices("session_started"); // start sound on every device
+
+    // If timed sequence, start word 0 immediately with its clamped duration
+    if (isTimedSequence(session?.type) && sessionWords.length > 0) {
+      const firstWord = sessionWords[0];
+      const dur = clampDuration(firstWord.duration_seconds ?? DEFAULT_WORD_DURATION_SEC);
+      isCooldownRef.current = false;
+      wordListIndexRef.current = 0;
+      timerSecondsLeftRef.current = dur;
+      setIsCooldown(false);
+      setWordListIndex(0);
+      setTotalWordSeconds(dur);
+      setTimerSecondsLeft(dur);
+      setIsPlaying(true);
+      await doSendWord(firstWord.word);
+    }
+
     setSaving(false);
   }
 
@@ -463,13 +1328,43 @@ export default function SessionDetail() {
     // (which fires on immediate navigation after a manual pause) reads the
     // correct status and does not double-fire the DB update.
     sessionStatusRef.current = "paused";
-    await supabase.from("sessions").update({ status: "paused" }).eq("id", id!);
+    setIsPlaying(false);
+    stopLiveSafetyTimer();
+    if (autoCycleTimer.current) {
+      clearInterval(autoCycleTimer.current);
+      autoCycleTimer.current = null;
+    }
+    await clearDevices("session_paused"); // Release solenoids + pause sound
+    await updateOrQueue("sessions", { status: "paused" }, { id: id! });
     // [REALTIME] Send pause command to all devices
     if (!auto) await loadData();
     else setSession((prev) => (prev ? { ...prev, status: "paused" } : prev));
   }
 
   async function resumeSession() {
+    if (!isOnline()) {
+      showValidationToast("You're offline", "Connect to the internet to resume.");
+      return;
+    }
+    // Pre-flight check: block if another session is already active
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (user) {
+      const { count } = await supabase
+        .from("sessions")
+        .select("id", { count: "exact", head: true })
+        .eq("teacher_id", user.id)
+        .in("status", ["in_progress", "paused", "active"])
+        .neq("id", id!);
+      if ((count ?? 0) > 0) {
+        showValidationToast(
+          "Cannot start: Another session is already active. Please end it first."
+        );
+        return;
+      }
+    }
+
     // Fix 6: eagerly update the ref so that any race between resume and
     // immediate navigation is handled correctly (the cleanup will see
     // in_progress and will re-pause, which is the desired behaviour).
@@ -479,7 +1374,25 @@ export default function SessionDetail() {
       .update({ status: "in_progress" })
       .eq("id", id!);
     await loadData();
-    // Position is already restored inside loadData via restoreWordPosition
+    await clearDevices("session_resumed"); // resume sound on every device
+
+    if (isTimedSequence(session?.type) && sessionWords.length > 0) {
+      const currentIdx = Math.min(sessionWords.length - 1, Math.max(0, wordListIndex));
+      const currentWord = sessionWords[currentIdx];
+      const dur = clampDuration(currentWord.duration_seconds ?? DEFAULT_WORD_DURATION_SEC);
+      isCooldownRef.current = false;
+      setIsCooldown(false);
+      setTotalWordSeconds(dur);
+      setTimerSecondsLeft(dur);
+      timerSecondsLeftRef.current = dur;
+      setIsPlaying(true);
+      await doSendWord(currentWord.word);
+    } else if (isLiveSession(session?.type) && activeWordId && lastSentWord) {
+      const liveChunks = wordToChunks(lastSentWord);
+      // Resume on chunk 0 on hardware — teacher local chunk navigation is decoupled
+      await broadcastChunk(liveChunks, 0, lastSentWord);
+      startLiveSafetyTimer();
+    }
   }
 
   function confirmFinish() {
@@ -488,14 +1401,29 @@ export default function SessionDetail() {
 
   async function executeFinishSession() {
     setFinishingSession(true);
+    setIsPlaying(false);
+    setIsCooldown(false);
+    isCooldownRef.current = false;
+    stopLiveSafetyTimer();
+    if (autoCycleTimer.current) {
+      clearInterval(autoCycleTimer.current);
+      autoCycleTimer.current = null;
+    }
+    await clearDevices("session_finished"); // Release solenoids + finish sound
+    setActiveWordId(null);
+    activeWordIdRef.current = null;
+    setWordSent(false);
+    setChunks([]);
+
     const sessionName = session?.name ?? "Session";
-    await supabase
-      .from("sessions")
-      .update({
-        status: "finished",
-        finished_at: new Date().toISOString(),
-      })
-      .eq("id", id!);
+    // Instantly transition to finished view
+    setSession((prev) => (prev ? { ...prev, status: "finished" } : prev));
+    sessionStatusRef.current = "finished";
+    await updateOrQueue(
+      "sessions",
+      { status: "finished", finished_at: new Date().toISOString() },
+      { id: id! }
+    );
     await loadData();
     setFinishingSession(false);
     setFinishSessionModal(false);
@@ -505,40 +1433,119 @@ export default function SessionDetail() {
   // ── Send word to devices ────────────────────────────────────────────────────
 
   async function sendWord(word: string) {
-    const w = word.trim().toUpperCase();
-    if (!w || !isValidWord(w)) {
-      Alert.alert("Invalid word", "Only letters A–Z are supported.");
+    if (!isOnline()) {
+      showValidationToast("You're offline", "Connect to the internet to send words.");
+      return;
+    }
+    // Input Validation: Enforce strict A-Z only validation to prevent symbol errors
+    const sanitized = word.replace(/[^a-zA-Z]/g, "").trim().toUpperCase();
+    if (!sanitized || !isValidWord(sanitized)) {
+      showValidationToast("Invalid word", "Only letters A–Z are supported.");
       return;
     }
     // Duplicate check — show confirm modal instead of silently re-sending
-    if (sentWords.has(w)) {
-      setDupWord(w);
+    if (sentWords.has(sanitized)) {
+      setDupWord(sanitized);
       setDupWordModal(true);
       return;
     }
-    await doSendWord(w);
+    await doSendWord(sanitized);
   }
 
   // Internal: broadcasts the word; also called on "Re-send Anyway"
   async function doSendWord(w: string) {
-    // Record history for manual sessions
-    if (session?.type === "manual" && !sessionWords.find((sw) => sw.word === w)) {
-      const { data: wordData } = await supabase
-        .from("session_words")
-        .insert({ session_id: id, word: w, order_index: sessionWords.length })
-        .select("id, word, order_index")
-        .single();
-      if (wordData) setSessionWords((prev) => [...prev, wordData]);
+    let wordId: string | null = null;
+
+    // Database Persistence: Immediately execute Supabase INSERT into session_words table
+    // tied to current session_id. This ensures words appear in the Finished summary.
+    if (isLiveSession(session?.type)) {
+      const orderIdx = sessionWords.length;
+      let insertedWord: SessionWord | null = null;
+
+      try {
+        const { data, error } = await supabase
+          .from("session_words")
+          .insert({
+            session_id: id,
+            word: w,
+            order_index: orderIdx,
+            duration_seconds: DEFAULT_WORD_DURATION_SEC,
+          })
+          .select("id, word, order_index, duration_seconds")
+          .maybeSingle();
+
+        if (error) {
+          // Fallback if duration_seconds column does not exist
+          const { data: fallbackData, error: fallbackError } = await supabase
+            .from("session_words")
+            .insert({
+              session_id: id,
+              word: w,
+              order_index: orderIdx,
+            })
+            .select("id, word, order_index")
+            .maybeSingle();
+
+          if (fallbackData) {
+            insertedWord = {
+              id: fallbackData.id,
+              word: fallbackData.word,
+              order_index: fallbackData.order_index,
+              duration_seconds: DEFAULT_WORD_DURATION_SEC,
+            };
+          } else if (fallbackError) {
+            console.error("Failed to insert into session_words:", fallbackError.message);
+          }
+        } else if (data) {
+          insertedWord = {
+            id: data.id,
+            word: data.word,
+            order_index: data.order_index,
+            duration_seconds: data.duration_seconds ?? DEFAULT_WORD_DURATION_SEC,
+          };
+        }
+      } catch (err) {
+        console.error("Error inserting into session_words:", err);
+      }
+
+      const finalWord: SessionWord = insertedWord ?? {
+        id: `live_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        word: w,
+        order_index: orderIdx,
+        duration_seconds: DEFAULT_WORD_DURATION_SEC,
+      };
+
+      setSessionWords((prev) => [...prev, finalWord]);
+      sessionWordsRef.current = [...sessionWordsRef.current, finalWord];
+      wordId = finalWord.id;
+
+      // 60-Second Safety Kill-Switch: Start hidden 60-second hardware burnout protection timer
+      startLiveSafetyTimer();
+    } else {
+      // Timed sequence word list
+      const existing = sessionWords.find((sw) => sw.word === w);
+      wordId = existing?.id ?? null;
     }
+
     sentWords.add(w);
-    // Fix 2: track the last *actually sent* word so the Paused card always
-    // displays accurate context, independent of list position or input state.
     setLastSentWord(w);
+    lastSentWordRef.current = w;
     const newChunks = wordToChunks(w);
     setChunks(newChunks);
     setChunkIndex(0);
     setWordSent(true);
-    await saveWordPosition(id!, w, 0);
+
+    // Clear the input and mark this word as the active one
+    setManualWord("");
+    if (wordId) {
+      setActiveWordId(wordId);
+      activeWordIdRef.current = wordId;
+    }
+
+    await saveWordPosition(id!, w, 0, {
+      activeWordId: wordId,
+      completedWordIds,
+    });
     await broadcastChunk(newChunks, 0, w);
   }
 
@@ -546,12 +1553,12 @@ export default function SessionDetail() {
     if (newIdx < 0 || newIdx >= chunks.length) return;
     setChunkIndex(newIdx);
     const word =
-      session?.type === "manual"
-        ? manualWord
+      isLiveSession(session?.type)
+        ? lastSentWord
         : (sessionWords[wordListIndex]?.word ?? "");
-    // Persist chunk position so resume always shows the exact chunk
-    await saveWordPosition(id!, word, newIdx);
-    await broadcastChunk(chunks, newIdx, word);
+    // Persist chunk position locally so resume shows the exact chunk on teacher UI
+    // Decoupled from hardware: does NOT broadcast to student devices
+    await saveWordPosition(id!, word, newIdx, { activeWordId, completedWordIds });
   }
 
   async function broadcastChunk(chunkArr: string[], idx: number, word: string) {
@@ -568,12 +1575,19 @@ export default function SessionDetail() {
       command_type: "display_chunk" as const,
       payload: {
         word,
+        session_word_id: asWordId(activeWordIdRef.current),
         chunk: chunkArr[idx],
         chunk_index: idx,
         total_chunks: chunkArr.length,
       },
     }));
-    await supabase.from("device_commands").insert(commands);
+    const { error } = await supabase.from("device_commands").insert(commands);
+    if (error) {
+      logEvent("error", "device_command_failed", `Could not send "${word}" to devices: ${error.message}`, {
+        session_id: id ?? null,
+        meta: { word, chunk: chunkArr[idx], devices: connectedDevices },
+      });
+    }
   }
 
   // ── Render helpers ──────────────────────────────────────────────────────────
@@ -584,7 +1598,7 @@ export default function SessionDetail() {
     setStatsModal(true);
     const { data } = await supabase
       .from("word_attempts")
-      .select("id, word, is_correct, response_time_ms, attempted_at")
+      .select("id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id")
       .eq("student_id", student.id)
       .eq("session_id", id!)
       .order("attempted_at", { ascending: true });
@@ -592,7 +1606,32 @@ export default function SessionDetail() {
     setLoadingStats(false);
   }
 
+  // Teacher manually corrects an auto-graded answer
+  async function overrideAttempt(attempt: WordAttempt, correct: boolean) {
+    const patch = { is_correct: correct, needs_review: false, graded_by: "teacher" };
+    setStatsData((prev) =>
+      prev
+        ? {
+            ...prev,
+            attempts: prev.attempts.map((a) =>
+              a.id === attempt.id ? { ...a, ...patch } : a
+            ),
+          }
+        : prev
+    );
+    const { error } = await updateOrQueue("word_attempts", patch, { id: attempt.id });
+    if (error) {
+      console.error("Override failed:", error);
+      if (statsData) openStudentStats(statsData.student); // reload real values
+    }
+  }
+
   const assignedStudents = allStudents.filter((s) => assignedIds.has(s.id));
+  const studentName = (sid?: string | null) =>
+    allStudents.find((s) => s.id === sid)?.full_name.split(" ")[0] ?? "—";
+  const validPairedAssignedCount = allStudents.filter(
+    (s) => assignedIds.has(s.id) && !!s.device
+  ).length;
 
   if (loading) {
     return (
@@ -603,9 +1642,32 @@ export default function SessionDetail() {
       </SafeAreaView>
     );
   }
-  if (!session) return null;
 
-  const filteredBank = [] as WordBankItem[]; // word bank is now on add-word screen
+  // Guard: session couldn't be loaded (deleted externally, bad id, network error).
+  // Show a recoverable error instead of a black screen.
+  if (!session) {
+    return (
+      <SafeAreaView style={styles.safe} edges={["top"]}>
+        <View style={styles.center}>
+          <Ionicons name="alert-circle-outline" size={40} color={C.muted} />
+          <Text style={[styles.emptyHint, { marginTop: 10, textAlign: "center" }]}>
+            Session not found.{"\n"}It may have been deleted or failed to load.
+          </Text>
+          <Pressable
+            onPress={() => router.back()}
+            style={({ pressed }) => [
+              styles.launchBtn,
+              { marginTop: 16, paddingHorizontal: 24 },
+              pressed && { opacity: 0.8 },
+            ]}
+          >
+            <Ionicons name="arrow-back" size={16} color="#1A1200" />
+            <Text style={styles.launchBtnText}>Go Back</Text>
+          </Pressable>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   // ── DUPLICATE WORD MODAL ────────────────────────────────────────────────────
   const DupWordModal = (
@@ -866,7 +1928,7 @@ export default function SessionDetail() {
             <View style={styles.infoRow}>
               <View style={[styles.badge, { backgroundColor: C.blueWash }]}>
                 <Text style={[styles.badgeText, { color: C.navy }]}>
-                  {session.type === "word_list" ? "Word List" : "Manual"}
+                  {getSessionTypeLabel(session.type)}
                 </Text>
               </View>
               <View style={[styles.badge, { backgroundColor: C.border }]}>
@@ -880,7 +1942,7 @@ export default function SessionDetail() {
           {/* Assign students */}
           <Text style={styles.sectionLabel}>ASSIGN STUDENTS</Text>
           <Text style={styles.sectionHint}>
-            Only students with connected devices can receive words.
+            Only students with paired hardware devices can be selected for sessions.
           </Text>
           {allStudents.length === 0 ? (
             <Text style={styles.emptyHint}>
@@ -890,6 +1952,7 @@ export default function SessionDetail() {
             <View style={styles.studentGrid}>
               {allStudents.map((s) => {
                 const assigned = assignedIds.has(s.id);
+                const hasDevice = !!s.device;
                 const statusColor = s.device
                   ? (DEVICE_COLOR[s.device.status] ?? C.muted)
                   : C.muted;
@@ -897,11 +1960,25 @@ export default function SessionDetail() {
                   <Pressable
                     key={s.id}
                     onPress={() => toggleStudent(s.id)}
+                    disabled={!hasDevice && !assigned}
                     style={({ pressed }) => [
                       styles.studentChip,
                       assigned && styles.studentChipActive,
-                      pressed && { opacity: 0.8 },
+                      !hasDevice && styles.studentChipDisabled,
+                      pressed && (hasDevice || assigned) && { opacity: 0.8 },
                     ]}
+                    accessibilityRole="checkbox"
+                    accessibilityState={{
+                      checked: assigned,
+                      disabled: !hasDevice && !assigned,
+                    }}
+                    accessibilityLabel={`${s.full_name}, ${
+                      !hasDevice
+                        ? "No device paired, selection disabled"
+                        : assigned
+                        ? "Selected"
+                        : "Not selected"
+                    }`}
                   >
                     {assigned && (
                       <Ionicons
@@ -914,56 +1991,142 @@ export default function SessionDetail() {
                       style={[
                         styles.studentChipText,
                         assigned && { color: C.white },
+                        !hasDevice && styles.studentChipTextDisabled,
                       ]}
                     >
                       {s.full_name}
                     </Text>
-                    <View
-                      style={[
-                        styles.statusDot,
-                        { backgroundColor: statusColor },
-                      ]}
-                    />
+                    {hasDevice ? (
+                      <View
+                        style={[
+                          styles.statusDot,
+                          { backgroundColor: statusColor },
+                        ]}
+                      />
+                    ) : (
+                      <View style={styles.noDeviceBadge}>
+                        <Ionicons
+                          name="alert-circle-outline"
+                          size={11}
+                          color={C.brown}
+                        />
+                        <Text style={styles.noDeviceBadgeText}>
+                          No Device Paired
+                        </Text>
+                      </View>
+                    )}
                   </Pressable>
                 );
               })}
             </View>
           )}
 
-          {/* Word list builder (word_list type only) */}
-          {session.type === "word_list" && (
+          {/* Timed sequence builder (timed_sequence or legacy word_list) */}
+          {isTimedSequence(session.type) && (
             <>
-              <Text style={styles.sectionLabel}>WORD LIST</Text>
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 4 }}>
+                <Text style={styles.sectionLabel}>TIMED SEQUENCE</Text>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                  {sessionWords.length > 1 && (
+                    <Pressable
+                      onPress={shuffleWords}
+                      disabled={shuffling}
+                      hitSlop={6}
+                      style={({ pressed }) => [
+                        styles.shuffleHeaderBtn,
+                        pressed && { opacity: 0.7 },
+                        shuffling && { opacity: 0.5 },
+                      ]}
+                      accessibilityLabel="Shuffle word order"
+                    >
+                      <Ionicons name="shuffle" size={13} color={C.navy} />
+                      <Text style={styles.shuffleHeaderBtnText}>
+                        {shuffling ? "Shuffling..." : "Shuffle"}
+                      </Text>
+                    </Pressable>
+                  )}
+                  <View style={styles.safetyPill}>
+                    <Ionicons name="shield-checkmark" size={12} color={C.green} />
+                    <Text style={styles.safetyPillText}>5s – 60s limit</Text>
+                  </View>
+                </View>
+              </View>
               <Text style={styles.sectionHint}>
-                Words will be sent to devices in this order.
+                Set the active duration for each word before launching.
               </Text>
 
               {sessionWords.length > 0 && (
                 <View style={styles.wordListContainer}>
-                  {sessionWords.map((sw, i) => (
-                    <View key={sw.id} style={styles.wordRow}>
-                      <Text style={styles.wordIndex}>
-                        {String(i + 1).padStart(2, "0")}
-                      </Text>
-                      <Text style={styles.wordText}>{sw.word}</Text>
-                      <Pressable
-                        onPress={() => {
-                          setWordToRemove(sw);
-                          setDeleteWordModal(true);
-                        }}
-                        hitSlop={8}
-                        style={({ pressed }) => [
-                          { opacity: pressed ? 0.5 : 1 },
-                        ]}
-                      >
-                        <Ionicons
-                          name="trash-outline"
-                          size={16}
-                          color={C.red}
-                        />
-                      </Pressable>
-                    </View>
-                  ))}
+                  {sessionWords.map((sw, i) => {
+                    const dur = sw.duration_seconds ?? DEFAULT_WORD_DURATION_SEC;
+                    return (
+                      <View key={sw.id} style={styles.sequenceWordRow}>
+                        <Text style={styles.wordIndex}>
+                          {String(i + 1).padStart(2, "0")}
+                        </Text>
+                        <Text style={styles.sequenceWordText}>{sw.word}</Text>
+
+                        {/* Per-word timer stepper: 5s to 60s hard-capped */}
+                        <View style={styles.stepperWrap}>
+                          <Pressable
+                            onPress={() => updateWordDuration(sw.id, dur - 5)}
+                            disabled={dur <= MIN_WORD_DURATION_SEC}
+                            style={({ pressed }) => [
+                              styles.stepperBtn,
+                              dur <= MIN_WORD_DURATION_SEC && styles.stepperBtnDisabled,
+                              pressed && { opacity: 0.6 },
+                            ]}
+                            hitSlop={4}
+                            accessibilityLabel="Decrease duration by 5s"
+                          >
+                            <Ionicons
+                              name="remove"
+                              size={14}
+                              color={dur <= MIN_WORD_DURATION_SEC ? C.border : C.navy}
+                            />
+                          </Pressable>
+                          <View style={styles.stepperBadge}>
+                            <Ionicons name="timer-outline" size={12} color={C.muted} />
+                            <Text style={styles.stepperText}>{dur}s</Text>
+                          </View>
+                          <Pressable
+                            onPress={() => updateWordDuration(sw.id, dur + 5)}
+                            disabled={dur >= MAX_WORD_DURATION_SEC}
+                            style={({ pressed }) => [
+                              styles.stepperBtn,
+                              dur >= MAX_WORD_DURATION_SEC && styles.stepperBtnDisabled,
+                              pressed && { opacity: 0.6 },
+                            ]}
+                            hitSlop={4}
+                            accessibilityLabel="Increase duration by 5s"
+                          >
+                            <Ionicons
+                              name="add"
+                              size={14}
+                              color={dur >= MAX_WORD_DURATION_SEC ? C.border : C.navy}
+                            />
+                          </Pressable>
+                        </View>
+
+                        <Pressable
+                          onPress={() => {
+                            setWordToRemove(sw);
+                            setDeleteWordModal(true);
+                          }}
+                          hitSlop={8}
+                          style={({ pressed }) => [
+                            { opacity: pressed ? 0.5 : 1 },
+                          ]}
+                        >
+                          <Ionicons
+                            name="trash-outline"
+                            size={16}
+                            color={C.red}
+                          />
+                        </Pressable>
+                      </View>
+                    );
+                  })}
                 </View>
               )}
 
@@ -992,6 +2155,29 @@ export default function SessionDetail() {
                   </Pressable>
                 )}
               </View>
+
+              {/* Shuffle Words button right above the Launch Session button */}
+              {sessionWords.length > 1 && (
+                <Pressable
+                  onPress={shuffleWords}
+                  disabled={shuffling}
+                  style={({ pressed }) => [
+                    styles.shuffleWordsBtn,
+                    pressed && { opacity: 0.85 },
+                    shuffling && { opacity: 0.6 },
+                  ]}
+                  accessibilityLabel="Shuffle words"
+                >
+                  {shuffling ? (
+                    <ActivityIndicator size="small" color={C.navy} />
+                  ) : (
+                    <Ionicons name="shuffle" size={18} color={C.navy} />
+                  )}
+                  <Text style={styles.shuffleWordsBtnText}>
+                    {shuffling ? "Shuffling Words..." : "Shuffle Words"}
+                  </Text>
+                </Pressable>
+              )}
             </>
           )}
 
@@ -999,10 +2185,10 @@ export default function SessionDetail() {
           {/* Launch button */}
           <Pressable
             onPress={launchSession}
-            disabled={saving || assignedIds.size === 0}
+            disabled={saving || validPairedAssignedCount === 0}
             style={({ pressed }) => [
               styles.launchBtn,
-              (saving || assignedIds.size === 0) && { opacity: 0.5 },
+              (saving || validPairedAssignedCount === 0) && { opacity: 0.5 },
               pressed && { opacity: 0.85 },
             ]}
           >
@@ -1071,7 +2257,7 @@ export default function SessionDetail() {
                 </Pressable>
                 <Pressable
                   onPress={() => {
-                    if (wordToRemove) removeWord(wordToRemove.id);
+                    if (wordToRemove) removeWord(wordToRemove.id, wordToRemove.word);
                     setDeleteWordModal(false);
                     setWordToRemove(null);
                   }}
@@ -1087,6 +2273,24 @@ export default function SessionDetail() {
             </View>
           </View>
         </Modal>
+
+        {/* ── Remove-word success toast ───────────────────────────────────── */}
+        <Toast
+          message="Word removed from list"
+          detail={removeWordToast?.word}
+          visible={!!removeWordToast}
+          variant="delete"
+          onDismiss={() => setRemoveWordToast(null)}
+        />
+
+        {/* ── Validation toast (replaces Alert.alert for launch/word checks) ── */}
+        <Toast
+          message={validationToast.message}
+          detail={validationToast.detail}
+          visible={validationToast.visible}
+          variant="delete"
+          onDismiss={() => setValidationToast((t) => ({ ...t, visible: false }))}
+        />
 
       </SafeAreaView>
     );
@@ -1149,6 +2353,21 @@ export default function SessionDetail() {
           variant="success"
           onDismiss={() => setFinishToast(null)}
         />
+        <Toast
+          message={validationToast.message}
+          detail={validationToast.detail}
+          visible={validationToast.visible}
+          variant="delete"
+          onDismiss={() => setValidationToast((t) => ({ ...t, visible: false }))}
+        />
+        <Toast
+          message={safetyToast.message}
+          detail={safetyToast.detail}
+          visible={safetyToast.visible}
+          variant="warning"
+          duration={5000}
+          onDismiss={() => setSafetyToast((prev) => ({ ...prev, visible: false }))}
+        />
       </SafeAreaView>
     );
 
@@ -1174,15 +2393,27 @@ export default function SessionDetail() {
             {session.purpose && (
               <Text style={styles.sessionPurpose}>{session.purpose}</Text>
             )}
-            <View
-              style={[
-                styles.badge,
-                { backgroundColor: C.blueWash, alignSelf: "flex-start" },
-              ]}
-            >
-              <Text style={[styles.badgeText, { color: C.navy }]}>
-                Finished
-              </Text>
+            <View style={styles.infoRow}>
+              <View
+                style={[
+                  styles.badge,
+                  { backgroundColor: C.blueWash, alignSelf: "flex-start" },
+                ]}
+              >
+                <Text style={[styles.badgeText, { color: C.navy }]}>
+                  {getSessionTypeLabel(session.type)}
+                </Text>
+              </View>
+              <View
+                style={[
+                  styles.badge,
+                  { backgroundColor: C.greenBg, alignSelf: "flex-start" },
+                ]}
+              >
+                <Text style={[styles.badgeText, { color: C.green }]}>
+                  Finished
+                </Text>
+              </View>
             </View>
           </View>
 
@@ -1290,8 +2521,14 @@ export default function SessionDetail() {
 
                       {/* Summary chips */}
                       {(() => {
-                        const total   = statsData.attempts.length;
-                        const correct = statsData.attempts.filter((a) => a.is_correct).length;
+                        // One result per word sent: the student's latest answer to it
+                        const answers = sessionWords
+                          .map((sw) => latestAttempt(attemptsForWord(statsData.attempts, sw)))
+                          .filter((a): a is WordAttempt => !!a);
+                        const graded  = answers.filter((a) => !a.needs_review);
+                        const total   = graded.length;
+                        const correct = graded.filter((a) => a.is_correct).length;
+                        const pending = answers.length - graded.length;
                         const acc     = total > 0 ? Math.round((correct / total) * 100) : 0;
                         const timed   = statsData.attempts.filter((a) => (a.response_time_ms ?? 0) > 0);
                         const avgMs   = timed.length > 0
@@ -1315,7 +2552,9 @@ export default function SessionDetail() {
                               <Text style={[styles.statsChipValue, { color: C.brown }]}>
                                 {correct}/{total}
                               </Text>
-                              <Text style={styles.statsChipLabel}>Correct</Text>
+                              <Text style={styles.statsChipLabel}>
+                                {pending > 0 ? `Correct · ${pending} to review` : "Correct"}
+                              </Text>
                             </View>
                           </View>
                         );
@@ -1334,10 +2573,8 @@ export default function SessionDetail() {
                     <Text style={styles.emptyHint}>No words sent this session.</Text>
                   }
                   renderItem={({ item: sw, index: i }) => {
-                    // Find matching attempt for this word
-                    const attempt = statsData.attempts.find(
-                      (a) => a.word === sw.word
-                    );
+                    // The student's latest answer to THIS sending of the word
+                    const attempt = latestAttempt(attemptsForWord(statsData.attempts, sw));
                     return (
                       <View
                         style={[
@@ -1355,50 +2592,87 @@ export default function SessionDetail() {
                           {sw.word}
                         </Text>
 
-                        {/* Spoken input — placeholder until STT/firmware ready */}
+                        {/* Spoken input — recording + what Whisper heard */}
                         {attempt ? (
-                          <View style={{ flex: 2, flexDirection: "row", alignItems: "center", gap: 5 }}>
-                            <Ionicons
-                              name={attempt.is_correct ? "mic" : "mic-outline"}
-                              size={11}
-                              color={attempt.is_correct ? C.green : C.muted}
-                            />
+                          <View style={{ flex: 2, flexDirection: "row", alignItems: "center", gap: 6 }}>
+                            <PlayRecordingButton path={attempt.audio_path ?? null} />
                             <Text
+                              numberOfLines={2}
                               style={[styles.reviewCell, {
                                 flex: 1,
-                                color: attempt.is_correct ? C.green : C.red,
                                 fontFamily: fonts.body,
+                                color: STATUS_STYLE[attemptStatus(attempt)].fg,
                               }]}
                             >
-                              {attempt.is_correct ? sw.word : "(incorrect)"}
+                              {attempt.transcript
+                                ? `"${cleanTranscript(attempt.transcript)}"`
+                                : "(no transcript)"}
                             </Text>
                           </View>
                         ) : (
                           <View style={[styles.reviewVoicePlaceholder, { flex: 2 }]}>
                             <Ionicons name="mic-off-outline" size={11} color={C.muted} />
                             <Text style={styles.reviewVoicePlaceholderText}>
-                              voice input soon
+                              no answer
                             </Text>
                           </View>
                         )}
 
-                        {/* Result badge */}
-                        {attempt ? (
-                          <View
-                            style={[
-                              styles.resultBadge,
-                              { flex: 1, backgroundColor: attempt.is_correct ? C.greenBg : C.redBg },
-                            ]}
-                          >
-                            <Text style={[styles.resultBadgeText, { color: attempt.is_correct ? C.green : C.red }]}>
-                              {attempt.is_correct ? "✓ Correct" : "✗ Wrong"}
-                            </Text>
-                          </View>
-                        ) : (
-                          <View style={[styles.resultBadge, { flex: 1, backgroundColor: C.border }]}>
-                            <Text style={[styles.resultBadgeText, { color: C.muted }]}>—</Text>
-                          </View>
-                        )}
+                        {/* Result + teacher override */}
+                        <View style={{ flex: 1, alignItems: "center", gap: 4 }}>
+                          {attempt ? (
+                            <>
+                              <View
+                                style={[
+                                  styles.resultBadge,
+                                  { backgroundColor: STATUS_STYLE[attemptStatus(attempt)].bg },
+                                ]}
+                              >
+                                <Text
+                                  style={[
+                                    styles.resultBadgeText,
+                                    { color: STATUS_STYLE[attemptStatus(attempt)].fg },
+                                  ]}
+                                >
+                                  {STATUS_STYLE[attemptStatus(attempt)].label}
+                                </Text>
+                              </View>
+                              <View style={{ flexDirection: "row", gap: 6 }}>
+                                <Pressable
+                                  onPress={() => overrideAttempt(attempt, true)}
+                                  hitSlop={6}
+                                  style={({ pressed }) => [
+                                    styles.overrideBtn,
+                                    { borderColor: C.green },
+                                    pressed && { opacity: 0.6 },
+                                  ]}
+                                  accessibilityLabel="Mark correct"
+                                >
+                                  <Ionicons name="checkmark" size={12} color={C.green} />
+                                </Pressable>
+                                <Pressable
+                                  onPress={() => overrideAttempt(attempt, false)}
+                                  hitSlop={6}
+                                  style={({ pressed }) => [
+                                    styles.overrideBtn,
+                                    { borderColor: C.red },
+                                    pressed && { opacity: 0.6 },
+                                  ]}
+                                  accessibilityLabel="Mark wrong"
+                                >
+                                  <Ionicons name="close" size={12} color={C.red} />
+                                </Pressable>
+                              </View>
+                              {attempt.graded_by === "teacher" && (
+                                <Text style={styles.teacherTag}>by teacher</Text>
+                              )}
+                            </>
+                          ) : (
+                            <View style={[styles.resultBadge, { backgroundColor: C.border }]}>
+                              <Text style={[styles.resultBadgeText, { color: C.muted }]}>—</Text>
+                            </View>
+                          )}
+                        </View>
                       </View>
                     );
                   }}
@@ -1416,14 +2690,22 @@ export default function SessionDetail() {
 
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
+      <ActiveSessionKeepAwake />
       {Header}
       <ScrollView
         contentContainerStyle={styles.scroll}
         showsVerticalScrollIndicator={false}
       >
-        {/* Session name + status */}
+        {/* Session name + purpose + status */}
         <View style={styles.activeHeader}>
-          <Text style={styles.sessionName}>{session.name}</Text>
+          <View style={{ flex: 1, gap: 2 }}>
+            <Text style={styles.sessionName}>{session.name}</Text>
+            {session.purpose ? (
+              <Text style={styles.activePurpose} numberOfLines={2}>
+                {session.purpose}
+              </Text>
+            ) : null}
+          </View>
           <View style={styles.liveIndicator}>
             <Animated.View style={[styles.liveDot, { opacity: pulseAnim }]} />
             <Text style={styles.liveText}>Live</Text>
@@ -1463,38 +2745,106 @@ export default function SessionDetail() {
           </View>
         </ScrollView>
 
-        {/* ── MANUAL: type word live ────────────────────────────────── */}
-        {session.type === "manual" && (
+        {/* ── LIVE SESSION: Teacher Pacing Control with 60s Safety Net ──────── */}
+        {isLiveSession(session.type) && (
           <>
-            <View style={styles.sectionCard}>
-              <Text style={styles.cardLabel}>SEND WORD</Text>
-              <View style={styles.sendRow}>
-                <TextInput
-                  style={[styles.wordInput, { flex: 1 }]}
-                  value={manualWord}
-                  onChangeText={(v) => {
-                    setManualWord(v.toUpperCase());
-                    setWordSent(false);
-                  }}
-                  placeholder="TYPE WORD"
-                  placeholderTextColor={C.muted}
-                  autoCapitalize="characters"
-                  autoCorrect={false}
-                  returnKeyType="send"
-                  onSubmitEditing={() => sendWord(manualWord)}
-                />
+            {activeWordId ? (
+              /* Active Word state: Input is hidden, replaced by prominent Clear Display button */
+              <View style={[styles.sectionCard, styles.sectionCardActiveLive]}>
+                <View style={styles.liveCardHeader}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                    <Ionicons name="hardware-chip-outline" size={16} color={C.navy} />
+                    <Text style={styles.cardLabel}>ACTIVE DISPLAY · STUDENT READING</Text>
+                  </View>
+                  <View style={styles.activeDisplayBadge}>
+                    <Animated.View style={[styles.liveDot, { opacity: pulseAnim }]} />
+                    <Text style={styles.activeDisplayBadgeText}>Displaying</Text>
+                  </View>
+                </View>
+
+                {/* Hero card showing current word on device */}
+                <View style={styles.activeLiveHero}>
+                  <Text style={styles.activeLiveWordLabel}>WORD ON BRAILLE DISPLAY</Text>
+                  <Text style={styles.activeLiveWordText}>{lastSentWord}</Text>
+                  <Text style={styles.activeLiveWordSub}>
+                    Solenoids are engaged. When the student is done reading, click below to clear the pins and type the next word.
+                  </Text>
+                </View>
+
+                {/* Prominent Clear Display button (replaces text input) */}
                 <Pressable
-                  onPress={() => sendWord(manualWord)}
+                  onPress={handleClearDisplay}
                   style={({ pressed }) => [
-                    styles.sendBtn,
+                    styles.clearDisplayBtn,
                     pressed && { opacity: 0.85 },
                   ]}
+                  accessibilityLabel="Clear Display and Finish Word"
                 >
-                  <Ionicons name="send" size={16} color="#1A1200" />
-                  <Text style={styles.sendBtnText}>Send</Text>
+                  <Ionicons name="stop-circle" size={20} color={C.white} />
+                  <Text style={styles.clearDisplayBtnText}>Clear Display (Finish Word)</Text>
                 </Pressable>
               </View>
-            </View>
+            ) : (
+              /* Ready for Next Word: Clean text input with strict A-Z validation */
+              <View style={styles.sectionCard}>
+                <View style={styles.liveCardHeader}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                    <Ionicons name="hand-right-outline" size={16} color={C.navy} />
+                    <Text style={styles.cardLabel}>LIVE SESSION · MANUAL PACING</Text>
+                  </View>
+                  <View style={styles.livePacingBadge}>
+                    <Ionicons name="shield-checkmark" size={12} color={C.green} />
+                    <Text style={styles.livePacingBadgeText}>60s Safety Net</Text>
+                  </View>
+                </View>
+
+                <Text style={styles.liveControlHint}>
+                  Type a word and send it to the braille display. You dictate the pace based on the student&apos;s progress.
+                </Text>
+
+                <View style={styles.sendRow}>
+                  <TextInput
+                    style={[styles.wordInput, { flex: 1 }]}
+                    value={manualWord}
+                    onChangeText={(v) => {
+                      // Input Validation: Enforce strict A-Z only
+                      setManualWord(v.replace(/[^a-zA-Z]/g, "").toUpperCase());
+                      setWordSent(false);
+                    }}
+                    placeholder="TYPE WORD (A–Z)"
+                    placeholderTextColor={C.muted}
+                    autoCapitalize="characters"
+                    autoCorrect={false}
+                    returnKeyType="send"
+                    onSubmitEditing={() => {
+                      if (manualWord.trim()) sendWord(manualWord);
+                    }}
+                  />
+                  <Pressable
+                    onPress={() => sendWord(manualWord)}
+                    disabled={!manualWord.trim()}
+                    style={({ pressed }) => [
+                      styles.sendBtn,
+                      !manualWord.trim() && { opacity: 0.5 },
+                      pressed && { opacity: 0.85 },
+                    ]}
+                    accessibilityLabel="Send word"
+                  >
+                    <Ionicons name="send" size={16} color="#1A1200" />
+                    <Text style={styles.sendBtnText}>Send</Text>
+                  </Pressable>
+                </View>
+              </View>
+            )}
+
+            {/* Teacher fallback: grade the current word by hand */}
+            <HandGradeCard
+              word={lastSentWord}
+              wordId={[...sessionWords].reverse().find((sw) => sw.word === lastSentWord)?.id ?? null}
+              students={assignedStudents}
+              attempts={liveAttempts}
+              onGrade={gradeByHand}
+            />
 
             {/* Words sent history + live student responses */}
             {sessionWords.length > 0 && (
@@ -1502,31 +2852,45 @@ export default function SessionDetail() {
                 <Text style={styles.cardLabel}>WORDS SENT</Text>
                 <View style={{ gap: 8 }}>
                   {[...sessionWords].reverse().map((sw, i) => {
-                    // Find any live attempt for this word
-                    const attempt = liveAttempts.find(
-                      (a) => a.word === sw.word
-                    );
+                    const isActive = sw.id === activeWordId;
+                    const isDone = completedWordIds.has(sw.id);
                     return (
-                      <View key={sw.id} style={styles.historyRow}>
-                        <Text style={styles.historyIndex}>
+                      <View
+                        key={sw.id}
+                        style={[
+                          styles.historyRow,
+                          isActive && styles.historyRowActive,
+                          isDone && styles.historyRowDone,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.historyIndex,
+                            isActive && { color: C.amber },
+                            isDone && { color: C.green },
+                          ]}
+                        >
                           {String(sessionWords.length - i).padStart(2, "0")}
                         </Text>
-                        <Text style={styles.historyWord}>{sw.word}</Text>
-                        {attempt && (
-                          <View
-                            style={[
-                              styles.attemptLiveBadge,
-                              { backgroundColor: attempt.is_correct ? C.greenBg : C.redBg },
-                            ]}
-                          >
-                            <Text
-                              style={[
-                                styles.attemptLiveBadgeText,
-                                { color: attempt.is_correct ? C.green : C.red },
-                              ]}
-                            >
-                              {attempt.is_correct ? "✓ Correct" : "✗ Wrong"}
-                            </Text>
+                        <Text
+                          style={[
+                            styles.historyWord,
+                            isActive && { color: C.brown },
+                            isDone && { color: C.green },
+                          ]}
+                        >
+                          {sw.word}
+                        </Text>
+                        {isActive && (
+                          <View style={styles.activeWordBadge}>
+                            <View style={styles.activeWordDot} />
+                            <Text style={styles.activeWordBadgeText}>Active</Text>
+                          </View>
+                        )}
+                        {isDone && !isActive && (
+                          <View style={styles.doneWordBadge}>
+                            <Ionicons name="checkmark" size={10} color={C.green} />
+                            <Text style={styles.doneWordBadgeText}>Done</Text>
                           </View>
                         )}
                       </View>
@@ -1546,18 +2910,20 @@ export default function SessionDetail() {
                       <View
                         style={[
                           styles.responseDot,
-                          { backgroundColor: a.is_correct ? C.green : C.red },
+                          { backgroundColor: STATUS_STYLE[attemptStatus(a)].fg },
                         ]}
                       />
+                      <Text style={hg.who} numberOfLines={1}>{studentName(a.student_id)}</Text>
                       <Text style={styles.historyWord}>{a.word}</Text>
                       <View style={{ flex: 1 }} />
                       <Text
                         style={[
                           styles.responseLabel,
-                          { color: a.is_correct ? C.green : C.red },
+                          { color: STATUS_STYLE[attemptStatus(a)].fg },
                         ]}
                       >
-                        {a.is_correct ? "Correct" : "Wrong"}
+                        {STATUS_STYLE[attemptStatus(a)].short}
+                        {a.transcript ? ` · "${cleanTranscript(a.transcript)}"` : ""}
                       </Text>
                     </View>
                   ))}
@@ -1567,95 +2933,207 @@ export default function SessionDetail() {
           </>
         )}
 
-        {/* ── WORD LIST: navigate through list ─────────────────────── */}
-        {session.type === "word_list" && sessionWords.length > 0 && (
+        {/* ── TIMED SEQUENCE: Auto-cycle playback engine ──────────── */}
+        {isTimedSequence(session.type) && sessionWords.length > 0 && (
           <View style={styles.sectionCard}>
-            <Text style={styles.cardLabel}>WORD LIST</Text>
-            <View style={styles.wordNavRow}>
-              <Pressable
-                onPress={() => {
-                  const newIdx = Math.max(0, wordListIndex - 1);
-                  setWordListIndex(newIdx);
-                  setWordSent(false);
-                  setChunks([]);
-                  // Save navigation position so resume lands on the same word
-                  saveWordPosition(id!, sessionWords[newIdx]?.word ?? "", 0);
-                }}
-                disabled={wordListIndex === 0}
-                style={({ pressed }) => [
-                  styles.navBtn,
-                  pressed && { opacity: 0.7 },
-                  wordListIndex === 0 && { opacity: 0.3 },
+            <View style={styles.timedCardHeader}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                <Ionicons name="timer" size={16} color={C.navy} />
+                <Text style={styles.cardLabel}>TIMED SEQUENCE · AUTO-CYCLE</Text>
+              </View>
+              <View
+                style={[
+                  styles.playbackStateBadge,
+                  {
+                    backgroundColor: isCooldown
+                      ? C.blueWash
+                      : isPlaying
+                      ? C.greenBg
+                      : C.brownBg,
+                  },
                 ]}
               >
-                <Ionicons name="chevron-back" size={20} color={C.navy} />
-              </Pressable>
-              <View style={styles.wordDisplay}>
-                <Text style={styles.wordDisplayIndex}>
-                  {wordListIndex + 1} / {sessionWords.length}
+                <View
+                  style={[
+                    styles.playbackStateDot,
+                    {
+                      backgroundColor: isCooldown
+                        ? C.navy
+                        : isPlaying
+                        ? C.green
+                        : C.amber,
+                    },
+                  ]}
+                />
+                <Text
+                  style={[
+                    styles.playbackStateText,
+                    {
+                      color: isCooldown
+                        ? C.navy
+                        : isPlaying
+                        ? C.green
+                        : C.brown,
+                    },
+                  ]}
+                >
+                  {isCooldown
+                    ? "Student Break"
+                    : isPlaying
+                    ? "Auto-cycling"
+                    : "Paused"}
                 </Text>
-                <Text style={styles.wordDisplayText}>
+              </View>
+            </View>
+
+            {/* Hero Word Card with Countdown & Progress */}
+            {isCooldown ? (
+              <View style={[styles.timedHeroBox, styles.timedHeroBoxCooldown]}>
+                <View style={styles.cooldownHeaderRow}>
+                  <Ionicons name="sparkles-outline" size={15} color={C.navy} />
+                  <Text style={styles.cooldownBadgeText}>STUDENT BREAK</Text>
+                </View>
+                <Text style={styles.cooldownTitleText}>Student Break</Text>
+                <Text style={styles.cooldownSubText}>
+                  Get ready for the next word:{" "}
+                  <Text style={styles.cooldownNextWordText}>
+                    {sessionWords[wordListIndex + 1]?.word ?? "Next"}
+                  </Text>
+                </Text>
+
+                {/* Visual progress bar for cooldown */}
+                <View style={styles.progressBarTrack}>
+                  <View
+                    style={[
+                      styles.progressBarFill,
+                      styles.progressBarFillCooldown,
+                      {
+                        width: `${Math.max(
+                          0,
+                          Math.min(
+                            100,
+                            (timerSecondsLeft / COOLDOWN_DURATION_SEC) * 100
+                          )
+                        )}%`,
+                      },
+                    ]}
+                  />
+                </View>
+
+                {/* Countdown counter & Solenoid safety badge */}
+                <View style={styles.timerRow}>
+                  <View style={styles.timerMain}>
+                    <Ionicons name="time-outline" size={18} color={C.navy} />
+                    <Text style={styles.timerNumber}>{timerSecondsLeft}s</Text>
+                    <Text style={styles.timerUnit}>
+                      remaining of {COOLDOWN_DURATION_SEC}s
+                    </Text>
+                  </View>
+
+                  <View style={styles.hardwareLimitBadge}>
+                    <Ionicons name="checkmark-circle-outline" size={12} color={C.green} />
+                    <Text style={styles.hardwareLimitText}>Display Cleared</Text>
+                  </View>
+                </View>
+              </View>
+            ) : (
+              <View style={styles.timedHeroBox}>
+                <Text style={styles.wordDisplayIndex}>
+                  Word {wordListIndex + 1} of {sessionWords.length}
+                </Text>
+                <Text style={styles.timedWordText}>
                   {sessionWords[wordListIndex]?.word}
                 </Text>
-                {/* Show attempt result for current word live */}
-                {(() => {
-                  const currentWord = sessionWords[wordListIndex]?.word;
-                  const attempt = liveAttempts.find((a) => a.word === currentWord);
-                  if (!attempt) return null;
-                  return (
-                    <View
-                      style={[
-                        styles.wordListAttemptBadge,
-                        { backgroundColor: attempt.is_correct ? C.greenBg : C.redBg },
-                      ]}
-                    >
-                      <Text
-                        style={[
-                          styles.wordListAttemptText,
-                          { color: attempt.is_correct ? C.green : C.red },
-                        ]}
-                      >
-                        {attempt.is_correct ? "✓ Correct" : "✗ Wrong"}
-                      </Text>
-                    </View>
-                  );
-                })()}
+
+                {/* Visual progress bar */}
+                <View style={styles.progressBarTrack}>
+                  <View
+                    style={[
+                      styles.progressBarFill,
+                      {
+                        width: `${Math.max(
+                          0,
+                          Math.min(
+                            100,
+                            (timerSecondsLeft / (totalWordSeconds || 1)) * 100
+                          )
+                        )}%`,
+                      },
+                    ]}
+                  />
+                </View>
+
+                {/* Countdown counter & Solenoid safety badge */}
+                <View style={styles.timerRow}>
+                  <View style={styles.timerMain}>
+                    <Ionicons name="time-outline" size={18} color={C.navy} />
+                    <Text style={styles.timerNumber}>{timerSecondsLeft}s</Text>
+                    <Text style={styles.timerUnit}>
+                      remaining of {totalWordSeconds}s
+                    </Text>
+                  </View>
+
+                  <View style={styles.hardwareLimitBadge}>
+                    <Ionicons name="shield-outline" size={11} color={C.muted} />
+                    <Text style={styles.hardwareLimitText}>Max 60s coil safe</Text>
+                  </View>
+                </View>
+
               </View>
+            )}
+
+            {/* Playback Controls Row: strictly automated flow (Pause/Resume only) */}
+            <View style={styles.playbackControlsRow}>
+              {/* Play / Pause Timer */}
               <Pressable
-                onPress={() => {
-                  const newIdx = Math.min(sessionWords.length - 1, wordListIndex + 1);
-                  setWordListIndex(newIdx);
-                  setWordSent(false);
-                  setChunks([]);
-                  // Save navigation position so resume lands on the same word
-                  saveWordPosition(id!, sessionWords[newIdx]?.word ?? "", 0);
+                onPress={async () => {
+                  if (isPlaying) {
+                    setIsPlaying(false);
+                    await clearDevices(); // Drop coils while paused
+                  } else {
+                    setIsPlaying(true);
+                    if (!isCooldown) {
+                      const currentWord = sessionWords[wordListIndex];
+                      if (currentWord) {
+                        await doSendWord(currentWord.word);
+                      }
+                    }
+                  }
                 }}
-                disabled={wordListIndex === sessionWords.length - 1}
                 style={({ pressed }) => [
-                  styles.navBtn,
-                  pressed && { opacity: 0.7 },
-                  wordListIndex === sessionWords.length - 1 && { opacity: 0.3 },
+                  styles.playbackBtnPrimary,
+                  pressed && { opacity: 0.85 },
                 ]}
+                accessibilityLabel={
+                  isPlaying ? "Pause sequence timer" : "Resume sequence timer"
+                }
               >
-                <Ionicons name="chevron-forward" size={20} color={C.navy} />
+                <Ionicons
+                  name={isPlaying ? "pause" : "play"}
+                  size={20}
+                  color="#1A1200"
+                />
+                <Text style={styles.playbackBtnPrimaryText}>
+                  {isPlaying ? "Pause Timer" : "Resume Timer"}
+                </Text>
               </Pressable>
             </View>
-            <Pressable
-              onPress={() => sendWord(sessionWords[wordListIndex]?.word ?? "")}
-              style={({ pressed }) => [
-                styles.sendBtn,
-                { alignSelf: "stretch", justifyContent: "center" },
-                pressed && { opacity: 0.85 },
-              ]}
-            >
-              <Ionicons name="send" size={16} color="#1A1200" />
-              <Text style={styles.sendBtnText}>Send to Devices</Text>
-            </Pressable>
           </View>
         )}
 
-        {/* ── Word list: live responses feed ───────────────────────── */}
-        {session.type === "word_list" && liveAttempts.length > 0 && (
+        {/* ── Timed Sequence: grade the current word by hand ─────────── */}
+        {isTimedSequence(session.type) && (
+          <HandGradeCard
+            word={sessionWords[wordListIndex]?.word ?? ""}
+            wordId={sessionWords[wordListIndex]?.id ?? null}
+            students={assignedStudents}
+            attempts={liveAttempts}
+            onGrade={gradeByHand}
+          />
+        )}
+
+        {/* ── Timed Sequence: live responses feed ───────────────────────── */}
+        {isTimedSequence(session.type) && liveAttempts.length > 0 && (
           <View style={styles.sectionCard}>
             <Text style={styles.cardLabel}>LIVE RESPONSES</Text>
             <View style={{ gap: 8 }}>
@@ -1664,18 +3142,20 @@ export default function SessionDetail() {
                   <View
                     style={[
                       styles.responseDot,
-                      { backgroundColor: a.is_correct ? C.green : C.red },
+                      { backgroundColor: STATUS_STYLE[attemptStatus(a)].fg },
                     ]}
                   />
+                  <Text style={hg.who} numberOfLines={1}>{studentName(a.student_id)}</Text>
                   <Text style={styles.historyWord}>{a.word}</Text>
                   <View style={{ flex: 1 }} />
                   <Text
                     style={[
                       styles.responseLabel,
-                      { color: a.is_correct ? C.green : C.red },
+                      { color: STATUS_STYLE[attemptStatus(a)].fg },
                     ]}
                   >
-                    {a.is_correct ? "Correct" : "Wrong"}
+                    {STATUS_STYLE[attemptStatus(a)].short}
+                        {a.transcript ? ` · "${cleanTranscript(a.transcript)}"` : ""}
                   </Text>
                 </View>
               ))}
@@ -1689,14 +3169,16 @@ export default function SessionDetail() {
             <View style={styles.chunkHeader}>
               <Text style={styles.cardLabel}>DEVICE DISPLAY</Text>
               <Text style={styles.chunkCount}>
-                Chunk {chunkIndex + 1} of {chunks.length}
+                {isCooldown
+                  ? "Display Cleared"
+                  : `Chunk ${chunkIndex + 1} of ${chunks.length}`}
               </Text>
             </View>
 
-            <FiveCellDisplay chunk={chunks[chunkIndex]} />
+            <FiveCellDisplay chunk={isCooldown ? "" : chunks[chunkIndex]} />
 
-            {/* Chunk navigation */}
-            {chunks.length > 1 && (
+            {/* Chunk navigation — strictly local UI preview, decoupled from hardware */}
+            {!isCooldown && chunks.length > 1 && (
               <View style={styles.chunkNavRow}>
                 <Pressable
                   onPress={() => goToChunk(chunkIndex - 1)}
@@ -1706,9 +3188,11 @@ export default function SessionDetail() {
                     pressed && { opacity: 0.7 },
                     chunkIndex === 0 && { opacity: 0.3 },
                   ]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Back (previous chunk)"
                 >
                   <Ionicons name="arrow-back" size={16} color={C.navy} />
-                  <Text style={styles.chunkNavText}>Prev</Text>
+                  <Text style={styles.chunkNavText}>Back</Text>
                 </Pressable>
                 <Pressable
                   onPress={() => goToChunk(chunkIndex + 1)}
@@ -1718,6 +3202,8 @@ export default function SessionDetail() {
                     pressed && { opacity: 0.7 },
                     chunkIndex === chunks.length - 1 && { opacity: 0.3 },
                   ]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Next chunk"
                 >
                   <Text style={styles.chunkNavText}>Next</Text>
                   <Ionicons name="arrow-forward" size={16} color={C.navy} />
@@ -1725,13 +3211,40 @@ export default function SessionDetail() {
               </View>
             )}
             <Text style={styles.deviceHint}>
-              Student presses Next / Back on the device to navigate chunks.
+              {isCooldown
+                ? "Display is cleared for a short break before the next word."
+                : "Use Back / Next to preview chunks locally on your screen without interrupting student devices."}
             </Text>
           </View>
         )}
       </ScrollView>
       {DupWordModal}
       {FinishSessionModal}
+      {/* ── Validation toast (invalid word from send-word check) ─────────── */}
+      <Toast
+        message={validationToast.message}
+        detail={validationToast.detail}
+        visible={validationToast.visible}
+        variant="delete"
+        onDismiss={() => setValidationToast((t) => ({ ...t, visible: false }))}
+      />
+      {/* ── Finish toast ─────────────────────────────────────────────────── */}
+      <Toast
+        message="Session finished"
+        detail={finishToast?.name}
+        visible={!!finishToast}
+        variant="success"
+        onDismiss={() => setFinishToast(null)}
+      />
+      {/* ── Hardware Safety Kill-Switch Toast (60s inactivity) ───────────── */}
+      <Toast
+        message={safetyToast.message}
+        detail={safetyToast.detail}
+        visible={safetyToast.visible}
+        variant="warning"
+        duration={5000}
+        onDismiss={() => setSafetyToast((prev) => ({ ...prev, visible: false }))}
+      />
     </SafeAreaView>
   );
 }
@@ -1836,7 +3349,30 @@ const styles = StyleSheet.create({
     borderColor: C.border,
   },
   studentChipActive: { backgroundColor: C.navy, borderColor: C.navy },
+  studentChipDisabled: {
+    opacity: 0.5,
+    backgroundColor: C.bg,
+    borderColor: C.border,
+  },
   studentChipText: { fontFamily: fonts.heading, fontSize: 13, color: C.ink },
+  studentChipTextDisabled: { color: C.muted },
+  noDeviceBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+    backgroundColor: C.brownBg,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 100,
+    borderWidth: 1,
+    borderColor: "rgba(92, 56, 0, 0.15)",
+  },
+  noDeviceBadgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    color: C.brown,
+    fontWeight: "600",
+  },
   statusDot: { width: 7, height: 7, borderRadius: 4 },
 
   // Word list builder
@@ -1869,6 +3405,75 @@ const styles = StyleSheet.create({
     flex: 1,
     letterSpacing: 1,
   },
+  safetyPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: C.greenBg,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 100,
+  },
+  safetyPillText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    color: C.green,
+    fontWeight: "700",
+  },
+  sequenceWordRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    padding: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+    backgroundColor: C.white,
+  },
+  sequenceWordText: {
+    fontFamily: fonts.mono,
+    fontSize: 15,
+    color: C.navy,
+    flex: 1,
+    letterSpacing: 1,
+  },
+  stepperWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: C.bg,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: C.border,
+    padding: 2,
+    gap: 2,
+  },
+  stepperBtn: {
+    width: 24,
+    height: 24,
+    borderRadius: 6,
+    backgroundColor: C.white,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  stepperBtnDisabled: {
+    opacity: 0.35,
+    backgroundColor: "transparent",
+  },
+  stepperBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+    paddingHorizontal: 6,
+    minWidth: 42,
+    justifyContent: "center",
+  },
+  stepperText: {
+    fontFamily: fonts.mono,
+    fontSize: 12,
+    color: C.navy,
+    fontWeight: "700",
+  },
   deleteBtn: { padding: 6, borderRadius: 8, backgroundColor: C.redBg },
   wordListActions: {
     flexDirection: "row",
@@ -1900,6 +3505,40 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   reorderBtnText: { fontFamily: fonts.heading, fontSize: 14, color: C.navy },
+  shuffleWordsBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    backgroundColor: C.blueWash,
+    borderWidth: 1.5,
+    borderColor: C.navy,
+    borderRadius: 14,
+    paddingVertical: 13,
+    paddingHorizontal: 16,
+  },
+  shuffleWordsBtnText: {
+    fontFamily: fonts.heading,
+    fontSize: 14,
+    color: C.navy,
+  },
+  shuffleHeaderBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: C.blueWash,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 100,
+    borderWidth: 1,
+    borderColor: "rgba(12,68,124,0.25)",
+  },
+  shuffleHeaderBtnText: {
+    fontFamily: fonts.mono,
+    fontSize: 11,
+    fontWeight: "700",
+    color: C.navy,
+  },
 
   // Manual session history
   historyRow: {
@@ -1910,6 +3549,17 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 10,
+  },
+  historyRowActive: {
+    backgroundColor: C.brownBg,
+    borderWidth: 1.5,
+    borderColor: C.amber,
+  },
+  historyRowDone: {
+    backgroundColor: C.greenBg,
+    borderWidth: 1.5,
+    borderColor: C.green,
+    opacity: 0.7,
   },
   historyIndex: {
     fontFamily: fonts.mono,
@@ -1923,6 +3573,46 @@ const styles = StyleSheet.create({
     color: C.navy,
     flex: 1,
     letterSpacing: 1,
+  },
+
+  // Active word badge in WORDS SENT
+  activeWordBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: C.amber,
+    borderRadius: 100,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  activeWordDot: {
+    width: 5,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: "#1A1200",
+  },
+  activeWordBadgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 9,
+    color: "#1A1200",
+    letterSpacing: 0.5,
+  },
+
+  // Completed word badge in WORDS SENT
+  doneWordBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+    backgroundColor: C.greenBg,
+    borderRadius: 100,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+  },
+  doneWordBadgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 9,
+    color: C.green,
+    letterSpacing: 0.5,
   },
 
   // Live attempt badges (shown inline in WORDS SENT and WORD LIST)
@@ -2110,8 +3800,15 @@ const styles = StyleSheet.create({
   // Active view
   activeHeader: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
     justifyContent: "space-between",
+    gap: 8,
+  },
+  activePurpose: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: C.muted,
+    lineHeight: 18,
   },
   liveIndicator: { flexDirection: "row", alignItems: "center", gap: 5 },
   liveDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: C.green },
@@ -2147,6 +3844,28 @@ const styles = StyleSheet.create({
     borderColor: C.border,
     gap: 12,
   },
+  sectionCardError: {
+    borderColor: C.red,
+    backgroundColor: C.redBg,
+  },
+  activeWordErrorBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: C.redBg,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderWidth: 1,
+    borderColor: C.red,
+  },
+  activeWordErrorText: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: C.red,
+    flex: 1,
+    lineHeight: 17,
+  },
   cardLabel: {
     fontFamily: fonts.mono,
     fontSize: 10,
@@ -2166,6 +3885,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 13,
   },
+  wordInputDisabled: {
+    backgroundColor: C.brownBg,
+    borderColor: C.amber,
+    color: C.muted,
+  },
   sendBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -2176,6 +3900,115 @@ const styles = StyleSheet.create({
     paddingVertical: 13,
   },
   sendBtnText: { fontFamily: fonts.heading, fontSize: 14, color: "#1A1200" },
+
+  // Done button (replaces Send while a word is active)
+  doneBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: C.green,
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 13,
+  },
+  doneBtnText: { fontFamily: fonts.heading, fontSize: 14, color: C.white },
+
+  // Live Session manual pacing & prominent Clear Display styles
+  liveCardHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  livePacingBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: C.greenBg,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 100,
+  },
+  livePacingBadgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    fontWeight: "700",
+    color: C.green,
+  },
+  liveControlHint: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: C.muted,
+    lineHeight: 18,
+  },
+  sectionCardActiveLive: {
+    borderColor: C.navy,
+    borderWidth: 2,
+    backgroundColor: C.white,
+  },
+  activeDisplayBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    backgroundColor: C.greenBg,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 100,
+  },
+  activeDisplayBadgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    fontWeight: "700",
+    color: C.green,
+  },
+  activeLiveHero: {
+    backgroundColor: C.blueWash,
+    borderRadius: 14,
+    padding: 16,
+    alignItems: "center",
+    gap: 6,
+    borderWidth: 1.5,
+    borderColor: "rgba(12,68,124,0.2)",
+  },
+  activeLiveWordLabel: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    color: C.muted,
+    letterSpacing: 1.5,
+  },
+  activeLiveWordText: {
+    fontFamily: fonts.mono,
+    fontSize: 32,
+    fontWeight: "700",
+    color: C.navy,
+    letterSpacing: 4,
+  },
+  activeLiveWordSub: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: C.muted,
+    textAlign: "center",
+    lineHeight: 18,
+  },
+  clearDisplayBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    backgroundColor: C.navy,
+    borderRadius: 14,
+    paddingVertical: 15,
+    paddingHorizontal: 20,
+    shadowColor: C.navy,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    elevation: 3,
+  },
+  clearDisplayBtnText: {
+    fontFamily: fonts.heading,
+    fontSize: 15,
+    color: C.white,
+  },
 
   // Word list navigation
   wordNavRow: { flexDirection: "row", alignItems: "center", gap: 12 },
@@ -2196,6 +4029,183 @@ const styles = StyleSheet.create({
     fontSize: 22,
     color: C.navy,
     letterSpacing: 3,
+  },
+
+  // Active Timed Sequence playback card
+  timedCardHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  playbackStateBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 100,
+  },
+  playbackStateDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  playbackStateText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    fontWeight: "700",
+    letterSpacing: 0.3,
+  },
+  timedHeroBox: {
+    backgroundColor: C.bg,
+    borderRadius: 14,
+    padding: 16,
+    alignItems: "center",
+    gap: 10,
+    borderWidth: 1.5,
+    borderColor: C.border,
+  },
+  timedHeroBoxCooldown: {
+    backgroundColor: C.blueWash,
+    borderColor: "rgba(12,68,124,0.3)",
+  },
+  cooldownHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: C.white,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 100,
+    borderWidth: 1,
+    borderColor: "rgba(12,68,124,0.2)",
+  },
+  cooldownBadgeText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    fontWeight: "700",
+    color: C.navy,
+    letterSpacing: 0.8,
+  },
+  cooldownTitleText: {
+    fontFamily: fonts.heading,
+    fontSize: 22,
+    color: C.navy,
+    textAlign: "center",
+  },
+  cooldownSubText: {
+    fontFamily: fonts.body,
+    fontSize: 13,
+    color: C.muted,
+    textAlign: "center",
+  },
+  cooldownNextWordText: {
+    fontFamily: fonts.mono,
+    fontWeight: "700",
+    color: C.navy,
+  },
+  timedWordText: {
+    fontFamily: fonts.mono,
+    fontSize: 28,
+    color: C.navy,
+    letterSpacing: 3,
+    fontWeight: "700",
+  },
+  progressBarTrack: {
+    width: "100%",
+    height: 6,
+    backgroundColor: C.border,
+    borderRadius: 3,
+    overflow: "hidden",
+  },
+  progressBarFill: {
+    height: "100%",
+    backgroundColor: C.amber,
+    borderRadius: 3,
+  },
+  progressBarFillCooldown: {
+    backgroundColor: C.navy,
+  },
+  timerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    width: "100%",
+    paddingTop: 4,
+  },
+  timerMain: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  timerNumber: {
+    fontFamily: fonts.mono,
+    fontSize: 18,
+    color: C.navy,
+    fontWeight: "700",
+  },
+  timerUnit: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: C.muted,
+  },
+  hardwareLimitBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: C.white,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  hardwareLimitText: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    color: C.muted,
+  },
+
+  playbackControlsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  playbackBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 4,
+    backgroundColor: C.white,
+    borderWidth: 1.5,
+    borderColor: C.border,
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+  },
+  playbackBtnDisabled: {
+    opacity: 0.35,
+  },
+  playbackBtnText: {
+    fontFamily: fonts.heading,
+    fontSize: 13,
+    color: C.navy,
+  },
+  playbackBtnPrimary: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    backgroundColor: C.amber,
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+  },
+  playbackBtnPrimaryText: {
+    fontFamily: fonts.heading,
+    fontSize: 14,
+    color: "#1A1200",
   },
 
   // Chunk display
@@ -2459,6 +4469,28 @@ const styles = StyleSheet.create({
     fontFamily: fonts.mono,
     fontSize: 12,
     color: C.ink,
+  },
+  playBtn: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: C.blueWash,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  overrideBtn: {
+    width: 24,
+    height: 22,
+    borderRadius: 6,
+    borderWidth: 1.2,
+    backgroundColor: C.white,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  teacherTag: {
+    fontFamily: fonts.mono,
+    fontSize: 8,
+    color: C.muted,
   },
   reviewVoicePlaceholder: {
     flexDirection: "row",

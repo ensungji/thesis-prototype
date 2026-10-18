@@ -1,7 +1,7 @@
 // mobile/app/(teacher)/sessions/new.tsx
 // Dedicated screen for creating a new session.
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   View,
   Text,
@@ -18,33 +18,95 @@ import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
 import { colors as C, fonts } from "../../../lib/theme";
-
-type SessionType = "manual" | "word_list";
+import { Toast } from "../../../components/Toast";
+import {
+  type SessionType,
+  isTimedSequence,
+  isLiveSession,
+} from "../../../lib/session-timer";
 
 export default function NewSessionScreen() {
   const router = useRouter();
 
   const [name, setName] = useState("");
   const [purpose, setPurpose] = useState("");
-  const [type, setType] = useState<SessionType>("manual");
+  const [type, setType] = useState<SessionType>("live_session");
   const [saving, setSaving] = useState(false);
+  // true  → an in_progress/paused session exists; creation is blocked
+  const [blocked, setBlocked] = useState(false);
+  const [errorToast, setErrorToast] = useState(false);
+
+  /** Check whether the teacher already has an active session. */
+  async function checkForActiveSession(): Promise<boolean> {
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return false;
+    const { count } = await supabase
+      .from("sessions")
+      .select("id", { count: "exact", head: true })
+      .eq("teacher_id", user.id)
+      .in("status", ["in_progress", "paused"]);
+    return (count ?? 0) > 0;
+  }
+
+  // Pre-flight on mount — warn immediately if already blocked.
+  useEffect(() => {
+    checkForActiveSession().then((isBlocked) => {
+      if (isBlocked) {
+        setBlocked(true);
+        setErrorToast(true);
+      }
+    });
+  }, []);
 
   async function createSession() {
     if (!name.trim()) return;
     setSaving(true);
+
+    // ── Pre-flight check ─────────────────────────────────────────────────────
+    const isBlocked = await checkForActiveSession();
+    if (isBlocked) {
+      setBlocked(true);
+      setErrorToast(true);
+      setSaving(false);
+      return;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     const {
       data: { user },
     } = await supabase.auth.getUser();
-    const { data, error } = await supabase
+
+    let sessionType: string = type;
+    let { data, error } = await supabase
       .from("sessions")
       .insert({
         teacher_id: user!.id,
         name: name.trim(),
         purpose: purpose.trim() || null,
-        type,
+        type: sessionType,
       })
       .select("id")
       .single();
+
+    // Fallback if the database has a legacy check constraint
+    if (error && error.message.includes("check")) {
+      sessionType = isTimedSequence(type) ? "word_list" : "manual";
+      const retry = await supabase
+        .from("sessions")
+        .insert({
+          teacher_id: user!.id,
+          name: name.trim(),
+          purpose: purpose.trim() || null,
+          type: sessionType,
+        })
+        .select("id")
+        .single();
+      data = retry.data;
+      error = retry.error;
+    }
+
     setSaving(false);
     if (error || !data) return;
     router.replace(`/(teacher)/sessions/${data.id}` as any);
@@ -118,30 +180,30 @@ export default function NewSessionScreen() {
             <Text style={styles.label}>Session type</Text>
             <View style={styles.typeRow}>
               <Pressable
-                onPress={() => setType("manual")}
+                onPress={() => setType("live_session")}
                 style={[
                   styles.typeBtn,
-                  type === "manual" && styles.typeBtnActive,
+                  isLiveSession(type) && styles.typeBtnActive,
                 ]}
               >
                 <Ionicons
-                  name="create-outline"
+                  name="radio-outline"
                   size={20}
-                  color={type === "manual" ? C.white : C.muted}
+                  color={isLiveSession(type) ? C.white : C.muted}
                 />
                 <View>
                   <Text
                     style={[
                       styles.typeBtnLabel,
-                      type === "manual" && styles.typeBtnLabelActive,
+                      isLiveSession(type) && styles.typeBtnLabelActive,
                     ]}
                   >
-                    Manual
+                    Live Session
                   </Text>
                   <Text
                     style={[
                       styles.typeBtnSub,
-                      type === "manual" && { color: "rgba(255,255,255,0.7)" },
+                      isLiveSession(type) && { color: "rgba(255,255,255,0.7)" },
                     ]}
                   >
                     Type words live
@@ -150,33 +212,33 @@ export default function NewSessionScreen() {
               </Pressable>
 
               <Pressable
-                onPress={() => setType("word_list")}
+                onPress={() => setType("timed_sequence")}
                 style={[
                   styles.typeBtn,
-                  type === "word_list" && styles.typeBtnActive,
+                  isTimedSequence(type) && styles.typeBtnActive,
                 ]}
               >
                 <Ionicons
-                  name="list-outline"
+                  name="timer-outline"
                   size={20}
-                  color={type === "word_list" ? C.white : C.muted}
+                  color={isTimedSequence(type) ? C.white : C.muted}
                 />
                 <View>
                   <Text
                     style={[
                       styles.typeBtnLabel,
-                      type === "word_list" && styles.typeBtnLabelActive,
+                      isTimedSequence(type) && styles.typeBtnLabelActive,
                     ]}
                   >
-                    Word List
+                    Timed Sequence
                   </Text>
                   <Text
                     style={[
                       styles.typeBtnSub,
-                      type === "word_list" && { color: "rgba(255,255,255,0.7)" },
+                      isTimedSequence(type) && { color: "rgba(255,255,255,0.7)" },
                     ]}
                   >
-                    Pre-built list
+                    Timed word sequence
                   </Text>
                 </View>
               </Pressable>
@@ -188,10 +250,10 @@ export default function NewSessionScreen() {
         <View style={styles.footer}>
           <Pressable
             onPress={createSession}
-            disabled={saving || !name.trim()}
+            disabled={saving || !name.trim() || blocked}
             style={({ pressed }) => [
               styles.createBtn,
-              (saving || !name.trim()) && { opacity: 0.5 },
+              (saving || !name.trim() || blocked) && { opacity: 0.5 },
               pressed && { opacity: 0.85 },
             ]}
           >
@@ -206,6 +268,16 @@ export default function NewSessionScreen() {
           </Pressable>
         </View>
       </KeyboardAvoidingView>
+
+      {/* Active-session block toast — rendered outside KeyboardAvoidingView
+          so it always appears over the footer bar at the bottom. */}
+      <Toast
+        message="Cannot create: Another session is currently active."
+        visible={errorToast}
+        variant="delete"
+        duration={4000}
+        onDismiss={() => setErrorToast(false)}
+      />
     </SafeAreaView>
   );
 }

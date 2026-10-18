@@ -32,6 +32,11 @@ export const colors = {
 
   // Labels / mono text
   brown: "#5C3800",
+
+  // Difficulty tier — solid chip backgrounds (active state)
+  // Medium reuses `amber` (#EF9F27) — no new token needed.
+  diffEasy: "#27AE60",   // vibrant green  — Easy active chip / badge
+  diffHard: "#D94338",   // red-orange     — Hard active chip / badge
 } as const;
 
 // Exact font family strings loaded in _layout.tsx.

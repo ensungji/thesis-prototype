@@ -15,8 +15,11 @@ import {
   RefreshControl,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useRouter } from "expo-router";
-import { useFocusEffect } from "@react-navigation/native";
+// FIX (nav-audit): useFocusEffect MUST come from "expo-router", NOT from
+// "@react-navigation/native". Using the raw React Navigation version bypasses
+// Expo Router's URL state, causing both states to diverge. Any router.push()
+// call that follows a focus event from the wrong hook can produce a black screen.
+import { useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
 import { colors as C, fonts } from "../../../lib/theme";
@@ -151,8 +154,9 @@ export default function StudentsScreen() {
 
   useEffect(() => {
     loadStudents();
+    // Unique name per mount — prevents Supabase channel cache collisions.
     const channel = supabase
-      .channel("students-realtime")
+      .channel(`students-realtime-${Date.now()}`)
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "students" },
@@ -388,6 +392,7 @@ const styles = StyleSheet.create({
   },
 
   modalOverlay: { flex: 1, justifyContent: "flex-end" },
+  keyboardSheet: { width: "100%" },
   backdrop: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: "rgba(0,0,0,0.45)",

@@ -21,7 +21,11 @@ import { Toast } from "../../../components/Toast";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type SessionType = "manual" | "word_list";
+import {
+  type SessionType,
+  getSessionTypeLabel,
+} from "../../../lib/session-timer";
+
 type SessionStatus = "pending" | "in_progress" | "paused" | "finished";
 
 type Session = {
@@ -82,7 +86,7 @@ function SessionCard({
           </View>
           <View style={[styles.badge, { backgroundColor: C.bg }]}>
             <Text style={[styles.badgeText, { color: C.muted }]}>
-              {session.type === "word_list" ? "Word List" : "Manual"}
+              {getSessionTypeLabel(session.type)}
             </Text>
           </View>
           <Text style={styles.dateText}>{formatDate(session.created_at)}</Text>
@@ -103,6 +107,7 @@ export default function SessionsScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [toast, setToast] = useState<{ name: string } | null>(null);
+  const [errorToast, setErrorToast] = useState(false);
 
   // Show toast when arriving back after a deletion
   useEffect(() => {
@@ -110,6 +115,12 @@ export default function SessionsScreen() {
       setToast({ name: deletedName });
     }
   }, [deletedName]);
+
+  // A session is "active" if it is in-progress or paused — teacher must
+  // end it before creating a new one.
+  const hasActiveSession = sessions.some(
+    (s) => s.status === "in_progress" || s.status === "paused",
+  );
 
   const loadSessions = useCallback(async () => {
     const {
@@ -170,12 +181,28 @@ export default function SessionsScreen() {
       <View style={styles.header}>
         <Text style={styles.title}>Sessions</Text>
         <Pressable
-          onPress={() => router.push("/(teacher)/sessions/new" as any)}
-          style={({ pressed }) => [styles.addBtn, pressed && { opacity: 0.85 }]}
+          onPress={() => {
+            if (hasActiveSession) {
+              setErrorToast(true);
+              return;
+            }
+            router.push("/(teacher)/sessions/new" as any);
+          }}
+          style={({ pressed }) => [
+            styles.addBtn,
+            hasActiveSession && styles.addBtnDisabled,
+            pressed && !hasActiveSession && { opacity: 0.85 },
+          ]}
           accessibilityRole="button"
+          accessibilityState={{ disabled: hasActiveSession }}
+          accessibilityHint={
+            hasActiveSession
+              ? "End the current active session before creating a new one"
+              : undefined
+          }
         >
-          <Ionicons name="add" size={18} color="#1A1200" />
-          <Text style={styles.addBtnText}>New</Text>
+          <Ionicons name="add" size={18} color={hasActiveSession ? C.muted : "#1A1200"} />
+          <Text style={[styles.addBtnText, hasActiveSession && styles.addBtnTextDisabled]}>New</Text>
         </Pressable>
       </View>
 
@@ -219,6 +246,13 @@ export default function SessionsScreen() {
         variant="delete"
         onDismiss={() => setToast(null)}
       />
+      <Toast
+        message="Cannot create: Another session is currently active."
+        visible={errorToast}
+        variant="delete"
+        duration={3500}
+        onDismiss={() => setErrorToast(false)}
+      />
     </SafeAreaView>
   );
 }
@@ -247,7 +281,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 8,
   },
+  addBtnDisabled: {
+    backgroundColor: C.border,
+    opacity: 0.6,
+  },
   addBtnText: { fontFamily: fonts.heading, fontSize: 14, color: "#1A1200" },
+  addBtnTextDisabled: { color: C.muted },
 
   list: { padding: 16, gap: 12, flexGrow: 1 },
 
