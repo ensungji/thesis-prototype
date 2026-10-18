@@ -9,6 +9,7 @@
 //   EXPO_PUBLIC_SUPABASE_ANON_KEY=your-anon-key-from-the-supabase-dashboard
 
 import "react-native-url-polyfill/auto";
+import { AppState } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { createClient } from "@supabase/supabase-js";
 
@@ -27,4 +28,12 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
       eventsPerSecond: 10,
     },
   },
+});
+
+// Refresh the login token only while the app is in front, and right away when
+// it comes back (a phone asleep past the 1-hour token life would otherwise
+// fail its first requests). Supabase's recommended setup for React Native.
+AppState.addEventListener("change", (state) => {
+  if (state === "active") supabase.auth.startAutoRefresh();
+  else supabase.auth.stopAutoRefresh();
 });

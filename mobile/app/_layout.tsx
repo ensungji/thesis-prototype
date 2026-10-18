@@ -44,7 +44,8 @@ export default function RootLayout() {
   // to the same set of Braille hardware.
 
   const clearAllDevicesForUser = useCallback(async (userId: string) => {
-    // Fetch all students with connected devices belonging to this teacher
+    // Fetch every paired device of this teacher's students (whatever its status:
+    // a stale "offline" must not skip the clear)
     const { data: students } = await supabase
       .from("students")
       .select("id, devices(id, status)")
@@ -57,7 +58,7 @@ export default function RootLayout() {
       const devices = (student as any).devices;
       if (Array.isArray(devices)) {
         for (const d of devices) {
-          if (d.status === "connected") connectedDeviceIds.push(d.id);
+          connectedDeviceIds.push(d.id);
         }
       }
     }

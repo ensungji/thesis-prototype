@@ -1,13 +1,13 @@
 // mobile/app/(teacher)/dashboard.tsx
 // Fully wired to Supabase — real profile, real counts, real recent sessions.
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   View, Text, Pressable, ScrollView, Modal,
   StyleSheet, ActivityIndicator, RefreshControl,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useRouter } from "expo-router";
+import { useRouter, useFocusEffect } from "expo-router";
 import { supabase } from "../../lib/supabase";
 import { colors as C, fonts } from "../../lib/theme";
 import { BrailleCell } from "../../components/BrailleCell";
@@ -102,16 +102,36 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadDashboard();
-
-    // Unique name per mount — prevents Supabase channel cache collisions.
-    const channel = supabase
-      .channel(`dashboard-realtime-${Date.now()}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "sessions" }, loadDashboard)
-      .on("postgres_changes", { event: "*", schema: "public", table: "students" }, loadDashboard)
-      .subscribe();
-
-    return () => { supabase.removeChannel(channel); };
   }, [loadDashboard]);
+
+  // Listen only while this screen is open, and let bursts of changes settle
+  // into one reload (same pattern as Analytics)
+  const loadDashboardRef = useRef(loadDashboard);
+  useEffect(() => { loadDashboardRef.current = loadDashboard; });
+  const focusedOnceRef = useRef(false);
+  useFocusEffect(
+    useCallback(() => {
+      // Changes that came in while away: reload once on return
+      if (focusedOnceRef.current) loadDashboardRef.current();
+      focusedOnceRef.current = true;
+
+      let t: ReturnType<typeof setTimeout> | null = null;
+      const schedule = () => {
+        if (t) clearTimeout(t);
+        t = setTimeout(() => loadDashboardRef.current(), 1500);
+      };
+      // Unique name per mount — prevents Supabase channel cache collisions.
+      const channel = supabase
+        .channel(`dashboard-realtime-${Date.now()}`)
+        .on("postgres_changes", { event: "*", schema: "public", table: "sessions" }, schedule)
+        .on("postgres_changes", { event: "*", schema: "public", table: "students" }, schedule)
+        .subscribe();
+      return () => {
+        if (t) clearTimeout(t);
+        supabase.removeChannel(channel);
+      };
+    }, [])
+  );
 
   async function signOut() {
     // Clear active device claim so next login doesn't falsely detect a conflict

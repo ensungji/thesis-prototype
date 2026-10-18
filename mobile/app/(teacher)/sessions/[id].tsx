@@ -16,19 +16,22 @@ import {
   ActivityIndicator,
   RefreshControl,
   AppState,
+  Alert,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useLocalSearchParams, useRouter, useFocusEffect } from "expo-router";
+import { useLocalSearchParams, useRouter, useFocusEffect, useNavigation } from "expo-router";
+import { usePreventRemove } from "@react-navigation/native";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
 import { updateOrQueue, insertOrQueue, newId } from "../../../lib/outbox";
 import { logEvent } from "../../../lib/logger";
-import { isOnline } from "../../../lib/network";
+import { isOnline, subscribeOnline } from "../../../lib/network";
 import { onDevicePresence, type PresenceEvent } from "../../../lib/device-presence";
 import { colors as C, fonts } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
 import { BrailleLoader } from "../../../components/BrailleLoader";
 import { Toast } from "../../../components/Toast";
+import { Countdown } from "../../../components/Countdown";
 import { wordToChunks, getPattern, isValidWord } from "../../../lib/braille";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useKeepAwake } from "expo-keep-awake";
@@ -388,7 +391,6 @@ export default function SessionDetail() {
   // ── Timed Sequence Auto-Cycle playback state ────────────────────────────────
   const [isPlaying, setIsPlaying] = useState(true);
   const [isCooldown, setIsCooldown] = useState(false);
-  const [timerSecondsLeft, setTimerSecondsLeft] = useState<number>(DEFAULT_WORD_DURATION_SEC);
   const [totalWordSeconds, setTotalWordSeconds] = useState<number>(DEFAULT_WORD_DURATION_SEC);
   const autoCycleTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const isPlayingRef = useRef(true);
@@ -397,6 +399,24 @@ export default function SessionDetail() {
   const wordListIndexRef = useRef(0);
   const sessionWordsRef = useRef<SessionWord[]>([]);
 
+  // The countdown runs off a deadline, not a tick count: Android delays
+  // intervals whenever the JS thread is busy, so counted ticks run long.
+  const deadlineRef = useRef<number | null>(null);     // when the current word / break ends
+  const pausedLeftMsRef = useRef<number | null>(null); // time that was left when it stopped
+
+  function startCountdown(sec: number) {
+    deadlineRef.current = Date.now() + sec * 1000;
+    pausedLeftMsRef.current = null;
+    timerSecondsLeftRef.current = sec;
+  }
+
+  // Read by <Countdown>, which re-renders on its own (not this whole screen)
+  const getCountdownLeftMs = useCallback(() => {
+    if (deadlineRef.current !== null) return deadlineRef.current - Date.now();
+    if (pausedLeftMsRef.current !== null) return pausedLeftMsRef.current;
+    return timerSecondsLeftRef.current * 1000;
+  }, []);
+
   useEffect(() => {
     isPlayingRef.current = isPlaying;
   }, [isPlaying]);
@@ -404,10 +424,6 @@ export default function SessionDetail() {
   useEffect(() => {
     isCooldownRef.current = isCooldown;
   }, [isCooldown]);
-
-  useEffect(() => {
-    timerSecondsLeftRef.current = timerSecondsLeft;
-  }, [timerSecondsLeft]);
 
   useEffect(() => {
     wordListIndexRef.current = wordListIndex;
@@ -503,6 +519,7 @@ export default function SessionDetail() {
   const appStateRef      = useRef(AppState.currentState);
   const sessionStatusRef = useRef<string | null>(null);
   const clearDevicesRef = useRef<(commandType?: string) => Promise<void>>(async () => {});
+  const clearFailedRef = useRef(false); // last clear didn't reach the server
 
   // Latest chunk state for callbacks that outlive a render
   const chunksRef = useRef<string[]>([]);
@@ -548,7 +565,9 @@ export default function SessionDetail() {
       isTimedSequence(session?.type) && (!isPlayingRef.current || isCooldownRef.current);
     const want =
       activeWordIdRef.current && chunkArr.length > 0 && !timedPaused ? chunkArr[idx] ?? "" : "";
-    if (!want || e.showing.toUpperCase() === want.toUpperCase()) {
+    // After an answer upload the device clears its own display on purpose
+    // (firmware v7.2): don't raise the dots again, the teacher re-sends if needed
+    if (!want || e.afterAnswer || e.showing.toUpperCase() === want.toUpperCase()) {
       // Nothing to re-send — just say it's back (if it had been offline)
       if (e.wasOffline) {
         setDeviceToast({
@@ -613,7 +632,7 @@ export default function SessionDetail() {
       ) {
         // Hardware safety: release solenoids before auto-pausing
         stopLiveSafetyTimer();
-        clearDevicesRef.current("session_paused");
+        await clearDevicesRef.current("session_paused");
         // Direct DB update + local state (ref-safe, no stale closure)
         await updateOrQueue("sessions", { status: "paused" }, { id: id! });
         setSession((prev) => (prev ? { ...prev, status: "paused" } : prev));
@@ -622,6 +641,35 @@ export default function SessionDetail() {
     });
     return () => sub.remove();
   }, [id]);
+
+  // ── Ask before leaving a live session (Android back, swipe, header back) ──
+  // Tab presses don't remove this screen; they still pause via the blur cleanup.
+  const navigation = useNavigation();
+  usePreventRemove(session?.status === "in_progress", ({ data }) => {
+    Alert.alert("Leave live session?", "The session will be paused and the display cleared.", [
+      { text: "Stay", style: "cancel" },
+      {
+        text: "Pause & leave",
+        style: "destructive",
+        onPress: async () => {
+          await pauseSession(true);
+          navigation.dispatch(data.action);
+        },
+      },
+    ]);
+  });
+
+  // ── Back online: re-send a clear that failed while offline ─────────────────
+  // A late clear is always safe (a late WORD is not, so words are never re-sent).
+  useEffect(
+    () =>
+      subscribeOnline((online) => {
+        if (online && clearFailedRef.current && sessionStatusRef.current !== "in_progress") {
+          clearDevicesRef.current();
+        }
+      }),
+    []
+  );
 
   // ── Delete session modal ────────────────────────────────────────────────────
   const [deleteSessionModal, setDeleteSessionModal] = useState(false);
@@ -672,7 +720,7 @@ export default function SessionDetail() {
       return;
     }
 
-    const [sessionRes, studentsRes, devicesRes, assignedRes, wordsRes] =
+    const [sessionRes, studentsRes, assignedRes, wordsRes] =
       await Promise.all([
         supabase.from("sessions").select("*").eq("id", id).single(),
         supabase
@@ -680,9 +728,6 @@ export default function SessionDetail() {
           .select("id, full_name")
           .eq("teacher_id", user.id)
           .order("full_name"),
-        supabase
-          .from("devices")
-          .select("id, device_code, status, paired_student_id"),
         supabase
           .from("session_students")
           .select("student_id")
@@ -701,7 +746,15 @@ export default function SessionDetail() {
       return;
     }
 
-    const devicesData = devicesRes.data ?? [];
+    // Only the devices paired to this teacher's students (not every device)
+    const studentIds = (studentsRes.data ?? []).map((s) => s.id);
+    const devicesRes = studentIds.length
+      ? await supabase
+          .from("devices")
+          .select("id, device_code, status, paired_student_id")
+          .in("paired_student_id", studentIds)
+      : null;
+    const devicesData = devicesRes?.data ?? [];
     const merged: Student[] = (studentsRes.data ?? []).map((s) => ({
       ...s,
       device: devicesData.find((d) => d.paired_student_id === s.id) ?? null,
@@ -773,7 +826,11 @@ export default function SessionDetail() {
           words[activeIdx].duration_seconds ?? DEFAULT_WORD_DURATION_SEC
         );
         setTotalWordSeconds(dur);
-        setTimerSecondsLeft(dur);
+        // Seed the countdown only on a fresh start; this runs on every reload,
+        // and must never reset a running or paused countdown
+        if (deadlineRef.current === null && pausedLeftMsRef.current === null) {
+          timerSecondsLeftRef.current = dur;
+        }
       }
 
       // Restore braille display state
@@ -901,10 +958,40 @@ export default function SessionDetail() {
           setSession((prev) => prev ? { ...prev, ...(payload.new as Session) } : prev);
         }
       )
-      // Device connection-status changes (shows live dot colour changes and pairing updates)
+      // New word attempts (student responses appear live during a session)
       .on(
         "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "devices" },
+        { event: "INSERT", schema: "public", table: "word_attempts", filter: `session_id=eq.${id}` },
+        (payload) => {
+          const attempt = payload.new as WordAttempt;
+          setLiveAttempts((prev) =>
+            prev.some((a) => a.id === attempt.id) ? prev : [attempt, ...prev]
+          );
+        }
+      )
+      .subscribe();
+
+    return () => {
+      // Removes only THIS invocation's channel — the unique name ensures we
+      // never accidentally remove a channel belonging to a newer mount.
+      supabase.removeChannel(channel);
+    };
+  }, [id]);
+
+  // Device connection-status changes (live dot colour and pairing updates),
+  // only for the devices of this class — re-subscribes when that list changes
+  const deviceIdsKey = allStudents
+    .map((s) => s.device?.id)
+    .filter((d): d is string => !!d)
+    .sort()
+    .join(",");
+  useEffect(() => {
+    if (!id || !deviceIdsKey) return;
+    const channel = supabase
+      .channel(`session-devices-${id}-${Date.now()}`)
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "devices", filter: `id=in.(${deviceIdsKey})` },
         (payload) => {
           const updated = payload.new as {
             id: string;
@@ -935,25 +1022,11 @@ export default function SessionDetail() {
           );
         }
       )
-      // New word attempts (student responses appear live during a session)
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "word_attempts", filter: `session_id=eq.${id}` },
-        (payload) => {
-          const attempt = payload.new as WordAttempt;
-          setLiveAttempts((prev) =>
-            prev.some((a) => a.id === attempt.id) ? prev : [attempt, ...prev]
-          );
-        }
-      )
       .subscribe();
-
     return () => {
-      // Removes only THIS invocation's channel — the unique name ensures we
-      // never accidentally remove a channel belonging to a newer mount.
       supabase.removeChannel(channel);
     };
-  }, [id]);
+  }, [id, deviceIdsKey]);
 
 
   // ── Earlier answers (so the feed survives an app reload) ───────────────────
@@ -996,21 +1069,32 @@ export default function SessionDetail() {
     }
 
     // No answer yet → add one (id made here so an offline retry can't duplicate it)
+    const wordUuid = asWordId(wordId);
     const row = {
       id: newId(),
       student_id: student.id,
       session_id: id!,
       word,
-      session_word_id: asWordId(wordId),
+      session_word_id: wordUuid,
       response_time_ms: null,
       attempted_at: new Date().toISOString(),
       ...patch,
     };
     setLiveAttempts((prev) => [row, ...prev]);
-    const { error } = await insertOrQueue("word_attempts", row);
+    // One answer per student per word: if the voice grade got there first, the
+    // insert is skipped and the grade below lands on that row instead
+    const { error } = await insertOrQueue(
+      "word_attempts",
+      row,
+      wordUuid ? { onConflict: "session_word_id,student_id" } : undefined
+    );
     if (error) {
       setLiveAttempts((prev) => prev.filter((a) => a.id !== row.id));
       showValidationToast("Couldn't save grade", error);
+      return;
+    }
+    if (wordUuid) {
+      await updateOrQueue("word_attempts", patch, { session_word_id: wordUuid, student_id: student.id });
     }
   }
 
@@ -1095,8 +1179,10 @@ export default function SessionDetail() {
 
     // 2. Persist new order_index in background to Supabase
     setShuffling(true);
+    let failed = 0;
+    let firstError = "";
     try {
-      await Promise.all(
+      const results = await Promise.all(
         reindexed.map((sw) =>
           supabase
             .from("session_words")
@@ -1104,17 +1190,32 @@ export default function SessionDetail() {
             .eq("id", sw.id)
         )
       );
+      for (const r of results) {
+        if (r.error) {
+          failed++;
+          firstError ||= r.error.message;
+        }
+      }
     } catch (err) {
-      console.error("Failed to persist shuffled word order to database:", err);
+      failed = reindexed.length;
+      firstError = String((err as { message?: string })?.message ?? err);
     } finally {
       setShuffling(false);
+    }
+    if (failed > 0) {
+      // Part of the order may be saved: show what the server really has
+      logEvent("error", "shuffle_save_failed", `Shuffle: ${failed} of ${reindexed.length} positions not saved: ${firstError}`, {
+        session_id: id ?? null,
+      });
+      showValidationToast("Couldn't save the new order", "Showing the order that was saved. Try shuffling again.");
+      await loadData();
     }
   }
 
   // ── Clear braille devices (releases physical solenoids to prevent burnout) ──
   async function clearDevices(commandType: string = "display_chunk") {
     const connectedDevices = allStudents
-      .filter((s) => assignedIds.has(s.id) && s.device?.status === "connected")
+      .filter((s) => assignedIds.has(s.id) && !!s.device) // status may be stale: clear them all
       .map((s) => s.device!.id);
 
     if (connectedDevices.length === 0) return;
@@ -1131,6 +1232,7 @@ export default function SessionDetail() {
       },
     }));
     const { error } = await supabase.from("device_commands").insert(commands);
+    clearFailedRef.current = !!error;
     if (error) {
       logEvent("error", "device_command_failed", `Could not clear devices (${commandType}): ${error.message}`, {
         session_id: id ?? null,
@@ -1258,11 +1360,10 @@ export default function SessionDetail() {
     );
     isCooldownRef.current = false;
     wordListIndexRef.current = newIdx;
-    timerSecondsLeftRef.current = dur;
+    startCountdown(dur);
     setIsCooldown(false);
     setWordListIndex(newIdx);
     setTotalWordSeconds(dur);
-    setTimerSecondsLeft(dur);
     if (id) {
       await saveWordPosition(id, targetWord.word, 0);
     }
@@ -1287,9 +1388,16 @@ export default function SessionDetail() {
       return;
     }
 
+    // (Re)start where it stopped: the time left at the pause, or on a fresh
+    // start / app reload the seconds already set for this word
+    if (deadlineRef.current === null) {
+      deadlineRef.current =
+        Date.now() + (pausedLeftMsRef.current ?? timerSecondsLeftRef.current * 1000);
+      pausedLeftMsRef.current = null;
+    }
+
     autoCycleTimer.current = setInterval(() => {
-      const prev = timerSecondsLeftRef.current;
-      if (prev <= 1) {
+      if ((deadlineRef.current ?? 0) - Date.now() <= 0) {
         if (isCooldownRef.current) {
           // ── Cooldown phase completed: advance to next word ──
           isCooldownRef.current = false;
@@ -1302,9 +1410,8 @@ export default function SessionDetail() {
             const nextDur = clampDuration(
               words[nextIdx]?.duration_seconds ?? DEFAULT_WORD_DURATION_SEC
             );
+            startCountdown(nextDur); // now, so the next tick can't fire this again
             advanceToWord(nextIdx, true);
-            setTimerSecondsLeft(nextDur);
-            timerSecondsLeftRef.current = nextDur;
           } else {
             // Safety fallback: if no next word, auto-finish
             if (autoCycleTimer.current) {
@@ -1326,8 +1433,7 @@ export default function SessionDetail() {
             isCooldownRef.current = true;
             setIsCooldown(true);
             setTotalWordSeconds(COOLDOWN_DURATION_SEC);
-            setTimerSecondsLeft(COOLDOWN_DURATION_SEC);
-            timerSecondsLeftRef.current = COOLDOWN_DURATION_SEC;
+            startCountdown(COOLDOWN_DURATION_SEC);
           } else {
             // Final word in sequence completed active duration:
             // No cooldown needed after the last word -> Auto-finish session!
@@ -1338,17 +1444,18 @@ export default function SessionDetail() {
             executeFinishSession();
           }
         }
-      } else {
-        const nextVal = prev - 1;
-        timerSecondsLeftRef.current = nextVal;
-        setTimerSecondsLeft(nextVal);
       }
-    }, 1000);
+    }, 250);
 
     return () => {
       if (autoCycleTimer.current) {
         clearInterval(autoCycleTimer.current);
         autoCycleTimer.current = null;
+      }
+      // Stopped (pause, Pause Timer, background, leaving, finish): keep what was left
+      if (deadlineRef.current !== null) {
+        pausedLeftMsRef.current = Math.max(0, deadlineRef.current - Date.now());
+        deadlineRef.current = null;
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1433,11 +1540,10 @@ export default function SessionDetail() {
       const dur = clampDuration(firstWord.duration_seconds ?? DEFAULT_WORD_DURATION_SEC);
       isCooldownRef.current = false;
       wordListIndexRef.current = 0;
-      timerSecondsLeftRef.current = dur;
+      startCountdown(dur);
       setIsCooldown(false);
       setWordListIndex(0);
       setTotalWordSeconds(dur);
-      setTimerSecondsLeft(dur);
       setIsPlaying(true);
       await doSendWord(firstWord.word);
     }
@@ -1502,13 +1608,18 @@ export default function SessionDetail() {
       const currentIdx = Math.min(sessionWords.length - 1, Math.max(0, wordListIndex));
       const currentWord = sessionWords[currentIdx];
       const dur = clampDuration(currentWord.duration_seconds ?? DEFAULT_WORD_DURATION_SEC);
-      isCooldownRef.current = false;
-      setIsCooldown(false);
-      setTotalWordSeconds(dur);
-      setTimerSecondsLeft(dur);
-      timerSecondsLeftRef.current = dur;
-      setIsPlaying(true);
-      await doSendWord(currentWord.word);
+      // Pick up where it was paused, with the time that was left
+      if (isCooldownRef.current) {
+        setIsPlaying(true); // the break continues; the display stays clear
+      } else {
+        if (pausedLeftMsRef.current === null && deadlineRef.current === null) {
+          // nothing to pick up (e.g. the app was restarted): the whole word
+          setTotalWordSeconds(dur);
+          startCountdown(dur);
+        }
+        setIsPlaying(true);
+        await doSendWord(currentWord.word);
+      }
     } else if (isLiveSession(session?.type) && activeWordId && lastSentWord) {
       const liveChunks = wordToChunks(lastSentWord);
       // Resume on chunk 0 on hardware — teacher local chunk navigation is decoupled
@@ -1685,10 +1796,10 @@ export default function SessionDetail() {
 
   async function broadcastChunk(chunkArr: string[], idx: number, word: string) {
     const connectedDevices = allStudents
-      .filter((s) => assignedIds.has(s.id) && s.device?.status === "connected")
+      .filter((s) => assignedIds.has(s.id) && !!s.device) // a stale "offline" must not skip a device
       .map((s) => s.device!.id);
 
-    if (connectedDevices.length === 0) return; // no connected devices, UI still shows
+    if (connectedDevices.length === 0) return; // no paired devices, UI still shows
 
     // [REALTIME] ESP32 listens to device_commands via Supabase Realtime
     const commands = connectedDevices.map((device_id) => ({
@@ -3124,6 +3235,8 @@ export default function SessionDetail() {
                   </Text>
                 </Text>
 
+                <Countdown getLeftMs={getCountdownLeftMs}>
+                {(timerSecondsLeft) => (<>
                 {/* Visual progress bar for cooldown */}
                 <View style={styles.progressBarTrack}>
                   <View
@@ -3158,6 +3271,8 @@ export default function SessionDetail() {
                     <Text style={styles.hardwareLimitText}>Display Cleared</Text>
                   </View>
                 </View>
+                </>)}
+                </Countdown>
               </View>
             ) : (
               <View style={styles.timedHeroBox}>
@@ -3168,6 +3283,8 @@ export default function SessionDetail() {
                   {sessionWords[wordListIndex]?.word}
                 </Text>
 
+                <Countdown getLeftMs={getCountdownLeftMs}>
+                {(timerSecondsLeft) => (<>
                 {/* Visual progress bar */}
                 <View style={styles.progressBarTrack}>
                   <View
@@ -3201,6 +3318,8 @@ export default function SessionDetail() {
                     <Text style={styles.hardwareLimitText}>Max 60s coil safe</Text>
                   </View>
                 </View>
+                </>)}
+                </Countdown>
 
               </View>
             )}

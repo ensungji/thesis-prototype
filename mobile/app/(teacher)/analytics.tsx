@@ -7,7 +7,7 @@ import {
   ActivityIndicator, RefreshControl,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useRouter } from "expo-router";
+import { useRouter, useFocusEffect } from "expo-router";
 import { supabase } from "../../lib/supabase";
 import { colors as C, fonts } from "../../lib/theme";
 import { BrailleCell } from "../../components/BrailleCell";
@@ -212,19 +212,30 @@ export default function AnalyticsScreen() {
   const loadAnalyticsRef = React.useRef(loadAnalytics);
   useEffect(() => { loadAnalyticsRef.current = loadAnalytics; });
 
-  useEffect(() => {
-    const channel = supabase
-      .channel(`analytics-realtime-${Date.now()}`)
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "word_attempts" },
-        () => { loadAnalyticsRef.current(); }
-      )
-      .subscribe();
+  // Listen only while this screen is open (tabs keep it mounted during live
+  // sessions), and wait for answers to settle: 20 answers = 1 reload, not 20.
+  const focusedOnceRef = React.useRef(false);
+  useFocusEffect(
+    useCallback(() => {
+      // Answers that came in while away: reload once on return
+      if (focusedOnceRef.current) loadAnalyticsRef.current();
+      focusedOnceRef.current = true;
 
-    return () => { supabase.removeChannel(channel); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+      let t: ReturnType<typeof setTimeout> | null = null;
+      const schedule = () => {
+        if (t) clearTimeout(t);
+        t = setTimeout(() => loadAnalyticsRef.current(), 1500);
+      };
+      const channel = supabase
+        .channel(`analytics-realtime-${Date.now()}`)
+        .on("postgres_changes", { event: "INSERT", schema: "public", table: "word_attempts" }, schedule)
+        .subscribe();
+      return () => {
+        if (t) clearTimeout(t);
+        supabase.removeChannel(channel);
+      };
+    }, [])
+  );
 
   if (loading) {
     return (
