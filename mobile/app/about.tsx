@@ -147,7 +147,7 @@ export default function About() {
       >
         {/* Intro line */}
         <Animated.Text style={[s.intro, { opacity: headerFade }]}>
-          Braille D.O.T.S connects a teacher's phone to a physical braille device —
+          Braille D.O.T.S connects a teacher&apos;s phone to a physical braille device —
           letting students learn by touch.
         </Animated.Text>
 

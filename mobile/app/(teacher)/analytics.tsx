@@ -7,7 +7,7 @@ import {
   ActivityIndicator, RefreshControl,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useRouter } from "expo-router";
+import { useRouter, useFocusEffect } from "expo-router";
 import { supabase } from "../../lib/supabase";
 import { colors as C, fonts } from "../../lib/theme";
 import { BrailleCell } from "../../components/BrailleCell";
@@ -129,14 +129,35 @@ export default function AnalyticsScreen() {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return;
 
-    // Fetch all students for this teacher
-    const { data: students } = await supabase
-      .from("students")
-      .select("id, full_name")
-      .eq("teacher_id", user.id)
-      .order("full_name");
+    // Per-student numbers, computed in the database (teacher_student_stats):
+    // no 1,000-row cap, only the newest answer per student per word counts,
+    // and answers still waiting for review are left out
+    const { data: rows, error: statsError } = await supabase.rpc("teacher_student_stats", {
+      p_since: periodFilter(period),
+    });
 
-    if (!students || students.length === 0) {
+    if (statsError) {
+      // Offline / server problem: keep what's on screen
+      console.warn("analytics load failed:", statsError.message);
+      setLoading(false);
+      setRefreshing(false);
+      return;
+    }
+
+    type StatRow = {
+      student_id: string; full_name: string; total: number;
+      correct: number; avg_response_ms: number; streak: number;
+    };
+    const stats: StudentStat[] = ((rows ?? []) as StatRow[]).map(r => ({
+      id: r.student_id,
+      full_name: r.full_name,
+      total: r.total,
+      correct: r.correct,
+      avgResponseMs: r.avg_response_ms,
+      streak: r.streak,
+    }));
+
+    if (stats.length === 0) {
       setStudentStats([]);
       setSummary(null);
       setLoading(false);
@@ -144,45 +165,14 @@ export default function AnalyticsScreen() {
       return;
     }
 
-    // Fetch word attempts for all students, filtered by period
-    const since = periodFilter(period);
-    let query = supabase
-      .from("word_attempts")
-      .select("student_id, is_correct, response_time_ms, attempted_at")
-      .in("student_id", students.map(s => s.id));
-
-    if (since) query = query.gte("attempted_at", since);
-
-    const { data: attempts } = await query.order("attempted_at", { ascending: false });
-    const allAttempts = attempts ?? [];
-
-    // Compute per-student stats
-    const stats: StudentStat[] = students.map(s => {
-      const mine = allAttempts.filter(a => a.student_id === s.id);
-      const total   = mine.length;
-      const correct = mine.filter(a => a.is_correct).length;
-      const timed   = mine.filter(a => (a.response_time_ms ?? 0) > 0);
-      const avgResponseMs = timed.length > 0
-        ? Math.round(timed.reduce((acc, a) => acc + (a.response_time_ms ?? 0), 0) / timed.length)
-        : 0;
-
-      // Streak: consecutive correct from most recent
-      // Re-fetch in DESC order (already sorted DESC above)
-      let streak = 0;
-      for (const a of mine) {
-        if (a.is_correct) streak++;
-        else break;
-      }
-
-      return { id: s.id, full_name: s.full_name, total, correct, avgResponseMs, streak };
-    });
-
     setStudentStats(stats);
 
-    // Class summary
+    // Class summary. The average is over students WITH answers: a student who
+    // hasn't answered yet has no accuracy, not 0 %.
     const totalWords   = stats.reduce((s, x) => s + x.total, 0);
-    const avgAccuracy  = stats.length > 0
-      ? Math.round(stats.reduce((s, x) => s + (x.total > 0 ? (x.correct / x.total) * 100 : 0), 0) / stats.length)
+    const withAnswers  = stats.filter(x => x.total > 0);
+    const avgAccuracy  = withAnswers.length > 0
+      ? Math.round(withAnswers.reduce((s, x) => s + (x.correct / x.total) * 100, 0) / withAnswers.length)
       : 0;
     const respondingStudents = stats.filter(x => x.avgResponseMs > 0);
     const avgResponseMs = respondingStudents.length > 0
@@ -212,19 +202,30 @@ export default function AnalyticsScreen() {
   const loadAnalyticsRef = React.useRef(loadAnalytics);
   useEffect(() => { loadAnalyticsRef.current = loadAnalytics; });
 
-  useEffect(() => {
-    const channel = supabase
-      .channel(`analytics-realtime-${Date.now()}`)
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "word_attempts" },
-        () => { loadAnalyticsRef.current(); }
-      )
-      .subscribe();
+  // Listen only while this screen is open (tabs keep it mounted during live
+  // sessions), and wait for answers to settle: 20 answers = 1 reload, not 20.
+  const focusedOnceRef = React.useRef(false);
+  useFocusEffect(
+    useCallback(() => {
+      // Answers that came in while away: reload once on return
+      if (focusedOnceRef.current) loadAnalyticsRef.current();
+      focusedOnceRef.current = true;
 
-    return () => { supabase.removeChannel(channel); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+      let t: ReturnType<typeof setTimeout> | null = null;
+      const schedule = () => {
+        if (t) clearTimeout(t);
+        t = setTimeout(() => loadAnalyticsRef.current(), 1500);
+      };
+      const channel = supabase
+        .channel(`analytics-realtime-${Date.now()}`)
+        .on("postgres_changes", { event: "INSERT", schema: "public", table: "word_attempts" }, schedule)
+        .subscribe();
+      return () => {
+        if (t) clearTimeout(t);
+        supabase.removeChannel(channel);
+      };
+    }, [])
+  );
 
   if (loading) {
     return (

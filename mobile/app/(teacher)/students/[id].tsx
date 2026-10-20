@@ -32,6 +32,7 @@ type DeviceOption = {
   status: string;
   paired_student_id: string | null;
   paired_name: string | null;
+  taken: boolean; // paired to someone (maybe another class: then no student id)
 };
 type WordAttempt = {
   id: string;
@@ -227,15 +228,13 @@ export default function StudentDetail() {
 
   // ── Pair device ───────────────────────────────────────────────────────────────
 
-  // Loads every registered device + who it's paired to
+  // Loads every registered device. A device paired to another teacher's
+  // student comes back as taken, without that student's id (list_pairing_devices)
   async function loadDeviceList() {
     setLoadingDevices(true);
-    const { data: devs } = await supabase
-      .from("devices")
-      .select("id, device_code, status, paired_student_id")
-      .order("device_code");
+    const { data: devs } = await supabase.rpc("list_pairing_devices");
 
-    const pairedIds = (devs ?? [])
+    const pairedIds = ((devs ?? []) as { paired_student_id: string | null }[])
       .map((d) => d.paired_student_id)
       .filter((x): x is string => !!x);
 
@@ -244,7 +243,7 @@ export default function StudentDetail() {
       : { data: [] as { id: string; full_name: string }[] };
 
     setDeviceList(
-      (devs ?? []).map((d) => ({
+      ((devs ?? []) as Omit<DeviceOption, "paired_name">[]).map((d) => ({
         ...d,
         paired_name: names?.find((n) => n.id === d.paired_student_id)?.full_name ?? null,
       })),
@@ -263,22 +262,16 @@ export default function StudentDetail() {
     setSaving(true);
     setPairError(null);
 
-    // 1. Release this student's current device (if any)
-    await supabase
-      .from("devices")
-      .update({ paired_student_id: null })
-      .eq("paired_student_id", id);
-
-    // 2. Claim the new one — only if it's still free
-    const { data, error } = await supabase
-      .from("devices")
-      .update({ paired_student_id: id })
-      .eq("id", target.id)
-      .is("paired_student_id", null)
-      .select("id");
+    // Releases this student's current device and claims the new one in one
+    // step on the server. A device with another of your students moves to
+    // this one; it fails (changing nothing) if another teacher has it
+    const { error } = await supabase.rpc("claim_device", {
+      p_device: target.id,
+      p_student: id,
+    });
 
     setSaving(false);
-    if (error || !data?.length) {
+    if (error) {
       setPairError("That device was just paired to someone else. Pick another.");
       loadDeviceList();
       return;
@@ -290,11 +283,13 @@ export default function StudentDetail() {
   async function unpairDevice() {
     if (!id) return;
     setSaving(true);
-    await supabase
-      .from("devices")
-      .update({ paired_student_id: null })
-      .eq("paired_student_id", id);
+    const { error } = await supabase.rpc("release_device", { p_student: id });
     setSaving(false);
+    if (error) {
+      setPairError("Couldn't unpair the device. Check your connection and try again.");
+      setUnpairModal(false);
+      return;
+    }
     setPairModal(false);
     setUnpairModal(false);
     loadData();
@@ -789,7 +784,11 @@ export default function StudentDetail() {
                 <ScrollView style={{ maxHeight: 320 }}>
                   {deviceList.map((d) => {
                     const isMine = d.paired_student_id === id;
-                    const isTaken = !!d.paired_student_id && !isMine;
+                    // With another of MY students: can be moved to this one.
+                    // (Another teacher's device has no student id: "Taken".)
+                    const isMovable = !!d.paired_student_id && !isMine;
+                    const isTaken = d.taken && !isMine && !isMovable;
+                    const holder = d.paired_name?.split(" ")[0] ?? "another student";
                     const online = d.status === "connected";
                     return (
                       <Pressable
@@ -823,21 +822,33 @@ export default function StudentDetail() {
                                 ? C.blueWash
                                 : isTaken
                                   ? C.redBg
-                                  : C.greenBg,
+                                  : isMovable
+                                    ? C.brownBg
+                                    : C.greenBg,
                             },
                           ]}
                         >
                           <Text
                             style={[
                               styles.devBadgeText,
-                              { color: isMine ? C.navy : isTaken ? C.red : C.green },
+                              {
+                                color: isMine
+                                  ? C.navy
+                                  : isTaken
+                                    ? C.red
+                                    : isMovable
+                                      ? C.brown
+                                      : C.green,
+                              },
                             ]}
                           >
                             {isMine
                               ? "Paired to this student"
                               : isTaken
-                                ? `Paired · ${d.paired_name ?? "another student"}`
-                                : "Available"}
+                                ? "Taken"
+                                : isMovable
+                                  ? `With ${holder} — tap to move`
+                                  : "Available"}
                           </Text>
                         </View>
                       </Pressable>

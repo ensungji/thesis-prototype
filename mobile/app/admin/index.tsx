@@ -191,12 +191,22 @@ export default function AdminDashboard() {
     if (!confirmTarget) return;
     setConfirming(true);
     const newState = !confirmTarget.is_active;
-    await supabase
-      .from("profiles")
-      .update({ is_active: newState })
-      .eq("id", confirmTarget.id);
+    // The edge function also bans / unbans the login, so a deactivated
+    // teacher can't sign in or keep refreshing their session
+    const res = await supabase.functions.invoke("set-teacher-active", {
+      body: { teacherId: confirmTarget.id, active: newState },
+    });
     setConfirming(false);
     setConfirmModal(false);
+    if (res.error || res.data?.error) {
+      setToast({
+        message: "Couldn't change the account",
+        detail: res.data?.error ?? res.error?.message ?? "Try again.",
+        variant: "delete",
+      });
+      setConfirmTarget(null);
+      return;
+    }
     loadTeachers();
     setToast({
       message: newState ? "Teacher activated" : "Teacher deactivated",

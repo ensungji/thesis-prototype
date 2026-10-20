@@ -1,0 +1,44 @@
+-- 90 · LATER: lock down what the anon key can do to devices
+-- AUDIT 3.4 and policy review findings 5 and 9.
+--
+-- ┌──────────────────────────────────────────────────────────────────────────┐
+-- │ DO NOT RUN THIS YET. It turns off device registration with the anon key. │
+-- │ Run it only when ALL of these are true:                                  │
+-- │   1. register-device is deployed                                         │
+-- │   2. every device has a row in device_secrets (migration 13)             │
+-- │   3. every device is reflashed with its DEVICE_SECRET (firmware v7.3+)   │
+-- │      and its serial log shows "[REG] HTTP 200" from register-device      │
+-- │   4. the edge-function secret REQUIRE_DEVICE_SECRET is set to "true"     │
+-- │ The file ends in .sql.txt so `supabase db push` won't pick it up. Rename │
+-- │ it to .sql when the time comes.                                          │
+-- └──────────────────────────────────────────────────────────────────────────┘
+
+-- Registration and status now go through register-device (service role)
+drop policy if exists "esp32 insert devices" on public.devices;
+drop policy if exists "esp32 update devices" on public.devices;
+
+-- Nothing inserts into the device_events TABLE: the firmware's button events go
+-- out as Realtime broadcasts on a channel that is merely named
+-- "realtime:public:device_events", and the app never inserts there.
+drop policy if exists "Devices can insert events" on public.device_events;
+
+-- The firmware never writes system_logs (grade-answer logs with the service role).
+drop policy if exists "devices write logs" on public.system_logs;
+
+-- KEPT, on purpose:
+--   "esp32 read commands" (device_commands, anon SELECT)
+--   "esp32 read devices"  (devices, anon SELECT)
+-- The device listens through Realtime postgres_changes with the anon key, and
+-- Realtime only delivers rows the subscriber may SELECT. Without these the
+-- device stops receiving words and pairing changes. They can only be
+-- narrowed once each device signs in with its own JWT (e.g. register-device
+-- returning a short-lived token per device), which is a bigger change.
+-- What they expose: words sent to devices, device codes, status and the
+-- paired student's UUID (not names). The secret hashes are NOT exposed:
+-- they're in device_secrets.
+
+-- ── ROLLBACK ─────────────────────────────────────────────────────────────────
+-- create policy "esp32 insert devices" on public.devices for insert to anon with check (true);
+-- create policy "esp32 update devices" on public.devices for update to anon using (true) with check (true);
+-- create policy "Devices can insert events" on public.device_events for insert to public with check (true);
+-- create policy "devices write logs" on public.system_logs for insert to anon with check (source = 'device');

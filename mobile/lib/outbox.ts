@@ -26,6 +26,7 @@ const KEY = "outbox_v1";
 
 type QueuedUpdate = {
   op?: "update" | "insert";       // missing = update (older queued items)
+  onConflict?: string;            // insert only: columns that make a row "already there" (default id)
   key: string;                    // table + row match, used for merging
   table: string;
   values: Record<string, unknown>;
@@ -98,12 +99,19 @@ async function send(
   values: Record<string, unknown>,
   match: Record<string, string>,
   op: "update" | "insert" = "update",
+  onConflict = "id",
 ) {
-  const { error } =
-    op === "insert"
-      ? // ON CONFLICT DO NOTHING: a row that already arrived is not added twice
-        await supabase.from(table).upsert(values, { onConflict: "id", ignoreDuplicates: true })
-      : await supabase.from(table).update(values).match(match);
+  if (op === "insert") {
+    // ON CONFLICT DO NOTHING: a row that already arrived is not added twice
+    let { error } = await supabase.from(table).upsert(values, { onConflict, ignoreDuplicates: true });
+    // 42P10 = no unique index on those columns yet (migration not run): plain id check
+    if (error?.code === "42P10" && onConflict !== "id") {
+      ({ error } = await supabase.from(table).upsert(values, { onConflict: "id", ignoreDuplicates: true }));
+    }
+    if (error) throw error;
+    return;
+  }
+  const { error } = await supabase.from(table).update(values).match(match);
   if (error) throw error;
 }
 
@@ -124,12 +132,14 @@ export function newId(): string {
 export async function insertOrQueue(
   table: string,
   row: Record<string, unknown> & { id: string },
+  opts?: { onConflict?: string },
 ): Promise<{ queued: boolean; error?: string }> {
   start();
   const queueIt = async () => {
     await load();
     queue.push({
       op: "insert",
+      onConflict: opts?.onConflict,
       key: "insert:" + table + ":" + row.id,
       table,
       values: row,
@@ -144,7 +154,7 @@ export async function insertOrQueue(
     return { queued: true };
   }
   try {
-    await send(table, row, { id: row.id }, "insert");
+    await send(table, row, { id: row.id }, "insert", opts?.onConflict);
     return { queued: false };
   } catch (err) {
     if (isNetworkError(err)) {
@@ -168,6 +178,14 @@ export async function updateOrQueue(
   start();
   if (!isOnline()) {
     await enqueue(table, values, match);
+    return { queued: true };
+  }
+  // An older change to this row is still waiting: merge into it instead of
+  // sending now, or the older one could land after this one and win.
+  await load();
+  if (queue.some((q) => q.key === rowKey(table, match))) {
+    await enqueue(table, values, match);
+    flushOutbox();
     return { queued: true };
   }
   try {
@@ -241,8 +259,11 @@ export async function flushOutbox() {
       const row = item.table + JSON.stringify(item.match);
       if (blockedRows.has(row)) continue;
       try {
-        await send(item.table, item.values, item.match, item.op ?? "update");
-        queue = queue.filter((q) => q !== item); // sent
+        const sentValues = item.values;
+        await send(item.table, sentValues, item.match, item.op ?? "update", item.onConflict);
+        // Something newer was merged in while this was sending (enqueue gives
+        // the item a NEW values object) → keep it for the next pass.
+        if (item.values === sentValues) queue = queue.filter((q) => q !== item); // sent
       } catch (err) {
         if (isNetworkError(err)) {
           networkProblem = true; // connection dropped again — stop for now

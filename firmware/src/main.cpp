@@ -3,6 +3,16 @@
  * BRAILLE D.O.T.S. — FIRMWARE v7.1 (Supabase Realtime + Voice)
  * File: src/main.cpp
  *
+ * v7.3: per-device secret (AUDIT 3.4), only when built with DEVICE_SECRET
+ *       (firmware/secrets.ini): registers through the register-device
+ *       function and sends x-device-secret with every answer
+ * v7.2: production-audit fixes
+ *       - per-coil heat budget across words; forced cooldown when used up
+ *       - "new word" sound plays BEFORE the pins go up (no long full power)
+ *       - display drops before an answer upload (can't hear the app then)
+ *       - coils controlled from the very first lines of setup()
+ *       - answers carry the word they answer (&sw=<session_word_id>)
+ *       - full message logging only with DEBUG_LOG
  * v7.1: "alive" signal every 3 s → the app notices a power cut in ~10 s
  *       (instead of waiting 30–60 s for the server to time out)
  * v7.0: - answers up to 15 s: audio is streamed to the server WHILE the
@@ -74,6 +84,9 @@
 #define SPK_TEST_ON_BOOT 0      // 1 = play a 2-second test tone at boot
 #define CONNECTION_SOUNDS 0     // 1 = also beep on Wi-Fi/server disconnect & reconnect
 
+// Uncomment to print every Realtime message in full (slow: 50-90 ms each)
+// #define DEBUG_LOG
+
 uint8_t* recBuf      = nullptr; // 44-byte WAV header + audio
 size_t   recCapacity = 0;       // audio bytes that fit in recBuf
 
@@ -101,9 +114,20 @@ size_t   recCapacity = 0;       // audio bytes that fit in recBuf
 #define DEVICE_CODE "DOTS-0001"
 #endif
 
+// ── Device secret (AUDIT 3.4) ─────────────────────────────────
+// Set per device in firmware/secrets.ini (never commit it). Proves to the
+// server that answers really come from this device. Without it the device
+// works as before (anon registration, no secret header).
+#ifdef DEVICE_SECRET
+#define DEVICE_SECRET_HEADER "x-device-secret: " DEVICE_SECRET "\r\n"
+#else
+#define DEVICE_SECRET_HEADER ""
+#endif
+
 char deviceId[40] = ""; // UUID from the devices table, fetched at boot
 char pairedStudent[40] = ""; // student UUID this device is paired to ("" = none)
 bool registerDevice();  // defined below
+void publishEvent(const char *eventType, int posIndex, int totalLen); // defined below
 
 #define REALTIME_PATH "/realtime/v1/websocket?apikey=" SUPABASE_KEY "&vsn=1.0.0"
 #define REALTIME_PORT 443
@@ -209,6 +233,19 @@ unsigned long energizedAt = 0;
 // ── Chunk buffer ──────────────────────────────────────────────
 char chunkBuf[6] = "";
 int chunkLen = 0;
+char curWordId[40] = ""; // session_word_id of the word on the display ("" = none)
+
+// ── Heat budget (per coil, builds up across words) ────────────
+// The 60 s timer limits ONE word. This limits words back to back.
+// Hold is counted as full power, so the estimate is on the safe side.
+#define HEAT_LIMIT_MS  75000UL // budget before a forced cooldown (tune on the bench)
+#define HEAT_RESUME_MS 10000UL // words allowed again once every coil is below this
+#define COOL_RATE      2       // 1 ms off removes 2 ms of "heat"
+
+uint8_t curPats[NUM_CELLS] = {0};   // what's latched right now
+uint32_t coilHeat[NUM_CELLS][6] = {};
+bool cooling = false;
+unsigned long lastThermal = 0;
 
 
 
@@ -424,6 +461,7 @@ void oeOff() { analogWrite(PIN_OE, OE_OFF); }
 // Dots 1-6 are on Q2-Q7, hence the << 2.  Push-type: 1 = coil ON = dot UP.
 void shiftCells(const uint8_t *pats)
 {
+  memcpy(curPats, pats, NUM_CELLS);
   digitalWrite(PIN_LATCH, LOW);
   for (int c = NUM_CELLS - 1; c >= 0; c--)
     shiftOut(PIN_DATA, PIN_CLOCK, MSBFIRST, (pats[c] & 0x3F) << 2);
@@ -446,7 +484,45 @@ void clearDisplay()
   chunkLen = 0;
   devState = HOLDING; // stop punch->hold from re-enabling OE
   energized = false;
+  curWordId[0] = '\0';
   Serial.println("[SAFETY] All coils OFF");
+}
+
+// Heat bookkeeping, called from loop(). Coils that are ON gain heat,
+// coils that are OFF lose it COOL_RATE times as fast.
+void thermalTick(unsigned long now)
+{
+  unsigned long dt = now - lastThermal;
+  if (dt < 50)
+    return;
+  lastThermal = now;
+  bool hot = false, cooled = true;
+  for (int c = 0; c < NUM_CELLS; c++)
+    for (int d = 0; d < 6; d++)
+    {
+      uint32_t &h = coilHeat[c][d];
+      if (energized && (curPats[c] & (1 << d)))
+        h += dt;
+      else
+        h = h > dt * COOL_RATE ? h - dt * COOL_RATE : 0;
+      if (h >= HEAT_LIMIT_MS)
+        hot = true;
+      if (h >= HEAT_RESUME_MS)
+        cooled = false;
+    }
+  if (energized && hot)
+  {
+    Serial.println("[SAFETY] Heat budget used up - cooling down");
+    clearDisplay();
+    cooling = true;
+    publishEvent("thermal_cutoff", 0, 0);
+  }
+  else if (cooling && cooled)
+  {
+    Serial.println("[SAFETY] Cooled down - words allowed again");
+    cooling = false;
+    publishEvent("cooled", 0, 0);
+  }
 }
 
 // Show the whole chunk at once: letter i on cell i
@@ -491,7 +567,9 @@ void rtSend(const String &json)
   if (wsConnected)
   {
     wsClient.sendTXT(json.c_str());
+#ifdef DEBUG_LOG
     Serial.printf("→ Supabase: %s\n", json.c_str());
+#endif
   }
   else
   {
@@ -727,10 +805,20 @@ void handleCommand(JsonDocument &doc)
     return;
   }
 
+  if (cooling)
+  { // heat budget used up: refuse words until the coils have cooled
+    Serial.println("[SAFETY] Cooling down - word refused");
+    clearDisplay();
+    PLAY(SND_ERROR);
+    return;
+  }
+
+  strlcpy(curWordId, row["payload"]["session_word_id"] | "", sizeof(curWordId));
+
+  PLAY(SND_NEWWORD); // sound first ("a new word is ready")...
   energized = true;
   energizedAt = millis(); // 60s firmware timer starts per new chunk
-  showChunk();
-  PLAY(SND_NEWWORD); // "a new word is ready"
+  showChunk();            // ...then pins; loop() drops to hold power 100 ms later
 
 }
 
@@ -799,7 +887,9 @@ void onWsEvent(WStype_t type, uint8_t *payload, size_t length)
 
   case WStype_TEXT:
   {
+#ifdef DEBUG_LOG
     Serial.printf("← Supabase: %.*s\n", (int)length, (char *)payload);
+#endif
 
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload, length);
@@ -863,6 +953,18 @@ bool registerDevice()
   client.setInsecure(); // prototype: skip certificate check
   HTTPClient http;
 
+#ifdef DEVICE_SECRET
+  // The register-device function checks our secret, sets status = connected
+  // and answers with the same [{id, paired_student_id}] as the REST call.
+  String url = String("https://") + SUPABASE_HOST + "/functions/v1/register-device";
+  if (!http.begin(client, url))
+    return false;
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-device-secret", DEVICE_SECRET);
+  String body = String("{\"device_code\":\"") + DEVICE_CODE + "\"}";
+#else
   String url = String("https://") + SUPABASE_HOST +
                "/rest/v1/devices?on_conflict=device_code&select=id,paired_student_id";
   if (!http.begin(client, url))
@@ -875,6 +977,7 @@ bool registerDevice()
 
   String body = String("{\"device_code\":\"") + DEVICE_CODE +
                 "\",\"status\":\"connected\"}";
+#endif
   int code = http.POST(body);
   String resp = http.getString();
   http.end();
@@ -1092,7 +1195,9 @@ size_t recordWhileHeld()
 
 void uploadAnswer(size_t dataBytes)
 {
+  String wordId = curWordId; // grab it before clearDisplay() wipes it
   writeWavHeader(recBuf, dataBytes);
+  clearDisplay();            // answered: don't hold coils while we can't hear the app
 
   // Free the realtime connection's memory for this upload.
   // It reconnects by itself ~1s later (see setReconnectInterval).
@@ -1109,20 +1214,27 @@ void uploadAnswer(size_t dataBytes)
 
   String url = String("https://") + SUPABASE_HOST +
                "/functions/v1/grade-answer?device=" + deviceId;
+  if (wordId.length())
+    url += "&sw=" + wordId;
   if (!http.begin(client, url))
   {
     Serial.println("[ANS] Could not start upload");
+    rtPaused = false;
     PLAY(SND_ERROR);
     return;
   }
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
   http.addHeader("apikey", SUPABASE_KEY);
   http.addHeader("Content-Type", "audio/wav");
+#ifdef DEVICE_SECRET
+  http.addHeader("x-device-secret", DEVICE_SECRET);
+#endif
 
   Serial.printf("[ANS] Uploading %u bytes...\n", (unsigned)(dataBytes + 44));
   int code = http.POST(recBuf, dataBytes + 44);
   String resp = http.getString();
   http.end();
+  rtPaused = false; // a later drop is a real drop again
 
   Serial.printf("[ANS] HTTP %d: %s\n", code, resp.c_str());
 
@@ -1273,6 +1385,7 @@ void playResult(int code, const String &resp)
 // Hold ANSWER → record and upload at the same time → grade.
 void streamAnswer()
 {
+  String wordId = curWordId; // grab it before clearDisplay() wipes it
   PLAY(SND_REC_ON); // "I'm listening" — speak after the beep
 
   ringOverflow = false;
@@ -1303,6 +1416,10 @@ void streamAnswer()
     return released;
   };
 
+  // Answered: drop the dots, since commands can't reach us while offline.
+  // The teacher re-sends the word if the student needs to feel it again.
+  clearDisplay();
+
   // Tell the app we're going quiet on purpose, then free the realtime
   // connection's memory for the upload (it reconnects by itself).
   trackPresence("answer");
@@ -1318,10 +1435,12 @@ void streamAnswer()
 
   if (ok)
   {
-    String req = String("POST /functions/v1/grade-answer?device=") + deviceId + " HTTP/1.1\r\n" +
+    String req = String("POST /functions/v1/grade-answer?device=") + deviceId +
+                 (wordId.length() ? String("&sw=") + wordId : String("")) + " HTTP/1.1\r\n" +
                  "Host: " SUPABASE_HOST "\r\n"
                  "Authorization: Bearer " SUPABASE_KEY "\r\n"
                  "apikey: " SUPABASE_KEY "\r\n"
+                 DEVICE_SECRET_HEADER
                  "Content-Type: audio/wav\r\n"
                  "Transfer-Encoding: chunked\r\n"
                  "Connection: close\r\n\r\n";
@@ -1383,12 +1502,14 @@ void streamAnswer()
   if (!ok)
   {
     client.stop();
+    rtPaused = false; // a later drop is a real drop again
     PLAY(SND_ERROR);
     return;
   }
   if (ms < MIN_REC_MS)
   {
     client.stop(); // abort the request — nothing to grade
+    rtPaused = false;
     Serial.println("[ANS] Too short — hold ANSWER while speaking");
     PLAY(SND_ERROR);
     return;
@@ -1398,6 +1519,7 @@ void streamAnswer()
   String resp;
   int code = readResponse(client, resp, 25000);
   client.stop();
+  rtPaused = false;
   playResult(code, resp);
 }
 
@@ -1542,14 +1664,19 @@ void connectWiFi(bool openSetup)
 
 void setup()
 {
-  Serial.begin(115200);
-  delay(500);
-  Serial.println("\n=== BRAILLE D.O.T.S. v7.1 (voice + sound) — Supabase Realtime ===");
-
+  // Coils under control before ANYTHING else (the shift registers wake up
+  // with random values). A 10k pull-up on /OE covers the moment before this.
+  pinMode(PIN_OE, OUTPUT);
+  digitalWrite(PIN_OE, HIGH); // outputs disabled
   pinMode(PIN_DATA, OUTPUT);
   pinMode(PIN_CLOCK, OUTPUT);
   pinMode(PIN_LATCH, OUTPUT);
-  pinMode(PIN_OE, OUTPUT);
+  allCoilsOff();
+
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== BRAILLE D.O.T.S. v7.3 (voice + sound) — Supabase Realtime ===");
+
   pinMode(PIN_LED, OUTPUT);
   buttonInit(btnNext);
   buttonInit(btnBack);
@@ -1683,6 +1810,9 @@ void loop()
     oeHoldPower();
     devState = HOLDING;
   }
+
+  // ── Heat budget across words ──────────────────────────────
+  thermalTick(now);
 
   // ── Firmware kill-switch (backup for app crash) ───────────
   if (energized && now - energizedAt >= SAFETY_MS)

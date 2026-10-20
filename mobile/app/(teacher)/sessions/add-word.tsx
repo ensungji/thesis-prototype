@@ -261,11 +261,16 @@ export default function AddWordScreen() {
     // Hard-cap duration strictly between 5s and 60s (Hardware Safety)
     const safeDuration = clampDuration(duration);
 
-    // Get current word count for order_index
-    const { count } = await supabase
+    // Next order_index = highest existing + 1 (a count would repeat an index
+    // after a word in the middle was deleted)
+    const { data: lastRow } = await supabase
       .from("session_words")
-      .select("id", { count: "exact", head: true })
-      .eq("session_id", sessionId!);
+      .select("order_index")
+      .eq("session_id", sessionId!)
+      .order("order_index", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const nextIndex = (lastRow?.order_index ?? -1) + 1;
 
     // Check for duplicate
     const { data: existing } = await supabase
@@ -290,7 +295,7 @@ export default function AddWordScreen() {
       .insert({
         session_id: sessionId,
         word: w,
-        order_index: count ?? 0,
+        order_index: nextIndex,
         duration_seconds: safeDuration,
       })
       .select("id")
@@ -299,7 +304,7 @@ export default function AddWordScreen() {
     if (insertError && insertError.message.includes("duration_seconds")) {
       const { data: fallbackData } = await supabase
         .from("session_words")
-        .insert({ session_id: sessionId, word: w, order_index: count ?? 0 })
+        .insert({ session_id: sessionId, word: w, order_index: nextIndex })
         .select("id")
         .maybeSingle();
       insertedId = fallbackData?.id ?? null;
