@@ -253,5 +253,16 @@ await check("device_secrets is invisible to anon and teachers", async () => {
   await expectError(as(A, "authenticated", `select * from device_secrets`), /permission denied/);
 });
 
+// ── 14 session_words duration ────────────────────────────────────────────────
+await check("word time defaults to 10 s and must stay within 5–60 s", async () => {
+  const r = await as(null, null, `insert into session_words (session_id, word, order_index)
+    values ('5a000000-0000-0000-0000-000000000000', 'BEE', 3) returning duration_seconds`);
+  eq(r.rows, [{ duration_seconds: 10 }], "default");
+  await as(null, null, `update session_words set duration_seconds = 30 where word = 'BEE' and session_id = '5a000000-0000-0000-0000-000000000000'`);
+  await expectError(as(null, null, `update session_words set duration_seconds = 61 where word = 'BEE'`), /session_words_duration_range/);
+  await expectError(as(null, null, `update session_words set duration_seconds = 4 where word = 'BEE'`), /session_words_duration_range/);
+  await as(null, null, `delete from session_words where word = 'BEE' and session_id = '5a000000-0000-0000-0000-000000000000'`);
+});
+
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);

@@ -36,9 +36,11 @@ import {
   MAX_WORD_DURATION_SEC,
   DEFAULT_WORD_DURATION_SEC,
   clampDuration,
+  resolveWordDuration,
   saveWordDurations,
   loadWordDurations,
 } from "../../../lib/session-timer";
+import { updateOrQueue } from "../../../lib/outbox";
 import DraggableFlatList, {
   ScaleDecorator,
 } from "react-native-draggable-flatlist";
@@ -184,28 +186,22 @@ export default function AddWordScreen() {
       .order("order_index");
 
     if (error && error.message.includes("duration_seconds")) {
+      // No time column on the server: the phone's copy below fills it in
       const { data: fallbackData } = await supabase
         .from("session_words")
         .select("id, word, order_index")
         .eq("session_id", sessionId)
         .order("order_index");
-      words = (fallbackData ?? []).map((sw) => ({
-        ...sw,
-        duration_seconds: DEFAULT_WORD_DURATION_SEC,
-      }));
+      words = fallbackData ?? [];
     } else {
       words = data ?? [];
     }
 
+    // Same rule as the session screen, so this list shows the time it runs with
     const storedDurations = await loadWordDurations(sessionId);
     const resolved = words.map((sw) => ({
       ...sw,
-      duration_seconds: clampDuration(
-        sw.duration_seconds ??
-          storedDurations[sw.id] ??
-          storedDurations[sw.word] ??
-          DEFAULT_WORD_DURATION_SEC
-      ),
+      duration_seconds: resolveWordDuration(sw, storedDurations),
     }));
 
     setSessionWords(resolved);
@@ -227,6 +223,7 @@ export default function AddWordScreen() {
   // ── Update per-word timer ──────────────────────────────────────────────────
   async function updateWordDuration(wordId: string, value: number) {
     const safe = clampDuration(value);
+    const before = sessionWords.find((sw) => sw.id === wordId)?.duration_seconds;
     setSessionWords((prev) =>
       prev.map((sw) => (sw.id === wordId ? { ...sw, duration_seconds: safe } : sw))
     );
@@ -234,10 +231,14 @@ export default function AddWordScreen() {
       const current = await loadWordDurations(sessionId);
       current[wordId] = safe;
       await saveWordDurations(sessionId, current);
-      await supabase
-        .from("session_words")
-        .update({ duration_seconds: safe })
-        .eq("id", wordId);
+      // Offline: saved on the phone and sent when the connection is back
+      const { error } = await updateOrQueue("session_words", { duration_seconds: safe }, { id: wordId });
+      if (error) {
+        setSessionWords((prev) =>
+          prev.map((sw) => (sw.id === wordId ? { ...sw, duration_seconds: before } : sw))
+        );
+        showToast("Couldn't save the time", error, "delete");
+      }
     }
   }
 
@@ -308,6 +309,10 @@ export default function AddWordScreen() {
         .select("id")
         .maybeSingle();
       insertedId = fallbackData?.id ?? null;
+    } else if (insertError) {
+      setErrorModal({ title: "Couldn't add the word", message: insertError.message });
+      setSaving(false);
+      return;
     } else {
       insertedId = insertData?.id ?? null;
     }
@@ -518,7 +523,7 @@ export default function AddWordScreen() {
                   autoCapitalize="characters"
                   autoCorrect={false}
                   returnKeyType="done"
-                  onSubmitEditing={() => addWord(newWord)}
+                  onSubmitEditing={() => addWord(newWord, false, newWordDuration)}
                 />
                 <Text style={styles.hint}>Only letters A–Z (no numbers or symbols).</Text>
               </View>

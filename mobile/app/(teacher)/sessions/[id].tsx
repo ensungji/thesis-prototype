@@ -41,6 +41,7 @@ import {
   MAX_WORD_DURATION_SEC,
   DEFAULT_WORD_DURATION_SEC,
   clampDuration,
+  resolveWordDuration,
   isTimedSequence,
   isLiveSession,
   getSessionTypeLabel,
@@ -763,16 +764,11 @@ export default function SessionDetail() {
     const fetchedSession = sessionRes.data;
     const rawWords = (wordsRes.data ?? []) as SessionWord[];
     const cachedDurations = await loadWordDurations(id);
-    const fetchedWords: SessionWord[] = rawWords.map((sw) => {
-      const dur =
-        sw.duration_seconds ??
-        cachedDurations[sw.id] ??
-        DEFAULT_WORD_DURATION_SEC;
-      return {
-        ...sw,
-        duration_seconds: clampDuration(dur),
-      };
-    });
+    // Same rule as add-word.tsx: the time shown is the time the session runs
+    const fetchedWords: SessionWord[] = rawWords.map((sw) => ({
+      ...sw,
+      duration_seconds: resolveWordDuration(sw, cachedDurations),
+    }));
 
     setSession(fetchedSession);
     setAllStudents(merged);
@@ -1330,28 +1326,24 @@ export default function SessionDetail() {
   // ── Per-word duration stepper logic (strictly 5s - 60s hard-capped) ─────────
   async function updateWordDuration(wordId: string, newSec: number) {
     const clamped = clampDuration(newSec);
+    const before = sessionWords.find((w) => w.id === wordId)?.duration_seconds;
     setSessionWords((prev) =>
       prev.map((w) => (w.id === wordId ? { ...w, duration_seconds: clamped } : w))
     );
 
     if (id) {
-      const updatedMap: Record<string, number> = {};
-      sessionWords.forEach((w) => {
-        updatedMap[w.id] =
-          w.id === wordId
-            ? clamped
-            : (w.duration_seconds ?? DEFAULT_WORD_DURATION_SEC);
-      });
-      await saveWordDurations(id, updatedMap);
+      const cached = await loadWordDurations(id);
+      cached[wordId] = clamped;
+      await saveWordDurations(id, cached);
     }
 
-    try {
-      await supabase
-        .from("session_words")
-        .update({ duration_seconds: clamped })
-        .eq("id", wordId);
-    } catch {
-      // Local cache fallback handles it if column not yet in DB
+    // Offline: saved on the phone and sent when the connection is back
+    const { error } = await updateOrQueue("session_words", { duration_seconds: clamped }, { id: wordId });
+    if (error) {
+      setSessionWords((prev) =>
+        prev.map((w) => (w.id === wordId ? { ...w, duration_seconds: before } : w))
+      );
+      showValidationToast("Couldn't save the time", error);
     }
   }
 

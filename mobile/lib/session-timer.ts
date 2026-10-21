@@ -22,6 +22,20 @@ export function clampDuration(sec?: number | null): number {
   );
 }
 
+/**
+ * The time a word is shown for. Every screen uses this, so what the teacher
+ * sees is what the session runs: the saved value (session_words.duration_seconds),
+ * else this phone's copy (by word id, then by word), else the default.
+ */
+export function resolveWordDuration(
+  sw: { id: string; word: string; duration_seconds?: number | null },
+  cached: Record<string, number> = {}
+): number {
+  return clampDuration(
+    sw.duration_seconds ?? cached[sw.id] ?? cached[sw.word] ?? DEFAULT_WORD_DURATION_SEC
+  );
+}
+
 // ── Session Type Helpers ──────────────────────────────────────────────────────
 // "Live Session" (formerly "Manual")
 // "Timed Sequence" (formerly "Word List")
