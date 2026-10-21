@@ -34,6 +34,7 @@ import { Toast } from "../../../components/Toast";
 import { Countdown } from "../../../components/Countdown";
 import { wordToChunks, getPattern, isValidWord } from "../../../lib/braille";
 import { fisherYatesShuffle, saveWordOrder } from "../../../lib/word-order";
+import { useWordBank, filterWordBank } from "../../../lib/word-bank";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useKeepAwake } from "expo-keep-awake";
 import { createAudioPlayer, type AudioPlayer } from "expo-audio";
@@ -473,6 +474,12 @@ export default function SessionDetail() {
   // Duplicate word modal
   const [dupWordModal, setDupWordModal] = useState(false);
   const [dupWord, setDupWord] = useState("");
+
+  // Live Session: pick a word from the Word Bank (loaded when the sheet opens)
+  const { words: bankWords, loading: loadingBank, error: bankError, reload: reloadWordBank } =
+    useWordBank({ reloadOnFocus: false });
+  const [wordBankSheet, setWordBankSheet] = useState(false);
+  const [bankSearch, setBankSearch] = useState("");
 
   // ── Live attempt feed ───────────────────────────────────────────────────────
   const [liveAttempts, setLiveAttempts] = useState<WordAttempt[]>([]);
@@ -1648,6 +1655,24 @@ export default function SessionDetail() {
     await doSendWord(sanitized);
   }
 
+  function openWordBank() {
+    setBankSearch("");
+    setWordBankSheet(true);
+    reloadWordBank();
+  }
+
+  // A Word Bank word goes through sendWord(), exactly like a typed one
+  // (A–Z check, offline check, "Already sent" prompt)
+  async function pickBankWord(word: string) {
+    setWordBankSheet(false);
+    // Like the typed input, which is hidden while a word is on the display
+    if (activeWordIdRef.current) {
+      showValidationToast("A word is still on the display", "Tap Clear Display first, then pick the next word.");
+      return;
+    }
+    await sendWord(word);
+  }
+
   // Internal: broadcasts the word; also called on "Re-send Anyway"
   async function doSendWord(w: string) {
     let wordId: string | null = null;
@@ -1926,6 +1951,79 @@ export default function SessionDetail() {
               <Text style={styles.btnConfirmText}>Re-send Anyway</Text>
             </Pressable>
           </View>
+        </View>
+      </View>
+    </Modal>
+  );
+
+  // ── WORD BANK SHEET (Live Session) ──────────────────────────────────────────
+  const bankMatches = filterWordBank(bankWords, bankSearch);
+  const WordBankSheet = (
+    <Modal
+      visible={wordBankSheet}
+      animationType="slide"
+      transparent
+      onRequestClose={() => setWordBankSheet(false)}
+    >
+      <View style={styles.modalOverlay}>
+        <Pressable style={styles.backdrop} onPress={() => setWordBankSheet(false)} />
+        <View style={[styles.sheet, styles.bankSheet]}>
+          <View style={styles.handle} />
+          <Text style={styles.sheetTitle}>Word Bank</Text>
+          <View style={styles.bankSearchRow}>
+            <Ionicons name="search-outline" size={16} color={C.muted} />
+            <TextInput
+              style={styles.bankSearchInput}
+              value={bankSearch}
+              onChangeText={setBankSearch}
+              placeholder="Search words..."
+              placeholderTextColor={C.muted}
+              autoCapitalize="characters"
+              autoCorrect={false}
+              returnKeyType="search"
+            />
+            {bankSearch.length > 0 && (
+              <Pressable onPress={() => setBankSearch("")} hitSlop={8} accessibilityLabel="Clear search">
+                <Ionicons name="close-circle" size={16} color={C.muted} />
+              </Pressable>
+            )}
+          </View>
+          {loadingBank && bankWords.length === 0 ? (
+            <ActivityIndicator color={C.navy} style={{ marginTop: 24 }} />
+          ) : bankMatches.length === 0 ? (
+            <Text style={styles.emptyHint}>
+              {bankError && bankWords.length === 0
+                ? "Couldn't load the Word Bank. Check your connection and try again."
+                : bankWords.length === 0
+                ? "Your Word Bank is empty. Add words in the Word Bank tab."
+                : "No matching words."}
+            </Text>
+          ) : (
+            <FlatList
+              data={bankMatches}
+              keyExtractor={(w) => w.id}
+              style={{ flex: 1 }}
+              keyboardShouldPersistTaps="handled"
+              contentContainerStyle={{ gap: 8, paddingBottom: 8 }}
+              renderItem={({ item }) => {
+                const sent = sentWords.has(item.word.toUpperCase());
+                return (
+                  <Pressable
+                    onPress={() => pickBankWord(item.word)}
+                    style={({ pressed }) => [styles.bankRow, pressed && { opacity: 0.7 }]}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Send ${item.word}${sent ? ", already sent" : ""}`}
+                  >
+                    <Text style={styles.bankRowWord}>{item.word.toUpperCase()}</Text>
+                    {item.shared && <Text style={styles.bankRowTag}>Shared</Text>}
+                    {sent && <Text style={[styles.bankRowTag, { color: C.brown }]}>Sent</Text>}
+                    <View style={{ flex: 1 }} />
+                    <Ionicons name="send" size={14} color={C.navy} />
+                  </Pressable>
+                );
+              }}
+            />
+          )}
         </View>
       </View>
     </Modal>
@@ -3030,6 +3128,15 @@ export default function SessionDetail() {
                     }}
                   />
                   <Pressable
+                    onPress={openWordBank}
+                    style={({ pressed }) => [styles.bankBtn, pressed && { opacity: 0.7 }]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Pick a word from the Word Bank"
+                  >
+                    <Ionicons name="library-outline" size={16} color={C.navy} />
+                    <Text style={styles.bankBtnText}>Word Bank</Text>
+                  </Pressable>
+                  <Pressable
                     onPress={() => sendWord(manualWord)}
                     disabled={!manualWord.trim()}
                     style={({ pressed }) => [
@@ -3436,6 +3543,7 @@ export default function SessionDetail() {
           </View>
         )}
       </ScrollView>
+      {WordBankSheet}
       {DupWordModal}
       {FinishSessionModal}
       {/* ── Validation toast (invalid word from send-word check) ─────────── */}
@@ -4137,6 +4245,44 @@ const styles = StyleSheet.create({
     paddingVertical: 13,
   },
   sendBtnText: { fontFamily: fonts.heading, fontSize: 14, color: "#1A1200" },
+
+  // Word Bank button (next to the typed input) + its sheet
+  bankBtn: {
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 2,
+    backgroundColor: C.blueWash,
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    minWidth: 64,
+  },
+  bankBtnText: { fontFamily: fonts.heading, fontSize: 10, color: C.navy },
+  bankSheet: { height: "75%", paddingBottom: 24 },
+  bankSearchRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    backgroundColor: C.bg,
+    borderWidth: 1.5,
+    borderColor: C.border,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  bankSearchInput: { flex: 1, fontFamily: fonts.mono, fontSize: 15, color: C.ink, padding: 0 },
+  bankRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: C.bg,
+    borderWidth: 1.5,
+    borderColor: C.border,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+  },
+  bankRowWord: { fontFamily: fonts.mono, fontSize: 15, color: C.navy, letterSpacing: 1.5 },
+  bankRowTag: { fontFamily: fonts.mono, fontSize: 10, color: C.muted, letterSpacing: 0.5 },
 
   // Done button (replaces Send while a word is active)
   doneBtn: {

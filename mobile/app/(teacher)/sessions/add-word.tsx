@@ -19,7 +19,7 @@ import {
   Switch,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useLocalSearchParams, useRouter, useFocusEffect } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
 import { colors as C, fonts, radius } from "../../../lib/theme";
@@ -42,16 +42,11 @@ import {
 } from "../../../lib/session-timer";
 import { updateOrQueue } from "../../../lib/outbox";
 import { fisherYatesShuffle, saveWordOrder } from "../../../lib/word-order";
+import { useWordBank, filterWordBank, wordDifficulty } from "../../../lib/word-bank";
 import DraggableFlatList, {
   ScaleDecorator,
 } from "react-native-draggable-flatlist";
 
-type WordBankItem = {
-  id: string;
-  word: string;
-  category?: string;
-  difficulty?: string;
-};
 type SessionWord = {
   id: string;
   word: string;
@@ -145,11 +140,10 @@ export default function AddWordScreen() {
     setToast({ visible: true, message, detail, variant });
   }
 
-  // ── Word bank ──────────────────────────────────────────────────────────────
-  const [wordBank, setWordBank] = useState<WordBankItem[]>([]);
+  // ── Word bank (your words + shared words; reloads on focus) ────────────────
+  const { words: wordBank, loading: loadingBank, reload: loadWordBank } = useWordBank();
   const [bankSearch, setBankSearch] = useState("");
   const [diffFilter, setDiffFilter] = useState<Difficulty | null>(null);
-  const [loadingBank, setLoadingBank] = useState(false);
 
   function toggleDiffFilter(d: Difficulty) {
     setDiffFilter((prev) => (prev === d ? null : d));
@@ -164,21 +158,6 @@ export default function AddWordScreen() {
   const [lastAdded, setLastAdded] = useState<{ word: string; seconds: number } | null>(null);
 
   // ── Loaders ────────────────────────────────────────────────────────────────
-  const loadWordBank = useCallback(async () => {
-    setLoadingBank(true);
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) return;
-    const { data } = await supabase
-      .from("word_library")
-      .select("id, word, category, difficulty")
-      .eq("teacher_id", user.id)
-      .order("word");
-    setWordBank(data ?? []);
-    setLoadingBank(false);
-  }, []);
-
   const loadSessionWords = useCallback(async () => {
     if (!sessionId) return;
     setLoadingList(true);
@@ -211,14 +190,6 @@ export default function AddWordScreen() {
     setSessionWords(resolved);
     setLoadingList(false);
   }, [sessionId]);
-
-  // Reload word bank every time this screen comes into focus so that
-  // entries added via the main Word Bank nav are always reflected here.
-  useFocusEffect(
-    useCallback(() => {
-      loadWordBank();
-    }, [loadWordBank])
-  );
 
   useEffect(() => {
     loadSessionWords();
@@ -420,20 +391,7 @@ export default function AddWordScreen() {
     setReordering(false);
   }
 
-  const filteredBank = wordBank.filter((w) => {
-    const matchesSearch = w.word
-      .toLowerCase()
-      .includes(bankSearch.toLowerCase());
-    const effectiveDiff =
-      w.difficulty &&
-      (w.difficulty === "easy" ||
-        w.difficulty === "medium" ||
-        w.difficulty === "hard")
-        ? (w.difficulty as Difficulty)
-        : getDifficultyFromLength(w.word);
-    const matchesDiff = diffFilter ? effectiveDiff === diffFilter : true;
-    return matchesSearch && matchesDiff;
-  });
+  const filteredBank = filterWordBank(wordBank, bankSearch, diffFilter);
 
   const activeMeta = DIFFICULTY_META[effectiveDifficulty];
   const showDifficultySection = newWord.trim().length > 0;
@@ -889,13 +847,7 @@ export default function AddWordScreen() {
                 keyboardShouldPersistTaps="handled"
                 ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
                 renderItem={({ item }) => {
-                  const effectiveDiff =
-                    item.difficulty &&
-                    (item.difficulty === "easy" ||
-                      item.difficulty === "medium" ||
-                      item.difficulty === "hard")
-                      ? (item.difficulty as Difficulty)
-                      : getDifficultyFromLength(item.word);
+                  const effectiveDiff = wordDifficulty(item);
                   const dur = getBankWordDuration(item.id);
                   return (
                     <View style={styles.bankItem}>
