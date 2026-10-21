@@ -50,7 +50,7 @@
  */
 
 #if __has_include("secrets.h")
-#include "secrets.h"   // optional default Wi-Fi (not on GitHub)
+#include "secrets.h" // optional default Wi-Fi (not on GitHub)
 #endif
 #include <Arduino.h>
 #include <WiFi.h>
@@ -62,33 +62,33 @@
 #include <driver/i2s.h>
 
 // ── Microphone (INMP441 on I2S0) ──────────────────────────────
-#define MIC_PORT        I2S_NUM_0
-#define MIC_SCK         32
-#define MIC_WS          33
-#define MIC_SD          35
-#define MIC_CHANNEL     I2S_CHANNEL_FMT_ONLY_RIGHT // L/R tied to GND (ESP32 quirk: data lands in the RIGHT slot)
-#define MIC_SHIFT       14      // 32-bit mic sample → 16-bit. Lower = louder (13 = 2x louder)
-#define SAMPLE_RATE     16000   // what Whisper expects
-#define MAX_ANSWER_SEC  15      // longest answer (streamed while recording)
-#define RING_SEC        2       // RAM buffer that covers the connection set-up (64 KB)
-#define MIN_REC_MS      300     // shorter presses are ignored
-#define STREAM_ANSWERS  1       // 1 = stream (long answers). 0 = old way (2 s max)
+#define MIC_PORT I2S_NUM_0
+#define MIC_SCK 32
+#define MIC_WS 33
+#define MIC_SD 35
+#define MIC_CHANNEL I2S_CHANNEL_FMT_ONLY_RIGHT // L/R tied to GND (ESP32 quirk: data lands in the RIGHT slot)
+#define MIC_SHIFT 14                           // 32-bit mic sample → 16-bit. Lower = louder (13 = 2x louder)
+#define SAMPLE_RATE 16000                      // what Whisper expects
+#define MAX_ANSWER_SEC 15                      // longest answer (streamed while recording)
+#define RING_SEC 2                             // RAM buffer that covers the connection set-up (64 KB)
+#define MIN_REC_MS 300                         // shorter presses are ignored
+#define STREAM_ANSWERS 1                       // 1 = stream (long answers). 0 = old way (2 s max)
 
 // ── Speaker (MAX98357A on I2S1) ───────────────────────────────
-#define SPK_PORT        I2S_NUM_1
-#define SPK_BCLK        27
-#define SPK_LRC         26
-#define SPK_DIN         22
-#define SPK_RATE        16000
-#define SPK_VOLUME      0.25f   // 0.0 – 1.0  (classroom-friendly default)
-#define SPK_TEST_ON_BOOT 0      // 1 = play a 2-second test tone at boot
-#define CONNECTION_SOUNDS 0     // 1 = also beep on Wi-Fi/server disconnect & reconnect
+#define SPK_PORT I2S_NUM_1
+#define SPK_BCLK 27
+#define SPK_LRC 26
+#define SPK_DIN 22
+#define SPK_RATE 16000
+#define SPK_VOLUME 0.25f    // 0.0 – 1.0  (classroom-friendly default)
+#define SPK_TEST_ON_BOOT 0  // 1 = play a 2-second test tone at boot
+#define CONNECTION_SOUNDS 0 // 1 = also beep on Wi-Fi/server disconnect & reconnect
 
 // Uncomment to print every Realtime message in full (slow: 50-90 ms each)
 // #define DEBUG_LOG
 
-uint8_t* recBuf      = nullptr; // 44-byte WAV header + audio
-size_t   recCapacity = 0;       // audio bytes that fit in recBuf
+uint8_t *recBuf = nullptr; // 44-byte WAV header + audio
+size_t recCapacity = 0;    // audio bytes that fit in recBuf
 
 // ── Wi-Fi ─────────────────────────────────────────────────────
 // Order at power-on:
@@ -97,11 +97,11 @@ size_t   recCapacity = 0;       // audio bytes that fit in recBuf
 //   3. BACKUP_SSID / BACKUP_PASS from secrets.h (optional, e.g. a teacher hotspot)
 //   4. setup page: hotspot "<DEVICE_CODE>-SETUP", password SETUP_AP_PASS
 // Hold NEXT + BACK while powering on (3 s) to open the setup page directly.
-#define SETUP_AP_PASS        "dots1234" // min 8 characters
-#define WIFI_TRY_MS          20000UL    // per network
-#define PORTAL_TIMEOUT_S     300        // setup page closes after 5 min, then retries
-#define WIFI_LOST_RESTART_MS 120000UL   // Wi-Fi gone this long → restart
-#define REG_FAILS_TO_SETUP   12         // ~1 min without reaching Supabase → setup page
+#define SETUP_AP_PASS "dots1234"      // min 8 characters
+#define WIFI_TRY_MS 20000UL           // per network
+#define PORTAL_TIMEOUT_S 300          // setup page closes after 5 min, then retries
+#define WIFI_LOST_RESTART_MS 120000UL // Wi-Fi gone this long → restart
+#define REG_FAILS_TO_SETUP 12         // ~1 min without reaching Supabase → setup page
 
 // ── Supabase config ───────────────────────────────────────────
 #define SUPABASE_HOST "nacknvkbcjxuthtycdzj.supabase.co"
@@ -124,9 +124,9 @@ size_t   recCapacity = 0;       // audio bytes that fit in recBuf
 #define DEVICE_SECRET_HEADER ""
 #endif
 
-char deviceId[40] = ""; // UUID from the devices table, fetched at boot
-char pairedStudent[40] = ""; // student UUID this device is paired to ("" = none)
-bool registerDevice();  // defined below
+char deviceId[40] = "";                                               // UUID from the devices table, fetched at boot
+char pairedStudent[40] = "";                                          // student UUID this device is paired to ("" = none)
+bool registerDevice();                                                // defined below
 void publishEvent(const char *eventType, int posIndex, int totalLen); // defined below
 
 #define REALTIME_PATH "/realtime/v1/websocket?apikey=" SUPABASE_KEY "&vsn=1.0.0"
@@ -140,8 +140,8 @@ void publishEvent(const char *eventType, int posIndex, int totalLen); // defined
 // ── Shift register pins ───────────────────────────────────────
 #define PIN_DATA 23
 #define PIN_CLOCK 18
-#define PIN_LATCH 5 // ⚠ UNPLUG BEFORE UPLOAD
-#define PIN_OE 25   // Output Enable (active LOW, PWM)
+#define PIN_LATCH 21 // moved off GPIO5 (no need to unplug before upload anymore)
+#define PIN_OE 25    // Output Enable (active LOW, PWM)
 #define PIN_LED 2
 
 // ── Button pins ───────────────────────────────────────────────
@@ -153,20 +153,20 @@ void publishEvent(const char *eventType, int posIndex, int totalLen); // defined
 // 1 = button connects the pin to GND   (pull-up,   pressed = LOW)
 // 0 = button connects the pin to 3.3V  (pull-down, pressed = HIGH)
 // GND wiring is preferred: stronger internal pull, less noise.
-#define NEXT_TO_GND    0
-#define BACK_TO_GND    0
-#define ANSWER_TO_GND  1
+#define NEXT_TO_GND 0
+#define BACK_TO_GND 0
+#define ANSWER_TO_GND 1
 
 #define NUM_CELLS 5 // 5x 74HC595 + 5x ULN2803, 6 solenoids each
 
 // ── Timing ───────────────────────────────────────────────────
-#define PUNCH_MS 100
+#define PUNCH_MS 250 // was 100: longer full-power push
 #define HEARTBEAT_MS 25000
 #define ALIVE_MS 3000     // "I'm alive" to the app (silence for 10 s = offline)
 #define SAFETY_MS 60000UL // firmware-side kill-switch
 
 #define OE_FULL 0
-#define OE_HOLD 140
+#define OE_HOLD 60 // was 140: lower number = MORE power (about 75% instead of 45%)
 #define OE_OFF 255
 
 // ── Braille patterns ──────────────────────────────────────────
@@ -209,12 +209,12 @@ const uint8_t BRAILLE[26] = {
 // ── WebSocket client ──────────────────────────────────────────
 WebSocketsClient wsClient;
 bool wsConnected = false;
-bool rtPaused = false; // socket closed ON PURPOSE (answer upload) — keep the word
+bool rtPaused = false;  // socket closed ON PURPOSE (answer upload) — keep the word
 bool rtDropped = false; // connection was LOST (not paused) — play "reconnected" when back
 unsigned long lastHeartbeat = 0;
 int joinRef = 1;
 String presenceJoinRef = ""; // ref of our presence join → track when it's accepted
-bool presenceReady = false;   // joined → send "alive" signals
+bool presenceReady = false;  // joined → send "alive" signals
 unsigned long lastAlive = 0;
 
 // ── State machine ─────────────────────────────────────────────
@@ -238,22 +238,20 @@ char curWordId[40] = ""; // session_word_id of the word on the display ("" = non
 // ── Heat budget (per coil, builds up across words) ────────────
 // The 60 s timer limits ONE word. This limits words back to back.
 // Hold is counted as full power, so the estimate is on the safe side.
-#define HEAT_LIMIT_MS  75000UL // budget before a forced cooldown (tune on the bench)
+#define HEAT_LIMIT_MS 75000UL  // budget before a forced cooldown (tune on the bench)
 #define HEAT_RESUME_MS 10000UL // words allowed again once every coil is below this
-#define COOL_RATE      2       // 1 ms off removes 2 ms of "heat"
+#define COOL_RATE 2            // 1 ms off removes 2 ms of "heat"
 
-uint8_t curPats[NUM_CELLS] = {0};   // what's latched right now
+uint8_t curPats[NUM_CELLS] = {0}; // what's latched right now
 uint32_t coilHeat[NUM_CELLS][6] = {};
 bool cooling = false;
 unsigned long lastThermal = 0;
 
-
-
 // ── Button debouncing ─────────────────────────────────────────
 // A press/release only counts if the pin stays steady this long.
 // Filters out electrical noise and contact bounce.
-#define BTN_STABLE_MS  40   // must stay pressed/released this long to count
-#define RELEASE_MS     80   // while recording: released this long = stop
+#define BTN_STABLE_MS 40 // must stay pressed/released this long to count
+#define RELEASE_MS 80    // while recording: released this long = stop
 
 struct Button
 {
@@ -264,11 +262,11 @@ struct Button
   int raw;                 // last raw reading
   unsigned long changedAt; // when raw last changed
 };
-#define PRESSED_LVL(b)  ((b).toGnd ? LOW : HIGH)
+#define PRESSED_LVL(b) ((b).toGnd ? LOW : HIGH)
 #define RELEASED_LVL(b) ((b).toGnd ? HIGH : LOW)
 
-Button btnNext   = {BTN_NEXT,   "NEXT  ", NEXT_TO_GND,   NEXT_TO_GND ? HIGH : LOW,   NEXT_TO_GND ? HIGH : LOW,   0};
-Button btnBack   = {BTN_BACK,   "BACK  ", BACK_TO_GND,   BACK_TO_GND ? HIGH : LOW,   BACK_TO_GND ? HIGH : LOW,   0};
+Button btnNext = {BTN_NEXT, "NEXT  ", NEXT_TO_GND, NEXT_TO_GND ? HIGH : LOW, NEXT_TO_GND ? HIGH : LOW, 0};
+Button btnBack = {BTN_BACK, "BACK  ", BACK_TO_GND, BACK_TO_GND ? HIGH : LOW, BACK_TO_GND ? HIGH : LOW, 0};
 Button btnAnswer = {BTN_ANSWER, "ANSWER", ANSWER_TO_GND, ANSWER_TO_GND ? HIGH : LOW, ANSWER_TO_GND ? HIGH : LOW, 0};
 
 void buttonInit(Button &b)
@@ -323,14 +321,18 @@ void waitForRelease(Button &b)
 
 bool spkReady = false;
 
-enum Wave : uint8_t { SINE, SQUARE };
+enum Wave : uint8_t
+{
+  SINE,
+  SQUARE
+};
 
 struct Note
 {
-  float freq;    // Hz, 0 = silence
-  uint16_t ms;   // length
+  float freq;  // Hz, 0 = silence
+  uint16_t ms; // length
   Wave wave;
-  bool decay;    // true = bell-like fade out, false = steady
+  bool decay; // true = bell-like fade out, false = steady
 };
 
 void spkInit()
@@ -368,7 +370,7 @@ void playNote(const Note &n)
 {
   const uint32_t total = (uint32_t)SPK_RATE * n.ms / 1000;
   const uint32_t ramp = SPK_RATE * 5 / 1000; // 5ms fade in/out → no clicks
-  int16_t buf[256];                           // 128 stereo frames
+  int16_t buf[256];                          // 128 stereo frames
   float phase = 0.0f;
   const float step = 2.0f * PI * n.freq / SPK_RATE;
   uint32_t i = 0;
@@ -421,30 +423,26 @@ void playMelody(const Note *notes, size_t count)
 
 // ── The sound set ─────────────────────────────────────────────
 const Note SND_CORRECT[] = {{1047, 90, SINE, false}, {1319, 90, SINE, false}, {1568, 320, SINE, true}};
-const Note SND_WRONG[]   = {{150, 380, SQUARE, false}};
-const Note SND_REVIEW[]  = {{660, 110, SINE, false}, {0, 70, SINE, false}, {660, 110, SINE, false}};
-const Note SND_REC_ON[]  = {{1500, 60, SINE, false}};
+const Note SND_WRONG[] = {{150, 380, SQUARE, false}};
+const Note SND_REVIEW[] = {{660, 110, SINE, false}, {0, 70, SINE, false}, {660, 110, SINE, false}};
+const Note SND_REC_ON[] = {{1500, 60, SINE, false}};
 const Note SND_REC_OFF[] = {{800, 60, SINE, false}};
 const Note SND_NEWWORD[] = {{880, 120, SINE, true}, {1320, 220, SINE, true}};
-const Note SND_ERROR[]   = {{250, 120, SQUARE, false}, {0, 80, SINE, false},
-                            {250, 120, SQUARE, false}, {0, 80, SINE, false},
-                            {250, 120, SQUARE, false}};
-const Note SND_READY[]   = {{523, 100, SINE, false}, {659, 100, SINE, false}, {784, 220, SINE, true}};
+const Note SND_ERROR[] = {{250, 120, SQUARE, false}, {0, 80, SINE, false}, {250, 120, SQUARE, false}, {0, 80, SINE, false}, {250, 120, SQUARE, false}};
+const Note SND_READY[] = {{523, 100, SINE, false}, {659, 100, SINE, false}, {784, 220, SINE, true}};
 // Connection status
 const Note SND_DISCONNECTED[] = {{659, 120, SINE, false}, {523, 120, SINE, false}, {392, 320, SINE, true}};
-const Note SND_RECONNECTED[]  = {{523, 100, SINE, false}, {784, 220, SINE, true}};
+const Note SND_RECONNECTED[] = {{523, 100, SINE, false}, {784, 220, SINE, true}};
 // Pairing (teacher assigns / removes this device for a student)
-const Note SND_PAIRED[]   = {{784, 150, SINE, false}, {1175, 380, SINE, true}};
+const Note SND_PAIRED[] = {{784, 150, SINE, false}, {1175, 380, SINE, true}};
 const Note SND_UNPAIRED[] = {{1175, 150, SINE, false}, {784, 380, SINE, true}};
 // Session events (sent by the teacher's app)
-const Note SND_START[]    = {{660, 100, SINE, false}, {880, 100, SINE, false}, {1320, 260, SINE, true}};
-const Note SND_PAUSED[]   = {{784, 150, SINE, false}, {523, 280, SINE, true}};
-const Note SND_RESUMED[]  = {{523, 150, SINE, false}, {784, 280, SINE, true}};
-const Note SND_FINISHED[] = {{523, 120, SINE, false}, {659, 120, SINE, false},
-                             {784, 120, SINE, false}, {1047, 480, SINE, true}};
+const Note SND_START[] = {{660, 100, SINE, false}, {880, 100, SINE, false}, {1320, 260, SINE, true}};
+const Note SND_PAUSED[] = {{784, 150, SINE, false}, {523, 280, SINE, true}};
+const Note SND_RESUMED[] = {{523, 150, SINE, false}, {784, 280, SINE, true}};
+const Note SND_FINISHED[] = {{523, 120, SINE, false}, {659, 120, SINE, false}, {784, 120, SINE, false}, {1047, 480, SINE, true}};
 // Wi-Fi setup page is open (teacher must pick a network)
-const Note SND_SETUP[]    = {{440, 150, SINE, false}, {660, 150, SINE, false},
-                             {440, 150, SINE, false}, {660, 300, SINE, true}};
+const Note SND_SETUP[] = {{440, 150, SINE, false}, {660, 150, SINE, false}, {440, 150, SINE, false}, {660, 300, SINE, true}};
 
 #define PLAY(snd) playMelody(snd, sizeof(snd) / sizeof(snd[0]))
 
@@ -663,7 +661,8 @@ void joinPresenceChannel()
                       "\"presence\":{\"key\":\"") +
                deviceId + "\",\"enabled\":true},\"private\":false},"
                           "\"access_token\":\"" SUPABASE_KEY "\"},"
-                          "\"ref\":\"" + presenceJoinRef + "\"}";
+                          "\"ref\":\"" +
+               presenceJoinRef + "\"}";
   rtSend(msg);
 }
 
@@ -681,7 +680,7 @@ void trackPresence(const char *busy = "")
   m["code"] = DEVICE_CODE;
   m["showing"] = chunkBuf; // "" = display is clear
   if (busy[0])
-    m["busy"] = busy;      // e.g. "answer": socket closes for a while on purpose
+    m["busy"] = busy; // e.g. "answer": socket closes for a while on purpose
   String out;
   serializeJson(d, out);
   rtSend(out);
@@ -819,7 +818,6 @@ void handleCommand(JsonDocument &doc)
   energized = true;
   energizedAt = millis(); // 60s firmware timer starts per new chunk
   showChunk();            // ...then pins; loop() drops to hold power 100 ms later
-
 }
 
 void onWsEvent(WStype_t type, uint8_t *payload, size_t length)
@@ -872,7 +870,7 @@ void onWsEvent(WStype_t type, uint8_t *payload, size_t length)
       {
         Serial.println("[RT] Disconnected. Will retry...");
         rtDropped = true;
-        clearDisplay();         // real drop: no way to receive the kill-switch
+        clearDisplay(); // real drop: no way to receive the kill-switch
 #if CONNECTION_SOUNDS
         PLAY(SND_DISCONNECTED); // once per drop, not on every retry
 #endif
@@ -1009,9 +1007,9 @@ bool registerDevice()
 // to the server at the same time. The ring only has to cover the ~1 s
 // it takes to open the secure connection, so answers can be 15 s long.
 int16_t *ring = nullptr;
-size_t ringCap = 0;                // samples
-volatile size_t ringHead = 0;      // total samples written
-volatile size_t ringTail = 0;      // total samples sent
+size_t ringCap = 0;           // samples
+volatile size_t ringHead = 0; // total samples written
+volatile size_t ringTail = 0; // total samples sent
 volatile bool micOn = false;
 volatile bool ringOverflow = false;
 volatile int32_t micPeak = 0;
@@ -1197,7 +1195,7 @@ void uploadAnswer(size_t dataBytes)
 {
   String wordId = curWordId; // grab it before clearDisplay() wipes it
   writeWavHeader(recBuf, dataBytes);
-  clearDisplay();            // answered: don't hold coils while we can't hear the app
+  clearDisplay(); // answered: don't hold coils while we can't hear the app
 
   // Free the realtime connection's memory for this upload.
   // It reconnects by itself ~1s later (see setReconnectInterval).
@@ -1386,7 +1384,7 @@ void playResult(int code, const String &resp)
 void streamAnswer()
 {
   String wordId = curWordId; // grab it before clearDisplay() wipes it
-  PLAY(SND_REC_ON); // "I'm listening" — speak after the beep
+  PLAY(SND_REC_ON);          // "I'm listening" — speak after the beep
 
   ringOverflow = false;
   micPeak = 0;
@@ -1439,8 +1437,7 @@ void streamAnswer()
                  (wordId.length() ? String("&sw=") + wordId : String("")) + " HTTP/1.1\r\n" +
                  "Host: " SUPABASE_HOST "\r\n"
                  "Authorization: Bearer " SUPABASE_KEY "\r\n"
-                 "apikey: " SUPABASE_KEY "\r\n"
-                 DEVICE_SECRET_HEADER
+                 "apikey: " SUPABASE_KEY "\r\n" DEVICE_SECRET_HEADER
                  "Content-Type: audio/wav\r\n"
                  "Transfer-Encoding: chunked\r\n"
                  "Connection: close\r\n\r\n";
@@ -1482,7 +1479,7 @@ void streamAnswer()
     if (n > ringCap - idx)
       n = ringCap - idx; // up to the end of the ring
     if (n > 2048)
-      n = 2048;          // 4 KB per chunk
+      n = 2048; // 4 KB per chunk
     ok = sendChunk(client, (const uint8_t *)(ring + idx), n * 2);
     ringTail += n;
     if (!ok)
