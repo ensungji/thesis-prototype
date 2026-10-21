@@ -135,18 +135,29 @@ function FiveCellDisplay({ chunk }: { chunk: string }) {
 
 // ── Voice answer grading helpers ──────────────────────────────────────────────
 
-type AttemptStatus = "correct" | "wrong" | "review";
+type AttemptStatus = "correct" | "wrong" | "review" | "missed";
 
 function attemptStatus(a: WordAttempt): AttemptStatus {
+  if (a.graded_by === "missed") return "missed"; // saved when the word ended unanswered (counts as wrong)
   if (a.needs_review) return "review";
   return a.is_correct ? "correct" : "wrong";
 }
 
 const STATUS_STYLE: Record<AttemptStatus, { bg: string; fg: string; label: string; short: string }> = {
-  correct: { bg: C.greenBg, fg: C.green, label: "✓ Correct", short: "Correct" },
-  wrong:   { bg: C.redBg,   fg: C.red,   label: "✗ Wrong",   short: "Wrong" },
-  review:  { bg: C.brownBg, fg: C.brown, label: "⚠ Review",  short: "Review" },
+  correct: { bg: C.greenBg, fg: C.green, label: "✓ Correct",   short: "Correct" },
+  wrong:   { bg: C.redBg,   fg: C.red,   label: "✗ Wrong",     short: "Wrong" },
+  review:  { bg: C.brownBg, fg: C.brown, label: "⚠ Review",    short: "Review" },
+  missed:  { bg: C.border,  fg: C.muted, label: "– No answer", short: "No answer" },
 };
+
+// Where a grade change is saved. A "No answer" row is matched on student +
+// word: if a voice answer reached the server first, the row the phone made
+// was never added, and the grade must land on the voice answer instead.
+function attemptMatch(a: WordAttempt): Record<string, string> {
+  return a.graded_by === "missed" && a.session_word_id && a.student_id
+    ? { session_word_id: a.session_word_id, student_id: a.student_id }
+    : { id: a.id };
+}
 
 const cleanTranscript = (t?: string | null) => (t ?? "").replace(/[.!?,]/g, "").trim();
 
@@ -1052,9 +1063,9 @@ export default function SessionDetail() {
     const patch = { is_correct: correct, needs_review: false, graded_by: "teacher" };
 
     if (existing) {
-      // Override the voice grade (or change your own earlier tap)
+      // Override the voice grade or "No answer" (or change your own earlier tap)
       setLiveAttempts((prev) => prev.map((a) => (a.id === existing.id ? { ...a, ...patch } : a)));
-      const { error } = await updateOrQueue("word_attempts", patch, { id: existing.id });
+      const { error } = await updateOrQueue("word_attempts", patch, attemptMatch(existing));
       if (error) {
         setLiveAttempts((prev) => prev.map((a) => (a.id === existing.id ? existing : a)));
         showValidationToast("Couldn't save grade", error);
@@ -1091,6 +1102,78 @@ export default function SessionDetail() {
       await updateOrQueue("word_attempts", patch, { session_word_id: wordUuid, student_id: student.id });
     }
   }
+
+  // ── Word ended: "No answer" for assigned students who didn't answer ────────
+  // Timed: when the word's time runs out. Live: Clear Display, the next word,
+  // or Finish. Counts as wrong (is_correct false). Saved through the outbox
+  // with an id made here, and ON CONFLICT (word, student) DO NOTHING, so a
+  // retry never duplicates it and an answer already on the server is kept.
+  // A later voice answer replaces it (grade-answer); a teacher's grade wins.
+  const noAnswerSavedRef = useRef<Set<string>>(new Set()); // "wordId:studentId"
+  async function recordNoAnswers(sw: { id: string; word: string } | null | undefined) {
+    const wordId = asWordId(sw?.id);
+    if (!sw || !wordId || !id) return;
+    const rows = allStudents
+      .filter((s) => assignedIds.has(s.id) && !!s.device)
+      .filter(
+        (s) =>
+          !noAnswerSavedRef.current.has(`${wordId}:${s.id}`) &&
+          !liveAttempts.some((a) => a.student_id === s.id && a.session_word_id === wordId)
+      )
+      .map((s) => ({
+        id: newId(),
+        student_id: s.id,
+        session_id: id,
+        word: sw.word.toUpperCase(),
+        session_word_id: wordId,
+        is_correct: false,
+        needs_review: false,
+        graded_by: "missed",
+        response_time_ms: null,
+        attempted_at: new Date().toISOString(),
+      }));
+    if (rows.length === 0) return;
+    rows.forEach((r) => noAnswerSavedRef.current.add(`${wordId}:${r.student_id}`));
+    setLiveAttempts((prev) => [...rows, ...prev]);
+
+    let sentNow = false;
+    for (const row of rows) {
+      const { queued, error } = await insertOrQueue("word_attempts", row, {
+        onConflict: "session_word_id,student_id",
+      });
+      if (error) {
+        setLiveAttempts((prev) => prev.filter((a) => a.id !== row.id));
+        noAnswerSavedRef.current.delete(`${wordId}:${row.student_id}`);
+        logEvent("error", "no_answer_not_saved", `Couldn't save "No answer" for ${sw.word}: ${error}`, {
+          session_id: id,
+          meta: { session_word_id: wordId, student_id: row.student_id },
+        });
+      } else if (!queued) {
+        sentNow = true;
+      }
+    }
+    // An answer may have reached the server first (then the "No answer" row
+    // wasn't added): show what the server has for this word
+    if (sentNow) {
+      const { data } = await supabase
+        .from("word_attempts")
+        .select("id, student_id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id")
+        .eq("session_word_id", wordId);
+      if (data) {
+        setLiveAttempts((prev) => [
+          ...(data as WordAttempt[]),
+          ...prev.filter((a) => a.session_word_id !== wordId),
+        ]);
+      }
+    }
+  }
+  // The Timed Sequence timer runs in an interval made earlier: give it the latest
+  const recordNoAnswersRef = useRef(recordNoAnswers);
+  recordNoAnswersRef.current = recordNoAnswers;
+
+  // Live: the word that ends when the next one is sent / the display is
+  // cleared / the session finishes is the newest one sent
+  const lastLiveWord = () => sessionWordsRef.current[sessionWordsRef.current.length - 1];
 
   // ── Student assignment ──────────────────────────────────────────────────────
 
@@ -1276,6 +1359,7 @@ export default function SessionDetail() {
   async function handleClearDisplay() {
     stopLiveSafetyTimer();
     await clearDevices();
+    recordNoAnswers(lastLiveWord()); // the word is over
     if (activeWordId) {
       const newCompleted = new Set(completedWordIds).add(activeWordId);
       setCompletedWordIds(newCompleted);
@@ -1397,6 +1481,7 @@ export default function SessionDetail() {
           const currentIdx = wordListIndexRef.current;
           const words = sessionWordsRef.current;
           const nextIdx = currentIdx + 1;
+          recordNoAnswersRef.current(words[currentIdx]); // time's up: "No answer" for the rest
 
           if (nextIdx < words.length) {
             // Enter 10-second hardware cooldown phase
@@ -1613,6 +1698,7 @@ export default function SessionDetail() {
       autoCycleTimer.current = null;
     }
     await clearDevices("session_finished"); // Release solenoids + finish sound
+    if (isLiveSession(session?.type)) await recordNoAnswers(lastLiveWord()); // the last word is over
     setActiveWordId(null);
     activeWordIdRef.current = null;
     setWordSent(false);
@@ -1680,6 +1766,8 @@ export default function SessionDetail() {
     // Database Persistence: Immediately execute Supabase INSERT into session_words table
     // tied to current session_id. This ensures words appear in the Finished summary.
     if (isLiveSession(session?.type)) {
+      // Sending the next word ends the previous one (e.g. after the 60 s auto-clear)
+      recordNoAnswers(lastLiveWord());
       const orderIdx = sessionWords.length;
       let insertedWord: SessionWord | null = null;
 
@@ -1840,7 +1928,7 @@ export default function SessionDetail() {
           }
         : prev
     );
-    const { error } = await updateOrQueue("word_attempts", patch, { id: attempt.id });
+    const { error } = await updateOrQueue("word_attempts", patch, attemptMatch(attempt));
     if (error) {
       console.error("Override failed:", error);
       if (statsData) openStudentStats(statsData.student); // reload real values
@@ -2900,7 +2988,7 @@ export default function SessionDetail() {
                         </Text>
 
                         {/* Spoken input — recording + what Whisper heard */}
-                        {attempt ? (
+                        {attempt && attempt.graded_by !== "missed" ? (
                           <View style={{ flex: 2, flexDirection: "row", alignItems: "center", gap: 6 }}>
                             <PlayRecordingButton path={attempt.audio_path ?? null} />
                             <Text

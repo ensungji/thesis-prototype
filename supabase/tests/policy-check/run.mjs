@@ -264,5 +264,47 @@ await check("word time defaults to 10 s and must stay within 5–60 s", async ()
   await as(null, null, `delete from session_words where word = 'BEE' and session_id = '5a000000-0000-0000-0000-000000000000'`);
 });
 
+// ── 15 "No answer" rows (graded_by = 'missed') ───────────────────────────────
+const ANA = "a1000000-0000-0000-0000-000000000000";
+const BEN = "a2000000-0000-0000-0000-000000000000";
+const CAT = "11000000-0000-0000-0000-000000000000";
+const missedInsert = (student) => as(A, "authenticated", `insert into word_attempts
+    (id, student_id, session_id, session_word_id, word, is_correct, needs_review, graded_by)
+  values (gen_random_uuid(), '${student}', '5a000000-0000-0000-0000-000000000000', '${CAT}', 'CAT', false, false, 'missed')
+  on conflict (session_word_id, student_id) do nothing`);
+await check("a graded_by check that lists values gets 'missed' added", async () => {
+  await as(null, null, `alter table word_attempts add constraint wa_graded_by_ck check (graded_by in ('auto', 'teacher'))`);
+  await db.exec(readFileSync(join(migDir, "20261022120200_word_attempts_graded_by_missed.sql"), "utf8"));
+  const r = await as(null, null, `select conname from pg_constraint where conrelid = 'word_attempts'::regclass and contype = 'c'`);
+  eq(r.rows.map((x) => x.conname), ["word_attempts_graded_by_check"], "checks");
+  await expectError(as(null, null, `update word_attempts set graded_by = 'bogus' where id = 'f4000000-0000-0000-0000-000000000000'`), /graded_by_check/);
+  await missedInsert(BEN);
+  await as(null, null, `delete from word_attempts where student_id = '${BEN}'`);
+  await as(null, null, `alter table word_attempts drop constraint word_attempts_graded_by_check`);
+});
+await check("No answer: saved once per student and word", async () => {
+  await missedInsert(BEN);
+  await missedInsert(BEN); // a retry from the outbox
+  const r = await as(null, null, `select graded_by, is_correct from word_attempts where student_id = '${BEN}'`);
+  eq(r.rows, [{ graded_by: "missed", is_correct: false }], "rows");
+});
+await check("No answer never replaces an answer that's already there", async () => {
+  await missedInsert(ANA); // Ana's CAT is the teacher's grade
+  const r = await as(null, null, `select graded_by, is_correct from word_attempts where student_id = '${ANA}' and session_word_id = '${CAT}'`);
+  eq(r.rows, [{ graded_by: "teacher", is_correct: true }], "Ana's CAT");
+});
+await check("No answer counts as wrong; a student with only No answer is in the stats", async () => {
+  const r = await as(A, "authenticated", `select total, correct from teacher_student_stats() where full_name = 'Ben'`);
+  eq(r.rows, [{ total: 1, correct: 0 }], "Ben");
+});
+await check("teacher can override a No answer row (matched on student + word)", async () => {
+  const u = await as(A, "authenticated", `update word_attempts set is_correct = true, needs_review = false, graded_by = 'teacher'
+    where session_word_id = '${CAT}' and student_id = '${BEN}' returning id`);
+  eq(u.rows.length, 1, "rows");
+  const r = await as(A, "authenticated", `select total, correct from teacher_student_stats() where full_name = 'Ben'`);
+  eq(r.rows, [{ total: 1, correct: 1 }], "Ben");
+  await as(null, null, `delete from word_attempts where student_id = '${BEN}'`);
+});
+
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);

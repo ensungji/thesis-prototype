@@ -40,6 +40,7 @@ type WordAttempt = {
   is_correct: boolean;
   response_time_ms: number | null;
   attempted_at: string;
+  graded_by?: string | null; // "missed" = no answer before the word ended (counts as wrong)
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -149,7 +150,7 @@ export default function StudentDetail() {
         .maybeSingle(),
       supabase
         .from("word_attempts")
-        .select("id, word, is_correct, response_time_ms, attempted_at")
+        .select("id, word, is_correct, response_time_ms, attempted_at, graded_by")
         .eq("student_id", id)
         .order("attempted_at", { ascending: false })
         .limit(50),
@@ -460,42 +461,32 @@ export default function StudentDetail() {
           </View>
         ) : (
           <View style={styles.attemptList}>
-            {attempts.map((a) => (
-              <View key={a.id} style={styles.attemptRow}>
-                <View
-                  style={[
-                    styles.dot,
-                    { backgroundColor: a.is_correct ? C.green : C.red },
-                  ]}
-                />
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.attemptWord}>{a.word}</Text>
-                  <Text style={styles.attemptDate}>
-                    {formatDate(a.attempted_at)}
-                  </Text>
+            {attempts.map((a) => {
+              const missed = a.graded_by === "missed";
+              const fg = missed ? C.muted : a.is_correct ? C.green : C.red;
+              const bg = missed ? C.border : a.is_correct ? C.greenBg : C.redBg;
+              return (
+                <View key={a.id} style={styles.attemptRow}>
+                  <View style={[styles.dot, { backgroundColor: fg }]} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.attemptWord}>{a.word}</Text>
+                    <Text style={styles.attemptDate}>
+                      {formatDate(a.attempted_at)}
+                    </Text>
+                  </View>
+                  {a.response_time_ms != null && (
+                    <Text style={styles.attemptTime}>
+                      {formatTime(a.response_time_ms)}
+                    </Text>
+                  )}
+                  <View style={[styles.resultBadge, { backgroundColor: bg }]}>
+                    <Text style={[styles.resultBadgeText, { color: fg }]}>
+                      {missed ? "No answer" : a.is_correct ? "Correct" : "Wrong"}
+                    </Text>
+                  </View>
                 </View>
-                {a.response_time_ms != null && (
-                  <Text style={styles.attemptTime}>
-                    {formatTime(a.response_time_ms)}
-                  </Text>
-                )}
-                <View
-                  style={[
-                    styles.resultBadge,
-                    { backgroundColor: a.is_correct ? C.greenBg : C.redBg },
-                  ]}
-                >
-                  <Text
-                    style={[
-                      styles.resultBadgeText,
-                      { color: a.is_correct ? C.green : C.red },
-                    ]}
-                  >
-                    {a.is_correct ? "Correct" : "Wrong"}
-                  </Text>
-                </View>
-              </View>
-            ))}
+              );
+            })}
           </View>
         )}
       </ScrollView>
