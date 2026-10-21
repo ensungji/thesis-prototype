@@ -1864,6 +1864,20 @@ export default function SessionDetail() {
     (s) => assignedIds.has(s.id) && !!s.device
   ).length;
 
+  // What's still needed before Launch Session can be tapped
+  const launchMissing: string[] = [];
+  if (isTimedSequence(session?.type) && sessionWords.length === 0) {
+    launchMissing.push("add at least one word");
+  }
+  if (validPairedAssignedCount === 0) {
+    launchMissing.push(
+      assignedIds.size === 0
+        ? "assign a student with a paired device"
+        : "pair a device to an assigned student"
+    );
+  }
+  const launchBlocked = launchMissing.length > 0;
+
   if (loading) {
     return (
       <SafeAreaView style={styles.safe} edges={["top"]}>
@@ -2416,22 +2430,32 @@ export default function SessionDetail() {
           {/* Launch button */}
           <Pressable
             onPress={launchSession}
-            disabled={saving || validPairedAssignedCount === 0}
+            disabled={saving || launchBlocked}
             style={({ pressed }) => [
               styles.launchBtn,
-              (saving || validPairedAssignedCount === 0) && { opacity: 0.5 },
-              pressed && { opacity: 0.85 },
+              launchBlocked && styles.launchBtnDisabled,
+              saving && { opacity: 0.5 },
+              pressed && !launchBlocked && { opacity: 0.85 },
             ]}
+            accessibilityRole="button"
+            accessibilityState={{ disabled: saving || launchBlocked }}
           >
             {saving ? (
               <ActivityIndicator color="#1A1200" />
             ) : (
               <>
-                <Ionicons name="play" size={18} color="#1A1200" />
-                <Text style={styles.launchBtnText}>Launch Session</Text>
+                <Ionicons name="play" size={18} color={launchBlocked ? C.muted : "#1A1200"} />
+                <Text style={[styles.launchBtnText, launchBlocked && { color: C.muted }]}>
+                  Launch Session
+                </Text>
               </>
             )}
           </Pressable>
+          {launchBlocked && (
+            <Text style={styles.launchHint}>
+              To launch, {launchMissing.join(" and ")}.
+            </Text>
+          )}
         </ScrollView>
 
         {/* ── Delete session modal ───────────────────────────────────────────── */}
@@ -3911,6 +3935,15 @@ const styles = StyleSheet.create({
     backgroundColor: C.amber,
     borderRadius: 14,
     paddingVertical: 16,
+  },
+  launchBtnDisabled: { backgroundColor: C.border },
+  launchHint: {
+    fontFamily: fonts.body,
+    fontSize: 12,
+    color: C.muted,
+    textAlign: "center",
+    marginTop: -6,
+    lineHeight: 18,
   },
   launchBtnText: { fontFamily: fonts.heading, fontSize: 17, color: "#1A1200" },
 
