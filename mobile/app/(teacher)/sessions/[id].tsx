@@ -1181,6 +1181,7 @@ export default function SessionDetail() {
       return;
     }
 
+    const savedOrder = sessionWords; // put back if the new order can't be saved
     const shuffled = fisherYatesShuffle(sessionWords);
     const reindexed: SessionWord[] = shuffled.map((sw, index) => ({
       ...sw,
@@ -1207,11 +1208,13 @@ export default function SessionDetail() {
       setShuffling(false);
     }
     if (saveError) {
+      // Back to the saved order right away (a reload can't fetch it while offline)
+      setSessionWords(savedOrder);
+      sessionWordsRef.current = savedOrder;
       logEvent("error", "shuffle_save_failed", `Shuffle not saved: ${saveError}`, {
         session_id: id ?? null,
       });
       showValidationToast("Couldn't save the new order", "The order is unchanged. Try shuffling again.");
-      await loadData(); // back to the saved order
     }
   }
 
