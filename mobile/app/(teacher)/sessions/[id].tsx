@@ -661,15 +661,6 @@ export default function SessionDetail() {
   // ── Delete session modal ────────────────────────────────────────────────────
   const [deleteSessionModal, setDeleteSessionModal] = useState(false);
   const [deletingSession, setDeletingSession] = useState(false);
-  const [deleteCountdown, setDeleteCountdown] = useState(5);
-
-  // Tick down from 5 whenever the delete modal is open
-  useEffect(() => {
-    if (!deleteSessionModal) return;
-    if (deleteCountdown <= 0) return;
-    const t = setTimeout(() => setDeleteCountdown((c) => c - 1), 1000);
-    return () => clearTimeout(t);
-  }, [deleteSessionModal, deleteCountdown]);
 
   // ── Word delete confirmation ────────────────────────────────────────────────
   const [deleteWordModal, setDeleteWordModal] = useState(false);
@@ -1133,12 +1124,11 @@ export default function SessionDetail() {
   }
 
   function deleteSession() {
-    setDeleteCountdown(5); // reset countdown each time modal opens
     setDeleteSessionModal(true);
   }
 
   async function executeDeleteSession() {
-    if (deleteCountdown > 0) return; // safety guard
+    if (deletingSession) return; // already deleting (double tap)
     setDeletingSession(true);
     const sessionName = session?.name ?? "Session";
     await supabase.from("sessions").delete().eq("id", id!);
@@ -2021,32 +2011,21 @@ export default function SessionDetail() {
             {"This permanently removes the session and all its associated data. This cannot be undone."
             }
           </Text>
-          {deleteCountdown > 0 && (
-            <View style={styles.countdownRow}>
-              <Ionicons name="time-outline" size={14} color={C.muted} />
-              <Text style={styles.countdownText}>
-                Are you sure? You can delete in{" "}
-                <Text style={styles.countdownNumber}>{deleteCountdown}s</Text>
-              </Text>
-            </View>
-          )}
           <View style={styles.sheetActions}>
             <Pressable
               onPress={executeDeleteSession}
-              disabled={deletingSession || deleteCountdown > 0}
+              disabled={deletingSession}
               style={({ pressed }) => [
                 styles.sheetBtn,
                 styles.btnDestructive,
-                (deleteCountdown > 0 || deletingSession) && styles.btnDestructiveDisabled,
-                pressed && deleteCountdown === 0 && { opacity: 0.85 },
+                deletingSession && styles.btnDestructiveDisabled,
+                pressed && !deletingSession && { opacity: 0.85 },
               ]}
             >
               {deletingSession ? (
                 <ActivityIndicator color={C.red} />
               ) : (
-                <Text style={styles.btnDestructiveText}>
-                  {deleteCountdown > 0 ? `Delete (${deleteCountdown})` : "Delete"}
-                </Text>
+                <Text style={styles.btnDestructiveText}>Delete</Text>
               )}
             </Pressable>
             <Pressable
@@ -4611,17 +4590,6 @@ const styles = StyleSheet.create({
   // Not Yet (dismiss) — neutral outline
   btnNotYet: { backgroundColor: C.bg, borderWidth: 1.5, borderColor: C.border },
   btnNotYetText: { fontFamily: fonts.heading, fontSize: 15, color: C.navy },
-  countdownRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    backgroundColor: C.brownBg,
-    borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-  },
-  countdownText: { fontFamily: fonts.body, fontSize: 13, color: C.brown, flex: 1 },
-  countdownNumber: { fontFamily: fonts.heading, fontSize: 13, color: C.brown },
   sheetInput: {
     fontFamily: fonts.body,
     fontSize: 15,
