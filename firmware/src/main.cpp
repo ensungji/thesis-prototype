@@ -1,11 +1,14 @@
 /*
  * ================================================================
- * BRAILLE D.O.T.S. — FIRMWARE v7.1 (Supabase Realtime + Voice)
+ * BRAILLE D.O.T.S. — FIRMWARE v7.3 (Supabase Realtime + Voice)
  * File: src/main.cpp
  *
  * v7.3: per-device secret (AUDIT 3.4), only when built with DEVICE_SECRET
  *       (firmware/secrets.ini): registers through the register-device
  *       function and sends x-device-secret with every answer
+ *       - latch on GPIO21; longer punch, stronger hold
+ *       - heat budget: hold time counts at the hold power (from OE_HOLD),
+ *         and coils cool slower than they heat (COOL_RATE 0.5)
  * v7.2: production-audit fixes
  *       - per-coil heat budget across words; forced cooldown when used up
  *       - "new word" sound plays BEFORE the pins go up (no long full power)
@@ -237,13 +240,19 @@ char curWordId[40] = ""; // session_word_id of the word on the display ("" = non
 
 // ── Heat budget (per coil, builds up across words) ────────────
 // The 60 s timer limits ONE word. This limits words back to back.
-// Hold is counted as full power, so the estimate is on the safe side.
-#define HEAT_LIMIT_MS 75000UL  // budget before a forced cooldown (tune on the bench)
+// "Heat" = ms of on-time at full power: punch counts 1.0 per ms, hold
+// counts HOLD_HEAT_WEIGHT per ms (the share of time OE lets the coil on).
+// One 60 s word adds about 0.25 + 59.75 × 0.76 ≈ 46 s.
+// Cooling is slower than heating, so 60 s words with 10 s breaks trip the
+// cooldown during the 2nd word (46 − 5 + … ≥ 60).
+#define HEAT_LIMIT_MS 60000UL  // budget before a forced cooldown (tune on the bench)
 #define HEAT_RESUME_MS 10000UL // words allowed again once every coil is below this
-#define COOL_RATE 2            // 1 ms off removes 2 ms of "heat"
+#define COOL_RATE 0.5f         // 1 ms off removes 0.5 ms of "heat" (60 → 10 s takes 100 s)
+// OE is active LOW, so the outputs are ON for (255 - OE_HOLD) / 255 of the time
+#define HOLD_HEAT_WEIGHT ((255 - OE_HOLD) / 255.0f) // OE_HOLD 60 → 0.76
 
 uint8_t curPats[NUM_CELLS] = {0}; // what's latched right now
-uint32_t coilHeat[NUM_CELLS][6] = {};
+float coilHeat[NUM_CELLS][6] = {};
 bool cooling = false;
 unsigned long lastThermal = 0;
 
@@ -486,28 +495,42 @@ void clearDisplay()
   Serial.println("[SAFETY] All coils OFF");
 }
 
-// Heat bookkeeping, called from loop(). Coils that are ON gain heat,
-// coils that are OFF lose it COOL_RATE times as fast.
+// Heat bookkeeping, called from loop(). Coils that are ON gain heat at the
+// power they actually get (punch 1.0, hold HOLD_HEAT_WEIGHT); coils that
+// are OFF lose it at COOL_RATE.
 void thermalTick(unsigned long now)
 {
   unsigned long dt = now - lastThermal;
   if (dt < 50)
     return;
   lastThermal = now;
+  const float weight = devState == PUNCHING ? 1.0f : HOLD_HEAT_WEIGHT;
   bool hot = false, cooled = true;
+  float maxHeat = 0;
   for (int c = 0; c < NUM_CELLS; c++)
     for (int d = 0; d < 6; d++)
     {
-      uint32_t &h = coilHeat[c][d];
+      float &h = coilHeat[c][d];
       if (energized && (curPats[c] & (1 << d)))
-        h += dt;
+        h += dt * weight;
       else
         h = h > dt * COOL_RATE ? h - dt * COOL_RATE : 0;
       if (h >= HEAT_LIMIT_MS)
         hot = true;
       if (h >= HEAT_RESUME_MS)
         cooled = false;
+      if (h > maxHeat)
+        maxHeat = h;
     }
+
+  // For tuning HEAT_LIMIT_MS on the bench: the hottest coil every 5 s
+  static unsigned long lastHeatLog = 0;
+  if (maxHeat > 0 && now - lastHeatLog >= 5000)
+  {
+    lastHeatLog = now;
+    Serial.printf("[HEAT] hottest coil %.1f s of %.1f s budget%s\n",
+                  maxHeat / 1000.0f, HEAT_LIMIT_MS / 1000.0f, cooling ? " (cooling down)" : "");
+  }
   if (energized && hot)
   {
     Serial.println("[SAFETY] Heat budget used up - cooling down");

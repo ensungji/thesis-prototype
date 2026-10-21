@@ -102,18 +102,21 @@ Braille patterns used below: **C** = dots 1+4, **A** = dot 1, **T** = dots
    **Expect:** The app catches up (see 5.2). Nothing raises the pins again.
 
 ### 1.1 Heat limit across words
-Uses the defaults (limit 75 s of "heat", resume below 10 s, cooling twice as
-fast as heating). Same word each time so the same coils heat up.
+Uses the defaults (limit 60 s of "heat", hold counted at its real power
+≈ 0.76, resume below 10 s, cooling at half the heating rate). Same word each
+time so the same coils heat up. Serial prints `[HEAT] hottest coil …` every
+5 s while any coil is warm.
 1. **Do:** Live session. Send **CAT**. Don't clear it; let it auto-clear at 60 s.
+   **Expect:** `[HEAT]` climbs to about 46 s.
 2. **Do:** Within 2 s of the auto-clear, send **CAT** again (tap "Re-send
    Anyway" when asked).
    **Expect:** The pins rise normally.
-3. **Expect:** About 15–20 s later the pins drop by themselves. Serial:
+3. **Expect:** About 20 s later the pins drop by themselves. Serial:
    `[SAFETY] Heat budget used up - cooling down`.
 4. **Do:** Immediately send any word.
    **Expect:** The pins stay down and the device plays the error sound.
    Serial: `[SAFETY] Cooling down - word refused`.
-5. **Expect:** About 30–35 s after step 3, serial:
+5. **Expect:** About 100 s after step 3, serial:
    `[SAFETY] Cooled down - words allowed again`.
 6. **Do:** Send **CAT** again.
    **Expect:** It shows normally.
