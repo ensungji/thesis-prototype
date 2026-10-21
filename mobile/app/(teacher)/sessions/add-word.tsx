@@ -41,6 +41,7 @@ import {
   loadWordDurations,
 } from "../../../lib/session-timer";
 import { updateOrQueue } from "../../../lib/outbox";
+import { fisherYatesShuffle, saveWordOrder } from "../../../lib/word-order";
 import DraggableFlatList, {
   ScaleDecorator,
 } from "react-native-draggable-flatlist";
@@ -158,6 +159,9 @@ export default function AddWordScreen() {
   const [sessionWords, setSessionWords] = useState<SessionWord[]>([]);
   const [loadingList, setLoadingList] = useState(false);
   const [reordering, setReordering] = useState(false);
+  const [shuffling, setShuffling] = useState(false);
+  // Last word added from the New Word tab (the tab stays open for the next one)
+  const [lastAdded, setLastAdded] = useState<{ word: string; seconds: number } | null>(null);
 
   // ── Loaders ────────────────────────────────────────────────────────────────
   const loadWordBank = useCallback(async () => {
@@ -369,9 +373,28 @@ export default function AddWordScreen() {
     setNewWord("");
     setOverrideDifficulty(null);
 
-    // Refresh list and switch to it so the user sees what they just added
+    // Stay on this tab so the next word can be typed right away
     await loadSessionWords();
-    setTab("list");
+    if (fromBank) {
+      showToast("Added to sequence", `"${w}" · ${safeDuration}s. Tap Sequence to see the order.`);
+    } else {
+      setLastAdded({ word: w, seconds: safeDuration });
+    }
+  }
+
+  // ── Shuffle (same as the session screen's Shuffle) ─────────────────────────
+  async function shuffleWords() {
+    if (!sessionId || sessionWords.length <= 1 || shuffling) return;
+    const savedOrder = sessionWords; // put back if the new order can't be saved
+    const shuffled = fisherYatesShuffle(sessionWords).map((sw, i) => ({ ...sw, order_index: i }));
+    setSessionWords(shuffled);
+    setShuffling(true);
+    const saveError = await saveWordOrder(sessionId, shuffled.map((sw) => sw.id));
+    setShuffling(false);
+    if (saveError) {
+      setSessionWords(savedOrder);
+      showToast("Couldn't save the new order", "The order is unchanged. Try shuffling again.", "delete");
+    }
   }
 
   // ── Remove word from session list ───────────────────────────────────────────────
@@ -695,18 +718,52 @@ export default function AddWordScreen() {
                 )}
               </Pressable>
 
+              {lastAdded && (
+                <Pressable
+                  onPress={() => setTab("list")}
+                  style={({ pressed }) => [styles.addedHint, pressed && { opacity: 0.7 }]}
+                  accessibilityRole="button"
+                  accessibilityLabel={`${lastAdded.word} added, ${lastAdded.seconds} seconds. Open Sequence to see the order.`}
+                >
+                  <Ionicons name="checkmark-circle" size={16} color={C.green} />
+                  <Text style={styles.addedHintText}>
+                    <Text style={styles.addedHintWord}>{lastAdded.word}</Text> added · {lastAdded.seconds}s.
+                    Tap Sequence to see the order.
+                  </Text>
+                </Pressable>
+              )}
+
               {/* Mini word list preview at the bottom of the New Word tab */}
               {sessionWords.length > 0 && (
                 <View style={styles.previewCard}>
                   <View style={styles.previewHeader}>
                     <Text style={styles.previewLabel}>WORDS IN LIST</Text>
-                    <Pressable
-                      onPress={() => setTab("list")}
-                      hitSlop={8}
-                      style={({ pressed }) => [{ opacity: pressed ? 0.6 : 1 }]}
-                    >
-                      <Text style={styles.previewSeeAll}>Reorder →</Text>
-                    </Pressable>
+                    <View style={styles.previewActions}>
+                      {sessionWords.length > 1 && (
+                        <Pressable
+                          onPress={shuffleWords}
+                          disabled={shuffling}
+                          hitSlop={8}
+                          style={({ pressed }) => [
+                            styles.previewShuffle,
+                            (pressed || shuffling) && { opacity: 0.6 },
+                          ]}
+                          accessibilityLabel="Shuffle word order"
+                        >
+                          <Ionicons name="shuffle" size={13} color={C.navy} />
+                          <Text style={styles.previewSeeAll}>
+                            {shuffling ? "Shuffling..." : "Shuffle"}
+                          </Text>
+                        </Pressable>
+                      )}
+                      <Pressable
+                        onPress={() => setTab("list")}
+                        hitSlop={8}
+                        style={({ pressed }) => [{ opacity: pressed ? 0.6 : 1 }]}
+                      >
+                        <Text style={styles.previewSeeAll}>Reorder →</Text>
+                      </Pressable>
+                    </View>
                   </View>
                   {sessionWords.map((sw, i) => (
                     <View key={sw.id} style={styles.previewRow}>
@@ -1395,6 +1452,22 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
   },
   previewSeeAll: { fontFamily: fonts.heading, fontSize: 12, color: C.navy },
+  previewActions: { flexDirection: "row", alignItems: "center", gap: 16 },
+  previewShuffle: { flexDirection: "row", alignItems: "center", gap: 4 },
+
+  // "CAT added" hint under the Add button
+  addedHint: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: C.greenBg,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    marginTop: -8,
+  },
+  addedHintText: { flex: 1, fontFamily: fonts.body, fontSize: 13, color: C.ink, lineHeight: 18 },
+  addedHintWord: { fontFamily: fonts.mono, color: C.green, letterSpacing: 1 },
   previewRow: {
     flexDirection: "row",
     alignItems: "center",

@@ -33,6 +33,7 @@ import { BrailleLoader } from "../../../components/BrailleLoader";
 import { Toast } from "../../../components/Toast";
 import { Countdown } from "../../../components/Countdown";
 import { wordToChunks, getPattern, isValidWord } from "../../../lib/braille";
+import { fisherYatesShuffle, saveWordOrder } from "../../../lib/word-order";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useKeepAwake } from "expo-keep-awake";
 import { createAudioPlayer, type AudioPlayer } from "expo-audio";
@@ -103,21 +104,6 @@ const DEVICE_COLOR: Record<string, string> = {
   pending: C.navy,
   offline: C.red,
 };
-
-// Fisher-Yates algorithm for unbiased, true randomization
-function fisherYatesShuffle<T extends { id: string }>(items: T[]): T[] {
-  if (items.length <= 1) return [...items];
-  const shuffled = [...items];
-  for (let attempt = 0; attempt < 3; attempt++) {
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-    const isSameOrder = shuffled.every((item, idx) => item.id === items[idx].id);
-    if (!isSameOrder) break;
-  }
-  return shuffled;
-}
 
 // ── Five-cell display ─────────────────────────────────────────────────────────
 
@@ -1190,19 +1176,8 @@ export default function SessionDetail() {
 
     // 2. Persist new order_index in background to Supabase
     setShuffling(true);
-    // One server call: every position is saved, or none (reorder_session_words)
-    let saveError = "";
-    try {
-      const { error } = await supabase.rpc("reorder_session_words", {
-        p_session: id,
-        p_ids: reindexed.map((sw) => sw.id),
-      });
-      if (error) saveError = error.message;
-    } catch (err) {
-      saveError = String((err as { message?: string })?.message ?? err);
-    } finally {
-      setShuffling(false);
-    }
+    const saveError = await saveWordOrder(id!, reindexed.map((sw) => sw.id));
+    setShuffling(false);
     if (saveError) {
       // Back to the saved order right away (a reload can't fetch it while offline)
       setSessionWords(savedOrder);
