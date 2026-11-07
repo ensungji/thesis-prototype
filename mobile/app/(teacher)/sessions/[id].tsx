@@ -3085,6 +3085,10 @@ export default function SessionDetail() {
   // ACTIVE VIEW — in_progress
   // ══════════════════════════════════════════════════════════════════════════
 
+  // Braille preview: what the devices show (empty cells while cleared)
+  const previewShowing = wordSent && !isCooldown && chunks.length > 0;
+  const previewMulti = previewShowing && chunks.length > 1;
+
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
       <ActiveSessionKeepAwake />
@@ -3092,7 +3096,71 @@ export default function SessionDetail() {
       <ScrollView
         contentContainerStyle={styles.scroll}
         showsVerticalScrollIndicator={false}
+        stickyHeaderIndices={[0]}
       >
+        {/* ── Braille preview: first child, pinned at the top (sticky index 0),
+            above the word input and controls in Live and Timed modes ── */}
+        <View style={styles.previewSticky}>
+          <View style={styles.previewCard}>
+            <View style={styles.chunkHeader}>
+              <Text style={styles.cardLabel}>DEVICE DISPLAY</Text>
+              {previewMulti ? (
+                <View style={styles.previewNav}>
+                  <Pressable
+                    onPress={() => goToChunk(chunkIndex - 1)}
+                    disabled={chunkIndex === 0}
+                    hitSlop={8}
+                    style={({ pressed }) => [
+                      styles.previewNavBtn,
+                      pressed && { opacity: 0.7 },
+                      chunkIndex === 0 && { opacity: 0.3 },
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Back (previous chunk)"
+                    accessibilityHint="Changes the preview on your screen only, not the student devices"
+                  >
+                    <Ionicons name="chevron-back" size={16} color={C.navy} />
+                  </Pressable>
+                  <Text style={styles.chunkCount}>
+                    Chunk {chunkIndex + 1} of {chunks.length}
+                  </Text>
+                  <Pressable
+                    onPress={() => goToChunk(chunkIndex + 1)}
+                    disabled={chunkIndex === chunks.length - 1}
+                    hitSlop={8}
+                    style={({ pressed }) => [
+                      styles.previewNavBtn,
+                      pressed && { opacity: 0.7 },
+                      chunkIndex === chunks.length - 1 && { opacity: 0.3 },
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Next chunk"
+                    accessibilityHint="Changes the preview on your screen only, not the student devices"
+                  >
+                    <Ionicons name="chevron-forward" size={16} color={C.navy} />
+                  </Pressable>
+                </View>
+              ) : (
+                <Text style={styles.chunkCount}>
+                  {previewShowing
+                    ? "Chunk 1 of 1"
+                    : isCooldown
+                    ? "Display cleared · break"
+                    : "Display cleared"}
+                </Text>
+              )}
+            </View>
+
+            <FiveCellDisplay chunk={previewShowing ? chunks[chunkIndex] ?? "" : ""} />
+
+            {previewMulti ? (
+              <Text style={styles.deviceHint}>
+                Back / Next change this preview only, not the devices.
+              </Text>
+            ) : null}
+          </View>
+        </View>
+
         {/* Session name + purpose + status */}
         <View style={styles.activeHeader}>
           <View style={{ flex: 1, gap: 2 }}>
@@ -3578,60 +3646,6 @@ export default function SessionDetail() {
           </View>
         )}
 
-        {/* ── Chunk display (shown after word is sent) ──────────────── */}
-        {wordSent && chunks.length > 0 && (
-          <View style={styles.sectionCard}>
-            <View style={styles.chunkHeader}>
-              <Text style={styles.cardLabel}>DEVICE DISPLAY</Text>
-              <Text style={styles.chunkCount}>
-                {isCooldown
-                  ? "Display Cleared"
-                  : `Chunk ${chunkIndex + 1} of ${chunks.length}`}
-              </Text>
-            </View>
-
-            <FiveCellDisplay chunk={isCooldown ? "" : chunks[chunkIndex]} />
-
-            {/* Chunk navigation — strictly local UI preview, decoupled from hardware */}
-            {!isCooldown && chunks.length > 1 && (
-              <View style={styles.chunkNavRow}>
-                <Pressable
-                  onPress={() => goToChunk(chunkIndex - 1)}
-                  disabled={chunkIndex === 0}
-                  style={({ pressed }) => [
-                    styles.chunkNavBtn,
-                    pressed && { opacity: 0.7 },
-                    chunkIndex === 0 && { opacity: 0.3 },
-                  ]}
-                  accessibilityRole="button"
-                  accessibilityLabel="Back (previous chunk)"
-                >
-                  <Ionicons name="arrow-back" size={16} color={C.navy} />
-                  <Text style={styles.chunkNavText}>Back</Text>
-                </Pressable>
-                <Pressable
-                  onPress={() => goToChunk(chunkIndex + 1)}
-                  disabled={chunkIndex === chunks.length - 1}
-                  style={({ pressed }) => [
-                    styles.chunkNavBtn,
-                    pressed && { opacity: 0.7 },
-                    chunkIndex === chunks.length - 1 && { opacity: 0.3 },
-                  ]}
-                  accessibilityRole="button"
-                  accessibilityLabel="Next chunk"
-                >
-                  <Text style={styles.chunkNavText}>Next</Text>
-                  <Ionicons name="arrow-forward" size={16} color={C.navy} />
-                </Pressable>
-              </View>
-            )}
-            <Text style={styles.deviceHint}>
-              {isCooldown
-                ? "Display is cleared for a short break before the next word."
-                : "Use Back / Next to preview chunks locally on your screen without interrupting student devices."}
-            </Text>
-          </View>
-        )}
       </ScrollView>
       {WordBankSheet}
       {DupWordModal}
@@ -4688,11 +4702,40 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
   },
   chunkCount: { fontFamily: fonts.mono, fontSize: 11, color: C.muted },
+  // Pinned braille preview on the live screen. The wrapper covers the list
+  // scrolling under it; marginTop/paddingTop cancel the scroll padding so it
+  // sits in the same place pinned or not.
+  previewSticky: {
+    backgroundColor: C.bg,
+    marginTop: -16,
+    paddingTop: 16,
+    paddingBottom: 4,
+  },
+  previewCard: {
+    backgroundColor: C.white,
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderWidth: 1.5,
+    borderColor: C.border,
+    gap: 6,
+  },
+  previewNav: { flexDirection: "row", alignItems: "center", gap: 8 },
+  previewNavBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: C.bg,
+    borderWidth: 1.5,
+    borderColor: C.border,
+  },
   fiveCells: {
     flexDirection: "row",
     justifyContent: "center",
     gap: 10,
-    paddingVertical: 8,
+    paddingVertical: 2,
   },
   cellSlot: { alignItems: "center", gap: 6 },
   cellBox: {
@@ -4709,20 +4752,6 @@ const styles = StyleSheet.create({
     borderColor: C.border,
   },
   cellLetter: { fontFamily: fonts.mono, fontSize: 13, color: C.navy },
-  chunkNavRow: { flexDirection: "row", gap: 10 },
-  chunkNavBtn: {
-    flex: 1,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 6,
-    backgroundColor: C.bg,
-    borderWidth: 1.5,
-    borderColor: C.border,
-    borderRadius: 12,
-    paddingVertical: 11,
-  },
-  chunkNavText: { fontFamily: fonts.heading, fontSize: 14, color: C.navy },
   deviceHint: {
     fontFamily: fonts.body,
     fontSize: 11,

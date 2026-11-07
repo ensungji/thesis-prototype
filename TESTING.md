@@ -558,3 +558,26 @@ next request to fail.)
    on the Paused card.
    **Expect:** Same: the break picks up with the time that was left.
 4. **Expect:** There is no break after the last word; the session finishes.
+
+### C3 Braille preview at the top of the live screen
+Use your smallest phone (or set Display size / Font size to the largest).
+1. **Do:** Launch a Live session.
+   **Expect:** Right under the header, above the session name, students and
+   word input, a **DEVICE DISPLAY** card shows 5 empty cells and "Display
+   cleared".
+2. **Do:** Type **CAT**, tap **Send**.
+   **Expect:** The cells show C, A, T at once, without scrolling. The Clear
+   Display button is below the preview.
+3. **Do:** Send a word longer than 5 letters, e.g. **ELEPHANT**.
+   **Expect:** "Chunk 1 of 2" with small ‹ › buttons. › shows **ANT**; the
+   pins on the device don't change.
+4. **Do:** Scroll down to Grade by hand / Words sent.
+   **Expect:** The preview stays pinned at the top while the rest scrolls
+   under it.
+5. **Do:** Clear Display, then tap the word input.
+   **Expect:** The cells go empty ("Display cleared"). With the keyboard
+   open, the input is still reachable and not hidden under the preview.
+6. **Do:** Launch a Timed Sequence.
+   **Expect:** The same preview at the top shows each word, above the
+   countdown card and Pause Timer. During the Student Break it shows empty
+   cells and "Display cleared · break".
