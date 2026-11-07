@@ -1,15 +1,17 @@
 // mobile/app/admin/logs.tsx
 // Admin → System Logs. Everything that happened across phones, server,
-// database and devices, newest first. Updates live.
+// database and devices, newest first. Updates live. Export shares the logs on
+// screen (current filter, pages loaded so far) as a CSV file.
 
 import { useCallback, useEffect, useState } from "react";
-import { View, Text, Pressable, FlatList, StyleSheet, RefreshControl } from "react-native";
+import { View, Text, Pressable, FlatList, StyleSheet, RefreshControl, Alert } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../lib/supabase";
 import { colors as C, fonts } from "../../lib/theme";
 import { BrailleLoader } from "../../components/BrailleLoader";
+import { toCsv, shareCsv } from "../../lib/csv-share";
 
 type Log = {
   id: string;
@@ -65,6 +67,37 @@ function formatTime(iso: string) {
   return `${MONTHS[d.getMonth()]} ${d.getDate()} · ${hh}:${mm}:${ss} ${h < 12 ? "AM" : "PM"}`;
 }
 
+const CSV_HEADER = [
+  "created_at", "local_time", "level", "source", "event", "message",
+  "user_id", "device_id", "session_id", "meta",
+];
+
+function logsToCsv(logs: Log[]) {
+  return toCsv(
+    CSV_HEADER,
+    logs.map((l) => [
+      l.created_at,
+      formatTime(l.created_at),
+      l.level,
+      l.source,
+      l.event,
+      l.message,
+      l.user_id,
+      l.device_id,
+      l.session_id,
+      l.meta && Object.keys(l.meta).length > 0 ? JSON.stringify(l.meta) : "",
+    ])
+  );
+}
+
+// e.g. dots-logs-errors-2026-11-07-1430.csv
+function csvFileName(filter: Filter) {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  const label = FILTERS.find((f) => f.key === filter)?.label.toLowerCase() ?? filter;
+  return `dots-logs-${label}-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}.csv`;
+}
+
 function LogRow({ log }: { log: Log }) {
   const [open, setOpen] = useState(false);
   const st = LEVEL_STYLE[log.level] ?? LEVEL_STYLE.info;
@@ -115,6 +148,7 @@ export default function AdminLogs() {
   const [hasMore, setHasMore] = useState(true);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [errors24h, setErrors24h] = useState<number | null>(null);
+  const [exporting, setExporting] = useState(false);
 
   const fetchPage = useCallback(
     async (before?: string) => {
@@ -195,6 +229,21 @@ export default function AdminLogs() {
     setLoadingMore(false);
   }
 
+  async function exportCsv() {
+    if (exporting || logs.length === 0) return;
+    setExporting(true);
+    try {
+      const n = logs.length;
+      await shareCsv(csvFileName(filter), logsToCsv(logs), `Export ${n} log${n === 1 ? "" : "s"}`);
+    } catch (e) {
+      Alert.alert("Couldn't export logs", e instanceof Error ? e.message : String(e));
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  const canExport = !loading && !exporting && logs.length > 0;
+
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
       <View style={styles.header}>
@@ -217,6 +266,18 @@ export default function AdminLogs() {
               : `Live · ${errors24h} error${errors24h === 1 ? "" : "s"} in the last 24h`}
           </Text>
         </View>
+        <Pressable
+          onPress={exportCsv}
+          disabled={!canExport}
+          hitSlop={6}
+          style={({ pressed }) => [styles.exportBtn, !canExport && { opacity: 0.4 }, pressed && { opacity: 0.7 }]}
+          accessibilityRole="button"
+          accessibilityLabel={`Export the ${logs.length} logs shown as a CSV file`}
+          accessibilityState={{ disabled: !canExport, busy: exporting }}
+        >
+          <Ionicons name="download-outline" size={16} color={C.navy} />
+          <Text style={styles.exportText}>{exporting ? "Exporting…" : "Export"}</Text>
+        </Pressable>
       </View>
 
       <View style={styles.chips}>
@@ -295,6 +356,18 @@ const styles = StyleSheet.create({
     paddingBottom: 8,
   },
   backBtn: { padding: 4 },
+  exportBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 100,
+    borderWidth: 1.5,
+    borderColor: C.border,
+    backgroundColor: C.white,
+  },
+  exportText: { fontFamily: fonts.headingSemi, fontSize: 13, color: C.navy },
   title: { fontFamily: fonts.heading, fontSize: 22, color: C.navy },
   subtitle: { fontFamily: fonts.mono, fontSize: 11, color: C.muted, marginTop: 2 },
   chips: { flexDirection: "row", flexWrap: "wrap", gap: 8, paddingHorizontal: 16, paddingBottom: 10 },

@@ -517,3 +517,28 @@ next request to fail.)
    **Expect:** Nothing under `supabase/.temp/` is listed.
 2. **Do:** `git ls-files | findstr /i "secrets.h secrets.ini .env"`
    **Expect:** Only `firmware/secrets.ini.example`.
+
+---
+
+## Branch fix/bugs: C1–C3
+
+### C1 Admin Logs: Export as CSV (needs a new app build: expo-sharing)
+1. **Do:** Log in as admin, open **System Logs**, tap the **Errors** filter,
+   then tap **Export** (top right).
+   **Expect:** The Android share sheet opens with a file named like
+   `dots-logs-errors-2026-11-07-1430.csv`.
+2. **Do:** Pick **Save to Drive** (or Files / email it to yourself) and open
+   the file in Google Sheets or Excel.
+   **Expect:** A header row (`created_at, local_time, level, source, event,
+   message, user_id, device_id, session_id, meta`), then exactly the rows that
+   were on screen, newest first, all with level `error`. Messages with commas
+   or line breaks stay in one cell.
+3. **Do:** Tap **All**, scroll down until more logs load, tap **Export**.
+   **Expect:** The file has every row loaded on screen (more than 50), not
+   only the first page.
+4. **Do:** Pick a filter with no logs.
+   **Expect:** **Export** is greyed out and does nothing.
+5. **Do (old build only):** On a build made before this change, tap
+   **Export**.
+   **Expect:** No crash. The share sheet opens with the CSV as plain text
+   instead of a file.
