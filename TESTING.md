@@ -207,7 +207,7 @@ Do this on one device first.
 5. **Do:** Repeat steps 2–3 with the session's **Pause** button (the one that
    pauses the whole session) instead of Pause Timer, then **Resume**.
    **Expect:** Same: it resumes with the time that was left.
-6. **Do:** Pause during the 10 s **Student Break**, wait, resume.
+6. **Do:** Pause during the 20 s **Student Break**, wait, resume.
    **Expect:** The break continues with its remaining time; no word is sent
    during the break. After the break, word 2 starts with its full 30 s.
 7. **Do:** On your slowest phone, run a 60 s word and time it.
@@ -542,3 +542,19 @@ next request to fail.)
    **Export**.
    **Expect:** No crash. The share sheet opens with the CSV as plain text
    instead of a file.
+
+### C2 Timed Sequence: 20 s student break
+1. **Do:** Timed Sequence with 3 words, 10 s each. Launch. Start a stopwatch
+   when word 1 ends.
+   **Expect:** The **Student Break** card shows "20s remaining of 20s" and
+   counts down. The display stays cleared. Word 2 is sent after about 20 s on
+   the stopwatch.
+2. **Do:** In the next break, tap **Pause Timer** at about 12s left. Wait
+   30 s. Tap **Resume Timer**.
+   **Expect:** The countdown froze at about 12s and continues from there. No
+   word is sent when you resume. Word 3 starts about 12 s later with its
+   full 10 s.
+3. **Do:** Repeat step 2 with the session's **Pause** button, then **Resume**
+   on the Paused card.
+   **Expect:** Same: the break picks up with the time that was left.
+4. **Expect:** There is no break after the last word; the session finishes.

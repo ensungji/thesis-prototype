@@ -52,8 +52,10 @@ import {
   SessionType,
 } from "../../../lib/session-timer";
 
-// Mandatory 10-second hardware cooldown between words to prevent solenoid burnout
-const COOLDOWN_DURATION_SEC = 10;
+// Timed Sequence: the student break between words. The display is cleared for
+// this long (rest for the student, cooling for the solenoids). Pause / resume
+// during the break keeps the time that was left (deadlineRef / pausedLeftMsRef).
+const COOLDOWN_DURATION_SEC = 20;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -1484,7 +1486,7 @@ export default function SessionDetail() {
           recordNoAnswersRef.current(words[currentIdx]); // time's up: "No answer" for the rest
 
           if (nextIdx < words.length) {
-            // Enter 10-second hardware cooldown phase
+            // Enter the student break (COOLDOWN_DURATION_SEC)
             isCooldownRef.current = true;
             setIsCooldown(true);
             setTotalWordSeconds(COOLDOWN_DURATION_SEC);
