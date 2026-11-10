@@ -113,8 +113,15 @@ await check("teacher can't regrade another class's answer", async () => {
   eq(r.rows.length, 0, "rows updated");
 });
 await check("teacher can't insert an answer for another class's student", () =>
-  expectError(as(A, "authenticated", `insert into word_attempts (student_id) values ('b1000000-0000-0000-0000-000000000000')`), /row-level security/));
+  expectError(as(A, "authenticated", `insert into word_attempts (student_id, graded_by) values ('b1000000-0000-0000-0000-000000000000', 'teacher')`), /row-level security/));
 await check("hand grade: insert on conflict do nothing + update by pair", async () => {
+  // DOG is a voice row: since migration 22 it can only be overridden once the session has ended
+  await as(null, null, `update sessions set status = 'finished' where id = '5a000000-0000-0000-0000-000000000000'`);
+  try { await handGradeDog(); } finally {
+    await as(null, null, `update sessions set status = 'in_progress' where id = '5a000000-0000-0000-0000-000000000000'`);
+  }
+});
+async function handGradeDog() {
   await as(A, "authenticated", `insert into word_attempts (id, student_id, session_word_id, is_correct, graded_by)
     values (gen_random_uuid(), 'a1000000-0000-0000-0000-000000000000', '12000000-0000-0000-0000-000000000000', true, 'teacher')
     on conflict (session_word_id, student_id) do nothing`);
@@ -123,7 +130,7 @@ await check("hand grade: insert on conflict do nothing + update by pair", async 
   eq(r.rows.length, 1, "one row graded");
   // put DOG back to wrong for the stats test
   await as(null, null, `update word_attempts set is_correct = false, graded_by = 'auto' where id = 'f4000000-0000-0000-0000-000000000000'`);
-});
+}
 
 // ── 06 storage ───────────────────────────────────────────────────────────────
 await check("teacher reads only their own students' recordings", async () => {
@@ -607,7 +614,11 @@ await check("graded_by: null, auto, teacher, missed, skipped allowed; anything e
   }
   await as(null, null, `update word_attempts set graded_by = null where id = 'f4000000-0000-0000-0000-000000000000'`);
   await expectError(as(null, null, `update word_attempts set graded_by = 'bogus' where id = 'f4000000-0000-0000-0000-000000000000'`), /word_attempts_graded_by_check/);
-  await expectError(as(null, null, `update word_attempts set original_graded_by = 'bogus' where id = 'f4000000-0000-0000-0000-000000000000'`), /original_graded_by_check/);
+  // (migration 22 keeps the re-grade columns from being written, so test the check without it)
+  await db.exec(`alter table word_attempts disable trigger word_attempts_grading_lock`);
+  try {
+    await expectError(as(null, null, `update word_attempts set original_graded_by = 'bogus' where id = 'f4000000-0000-0000-0000-000000000000'`), /original_graded_by_check/);
+  } finally { await db.exec(`alter table word_attempts enable trigger word_attempts_grading_lock`); }
   await expectError(as(null, null, `update word_attempts set tries = -1 where id = 'f4000000-0000-0000-0000-000000000000'`), /tries_check/);
   await as(null, null, `update word_attempts set graded_by = 'auto' where id = 'f4000000-0000-0000-0000-000000000000'`);
 });
@@ -641,6 +652,166 @@ await check("deleting a session keeps its answers (word + session ids emptied) a
   const t = await as(null, null, `select count(*)::int as n from answer_attempts where student_id = '${BEN}'`);
   eq(t.rows, [{ n: 0 }], "tries removed with the words");
   await as(null, null, `delete from word_attempts where student_id = '${BEN}'`);
+});
+
+// ── 22 grading lock ──────────────────────────────────────────────────────────
+// Session L (A's, in_progress) with words L1..L6; Ana answers.
+const L = "5f400000-0000-0000-0000-000000000000";
+const LW = (n) => `1f40000${n}-0000-0000-0000-000000000000`;
+const LA = (n) => `fa40000${n}-0000-0000-0000-000000000000`; // Ana's row for word n
+const row = async (n) => (await as(null, null, `select is_correct, needs_review, graded_by, tries, transcript,
+  original_is_correct, original_graded_by, regraded_by, regraded_at is not null as regraded from word_attempts where id = '${LA(n)}'`)).rows[0];
+// what grade-answer sends for a new voice answer
+const voice = (n, result, tries, who = null) => as(who, who ? "authenticated" : null, `update word_attempts set
+  is_correct = ${result === "correct" || result === "review-but-matched"}, needs_review = ${result.startsWith("review")},
+  graded_by = 'auto', transcript = '${result} #${tries}', tries = ${tries}, attempted_at = now() where id = '${LA(n)}'`);
+const teacherGrade = (n, correct) => as(A, "authenticated", `update word_attempts
+  set is_correct = ${correct}, needs_review = false, graded_by = 'teacher' where id = '${LA(n)}' returning id`);
+await check("lock setup: session + device answers", async () => {
+  await as(null, null, `insert into sessions (id, teacher_id, name, status) values ('${L}', '${A}', 'Lock', 'in_progress')`);
+  for (let n = 1; n <= 6; n++) {
+    await as(null, null, `insert into session_words (id, session_id, word, order_index) values ('${LW(n)}', '${L}', 'W${n}', ${n})`);
+  }
+  // 1 voice correct, 2 voice wrong, 3 voice review, 4 missed, 5 skipped, 6 teacher
+  await as(null, "service_role", `insert into word_attempts (id, student_id, session_id, session_word_id, word, is_correct, needs_review, graded_by, tries) values
+    ('${LA(1)}', '${ANA}', '${L}', '${LW(1)}', 'W1', true,  false, 'auto', 1),
+    ('${LA(2)}', '${ANA}', '${L}', '${LW(2)}', 'W2', false, false, 'auto', 1),
+    ('${LA(3)}', '${ANA}', '${L}', '${LW(3)}', 'W3', true,  true,  'auto', 1),
+    ('${LA(4)}', '${ANA}', '${L}', '${LW(4)}', 'W4', false, false, 'missed', 0),
+    ('${LA(5)}', '${ANA}', '${L}', '${LW(5)}', 'W5', false, false, 'skipped', 0),
+    ('${LA(6)}', '${ANA}', '${L}', '${LW(6)}', 'W6', true,  false, 'teacher', 0)`);
+});
+await check("teacher can't create a voice row (explicit 'auto' or the column default)", async () => {
+  await expectError(as(A, "authenticated", `insert into word_attempts (student_id, session_id, word, is_correct, graded_by)
+    values ('${BEN}', '${L}', 'X', true, 'auto')`), /Only the device/);
+  await expectError(as(A, "authenticated", `insert into word_attempts (student_id, session_id, word, is_correct)
+    values ('${BEN}', '${L}', 'X', true)`), /Only the device/);
+});
+await check("teacher insert: tries forced to 0, re-grade columns empty", async () => {
+  const r = await as(A, "authenticated", `insert into word_attempts (student_id, session_id, word, is_correct, graded_by, tries, original_is_correct, regraded_at)
+    values ('${BEN}', '${L}', 'X', true, 'teacher', 7, false, now()) returning tries, original_is_correct, regraded_at`);
+  eq(r.rows, [{ tries: 0, original_is_correct: null, regraded_at: null }], "row");
+  await as(null, null, `delete from word_attempts where student_id = '${BEN}'`);
+});
+await check("active session: teacher can't change voice rows (correct, wrong, review)", async () => {
+  for (const n of [1, 2, 3]) {
+    await expectError(teacherGrade(n, n !== 1), /locked until the session ends/);
+  }
+  await expectError(as(A, "authenticated", `update word_attempts set needs_review = false where id = '${LA(3)}'`), /locked until/);
+});
+await check("active session: missed / skipped / teacher rows stay editable, no re-grade history", async () => {
+  for (const n of [4, 5, 6]) eq((await teacherGrade(n, n !== 6)).rows.length, 1, `row ${n}`);
+  const r = await row(4);
+  eq([r.graded_by, r.is_correct, r.original_is_correct, r.regraded], ["teacher", true, null, false], "W4");
+  // the app's own hand grade flow on a voice row: the insert is skipped, the update refused
+  await as(A, "authenticated", `insert into word_attempts (id, student_id, session_id, session_word_id, word, is_correct, graded_by)
+    values (gen_random_uuid(), '${ANA}', '${L}', '${LW(2)}', 'W2', true, 'teacher') on conflict (session_word_id, student_id) do nothing`);
+  await expectError(as(A, "authenticated", `update word_attempts set is_correct = true, needs_review = false, graded_by = 'teacher'
+    where session_word_id = '${LW(2)}' and student_id = '${ANA}'`), /locked until/);
+});
+await check("teacher can only change the grade; tries / re-grade columns silently kept", async () => {
+  await expectError(as(A, "authenticated", `update word_attempts set transcript = 'x' where id = '${LA(6)}'`), /only change the grade/);
+  await expectError(as(A, "authenticated", `update word_attempts set word = 'X' where id = '${LA(6)}'`), /only change the grade/);
+  await expectError(as(A, "authenticated", `update word_attempts set session_id = null where id = '${LA(1)}'`), /only change the grade/);
+  await expectError(as(A, "authenticated", `update word_attempts set graded_by = 'auto' where id = '${LA(6)}'`), /Only the device/);
+  await as(A, "authenticated", `update word_attempts set tries = 9, regraded_at = now(), original_is_correct = false where id = '${LA(6)}'`);
+  const r = await row(6);
+  eq([r.tries, r.regraded, r.original_is_correct], [0, false, null], "W6");
+});
+await check("device: unlimited retries while not correct (wrong → review → wrong)", async () => {
+  await voice(2, "review", 2);
+  await voice(2, "wrong", 3);
+  const r = await row(2);
+  eq([r.is_correct, r.needs_review, r.graded_by, r.tries, r.transcript], [false, false, "auto", 3, "wrong #3"], "W2");
+});
+await check("device: a review row with is_correct = true does NOT lock", async () => {
+  await voice(3, "wrong", 2);
+  eq((await row(3)).transcript, "wrong #2", "W3 replaced");
+  await voice(3, "review-but-matched", 3);
+  await voice(3, "correct", 4);
+  const r = await row(3);
+  eq([r.is_correct, r.needs_review, r.tries], [true, false, 4], "W3 now correct");
+});
+await check("device: voice-correct locks; a later voice answer is refused (DT001), tries may still go up", async () => {
+  const e = await expectError(voice(1, "wrong", 2), /already correct/);
+  const code = await db.query(`do $$ begin update word_attempts set is_correct = false where id = '${LA(1)}'; end $$`).catch((x) => x.code);
+  eq(code, "DT001", "SQLSTATE");
+  await as(null, null, `update word_attempts set tries = 2 where id = '${LA(1)}'`);
+  const r = await row(1);
+  eq([r.is_correct, r.graded_by, r.tries, r.transcript], [true, "auto", 2, null], "W1 kept");
+  return e;
+});
+await check("device: replaces missed / skipped rows; keeps (adds to) a teacher's grade", async () => {
+  await as(null, null, `update word_attempts set graded_by = 'missed', is_correct = false where id = '${LA(4)}'`); // back to No answer
+  await voice(4, "wrong", 1);
+  await as(null, null, `update word_attempts set graded_by = 'skipped', is_correct = false where id = '${LA(5)}'`);
+  await voice(5, "correct", 1);
+  await as(null, "service_role", `update word_attempts set transcript = 'heard', tries = 1 where id = '${LA(6)}'`);
+  const r = [await row(4), await row(5), await row(6)].map((x) => [x.graded_by, x.is_correct]);
+  eq(r, [["auto", false], ["auto", true], ["teacher", false]], "W4 W5 W6 (W6 = the teacher's 'wrong' from above)");
+});
+await check("the existing AFTER trigger still runs for allowed changes only", async () => {
+  // stand-in for the live trg_log_teacher_grade (AFTER INSERT / UPDATE)
+  await db.exec(`create table grade_log (wa uuid);
+    create or replace function log_grade() returns trigger language plpgsql as $f$ begin
+      if new.graded_by = 'teacher' then insert into grade_log values (new.id); end if; return new; end $f$;
+    create trigger trg_log_teacher_grade after insert or update on word_attempts for each row execute function log_grade();
+    grant all on grade_log to authenticated;`);
+  await teacherGrade(6, false);                                   // allowed → logged
+  await expectError(teacherGrade(2, true), /locked until/);       // refused → not logged
+  const r = await as(null, null, `select wa from grade_log`);
+  eq(r.rows.map((x) => x.wa), [LA(6)], "logged");
+  await db.exec(`drop trigger trg_log_teacher_grade on word_attempts; drop table grade_log; drop function log_grade()`);
+});
+await check("session ended: first re-grade saves the original, later ones don't change it", async () => {
+  await as(A, "authenticated", `update sessions set status = 'finished' where id = '${L}'`);
+  eq((await teacherGrade(1, false)).rows.length, 1, "re-graded");
+  let r = await row(1);
+  eq([r.is_correct, r.graded_by, r.original_is_correct, r.original_graded_by, r.regraded_by, r.regraded],
+     [false, "teacher", true, "auto", A, true], "after 1st");
+  const at1 = (await as(null, null, `select regraded_at from word_attempts where id = '${LA(1)}'`)).rows[0].regraded_at;
+  await teacherGrade(1, true);
+  await as(A, "authenticated", `update word_attempts set is_correct = false, needs_review = true where id = '${LA(1)}'`);
+  r = await row(1);
+  const at2 = (await as(null, null, `select regraded_at from word_attempts where id = '${LA(1)}'`)).rows[0].regraded_at;
+  eq([r.is_correct, r.needs_review, r.original_is_correct, r.original_graded_by, String(at2)],
+     [false, true, true, "auto", String(at1)], "after 3rd");
+});
+await check("session ended: a voice row changed without graded_by becomes 'teacher' (re-grade recorded)", async () => {
+  await as(A, "authenticated", `update word_attempts set is_correct = true where id = '${LA(2)}'`);
+  const r = await row(2);
+  eq([r.is_correct, r.graded_by, r.original_is_correct, r.original_graded_by], [true, "teacher", false, "auto"], "W2");
+});
+await check("session ended: the correct lock still holds for the device", async () => {
+  await expectError(voice(5, "wrong", 2), /already correct/); // W5: voice-correct
+  eq((await row(5)).is_correct, true, "W5 kept");
+});
+await check("SQL editor / device can't write the re-grade columns either", async () => {
+  await as(null, null, `update word_attempts set original_is_correct = null, regraded_at = null where id = '${LA(1)}'`);
+  const r = await row(1);
+  eq([r.original_is_correct, r.regraded], [true, true], "kept");
+});
+await check("deleting the re-grader's profile empties regraded_by, keeps the rest", async () => {
+  const E = "eeeeeeee-0000-0000-0000-000000000000", ST = "e1000000-0000-0000-0000-000000000000";
+  await as(null, null, `insert into profiles (id, role) values ('${E}', 'teacher')`);
+  await as(null, null, `insert into students (id, teacher_id, full_name) values ('${ST}', '${E}', 'Eve')`);
+  await as(null, null, `insert into word_attempts (id, student_id, session_id, session_word_id, word, is_correct, graded_by)
+    values ('fe000000-0000-0000-0000-000000000000', '${ST}', '${L}', '${LW(1)}', 'W1', true, 'auto')`);
+  await as(E, "authenticated", `update word_attempts set is_correct = false, graded_by = 'teacher' where id = 'fe000000-0000-0000-0000-000000000000'`);
+  await as(null, null, `delete from profiles where id = '${E}'`);
+  const r = await as(null, null, `select is_correct, original_is_correct, regraded_by, regraded_at is not null as at from word_attempts where id = 'fe000000-0000-0000-0000-000000000000'`);
+  eq(r.rows, [{ is_correct: false, original_is_correct: true, regraded_by: null, at: true }], "row");
+  await as(null, null, `delete from students where id = '${ST}'`);
+  await as(null, null, `delete from word_attempts where id = 'fe000000-0000-0000-0000-000000000000'`);
+});
+await check("teacher deletes an ACTIVE session: allowed, voice rows kept (ids emptied)", async () => {
+  await as(A, "authenticated", `update sessions set status = 'paused' where id = '${L}'`);
+  const d = await as(A, "authenticated", `delete from sessions where id = '${L}' returning id`);
+  eq(d.rows.length, 1, "deleted");
+  const r = await as(null, null, `select count(*)::int as n, count(session_id)::int as s, count(session_word_id)::int as w
+    from word_attempts where id::text like 'fa40000%'`);
+  eq(r.rows, [{ n: 6, s: 0, w: 0 }], "rows kept, ids emptied");
+  await as(null, null, `delete from word_attempts where id::text like 'fa40000%'`);
 });
 
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");

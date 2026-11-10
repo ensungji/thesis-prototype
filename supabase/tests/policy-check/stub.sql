@@ -62,6 +62,10 @@ grant select on storage.objects to anon, authenticated;
 grant execute on function auth.uid() to anon, authenticated;
 -- like Supabase: tables created later (by migrations) are granted to the API roles too
 alter default privileges in schema public grant all on tables to anon, authenticated;
+-- the service role (edge functions) has every right and bypasses RLS
+grant usage on schema public, storage to service_role;
+grant all on all tables in schema public to service_role;
+alter default privileges in schema public grant all on tables to service_role;
 
 -- Existing functions / trigger / policies (from Query 2-4)
 create function public.is_admin() returns boolean language sql stable security definer
