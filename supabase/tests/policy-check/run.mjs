@@ -275,7 +275,8 @@ const missedInsert = (student) => as(A, "authenticated", `insert into word_attem
 await check("a graded_by check that lists values gets 'missed' added", async () => {
   await as(null, null, `alter table word_attempts add constraint wa_graded_by_ck check (graded_by in ('auto', 'teacher'))`);
   await db.exec(readFileSync(join(migDir, "20261022120200_word_attempts_graded_by_missed.sql"), "utf8"));
-  const r = await as(null, null, `select conname from pg_constraint where conrelid = 'word_attempts'::regclass and contype = 'c'`);
+  const r = await as(null, null, `select conname from pg_constraint where conrelid = 'word_attempts'::regclass and contype = 'c'
+    and pg_get_constraintdef(oid) ilike '%graded_by%'`);
   eq(r.rows.map((x) => x.conname), ["word_attempts_graded_by_check"], "checks");
   await expectError(as(null, null, `update word_attempts set graded_by = 'bogus' where id = 'f4000000-0000-0000-0000-000000000000'`), /graded_by_check/);
   await missedInsert(BEN);
@@ -588,6 +589,58 @@ await check("answer_attempts: deleting a session deletes its tries, never blocks
   eq(d.rows.length, 1, "session deleted");
   const n = await as(null, null, `select count(*)::int as n from answer_attempts where session_word_id = '${W}'`);
   eq(n.rows, [{ n: 0 }], "tries left");
+});
+
+// ── 21 word_attempts: tries, re-grade columns, checks, FK ────────────────────
+const M21 = "20261111120600_word_attempts_tries_regrade.sql";
+await check("migration 21 runs a second time (restores the checks the 15 re-run test removed)", async () => {
+  await db.exec(readFileSync(join(migDir, M21), "utf8"));
+  const r = await as(null, null, `select conname from pg_constraint where conrelid = 'word_attempts'::regclass
+    and contype in ('c', 'f') order by 1`);
+  eq(r.rows.map((x) => x.conname), [
+    "word_attempts_graded_by_check", "word_attempts_original_graded_by_check", "word_attempts_regraded_by_fkey",
+    "word_attempts_session_id_fkey", "word_attempts_session_word_id_fkey", "word_attempts_tries_check"], "constraints");
+});
+await check("graded_by: null, auto, teacher, missed, skipped allowed; anything else refused", async () => {
+  for (const g of ["auto", "teacher", "missed", "skipped"]) {
+    await as(null, null, `update word_attempts set graded_by = '${g}' where id = 'f4000000-0000-0000-0000-000000000000'`);
+  }
+  await as(null, null, `update word_attempts set graded_by = null where id = 'f4000000-0000-0000-0000-000000000000'`);
+  await expectError(as(null, null, `update word_attempts set graded_by = 'bogus' where id = 'f4000000-0000-0000-0000-000000000000'`), /word_attempts_graded_by_check/);
+  await expectError(as(null, null, `update word_attempts set original_graded_by = 'bogus' where id = 'f4000000-0000-0000-0000-000000000000'`), /original_graded_by_check/);
+  await expectError(as(null, null, `update word_attempts set tries = -1 where id = 'f4000000-0000-0000-0000-000000000000'`), /tries_check/);
+  await as(null, null, `update word_attempts set graded_by = 'auto' where id = 'f4000000-0000-0000-0000-000000000000'`);
+});
+await check("tries: 0 by default, 1 for an existing row with a recording", async () => {
+  await as(null, null, `insert into word_attempts (id, student_id, session_id, session_word_id, word, is_correct, audio_path)
+    values ('f7000000-0000-0000-0000-000000000000', '${BEN}', '5a000000-0000-0000-0000-000000000000', '${SW_A}', 'CAT', false, 'x/y/1_cat.wav')`);
+  eq((await as(null, null, `select tries from word_attempts where id = 'f7000000-0000-0000-0000-000000000000'`)).rows, [{ tries: 0 }], "new row");
+  await db.exec(readFileSync(join(migDir, M21), "utf8"));
+  const r = await as(null, null, `select id, tries from word_attempts where id in ('f7000000-0000-0000-0000-000000000000', 'f4000000-0000-0000-0000-000000000000') order by id`);
+  eq(r.rows.map((x) => x.tries), [0, 1], "f4 (no recording) / f7 (recording)");
+  await as(null, null, `delete from word_attempts where id = 'f7000000-0000-0000-0000-000000000000'`);
+});
+await check("session_word_id must be a real word", () =>
+  expectError(as(null, null, `insert into word_attempts (student_id, session_word_id, word, is_correct)
+    values ('${BEN}', '00000000-0000-0000-0000-000000000000', 'X', false)`), /word_attempts_session_word_id_fkey/));
+await check("deleting a session keeps its answers (word + session ids emptied) and the stats don't change", async () => {
+  const S = "5f300000-0000-0000-0000-000000000000", W1 = "1f310000-0000-0000-0000-000000000000", W2 = "1f320000-0000-0000-0000-000000000000";
+  await as(null, null, `insert into sessions (id, teacher_id, name, status) values ('${S}', '${A}', 'Old', 'finished')`);
+  await as(null, null, `insert into session_words (id, session_id, word, order_index) values ('${W1}', '${S}', 'HI', 0), ('${W2}', '${S}', 'GO', 1)`);
+  await as(null, null, `insert into word_attempts (student_id, session_id, session_word_id, word, is_correct, response_time_ms, graded_by) values
+    ('${BEN}', '${S}', '${W1}', 'HI', true, 1000, 'auto'), ('${BEN}', '${S}', '${W2}', 'GO', false, 3000, 'missed')`);
+  await as(null, "service_role", `insert into answer_attempts (session_word_id, student_id, attempt_no, result) values ('${W1}', '${BEN}', 1, 'correct')`);
+  const stats = () => as(A, "authenticated", `select total, correct, avg_response_ms, streak from teacher_student_stats() where full_name = 'Ben'`);
+  const before = (await stats()).rows;
+  eq(before, [{ total: 2, correct: 1, avg_response_ms: 2000, streak: 0 }], "before");
+  const d = await as(A, "authenticated", `delete from sessions where id = '${S}' returning id`);
+  eq(d.rows.length, 1, "deleted");
+  eq((await stats()).rows, before, "stats after delete");
+  const r = await as(null, null, `select word, session_id, session_word_id from word_attempts where student_id = '${BEN}' order by word`);
+  eq(r.rows, [{ word: "GO", session_id: null, session_word_id: null }, { word: "HI", session_id: null, session_word_id: null }], "kept rows");
+  const t = await as(null, null, `select count(*)::int as n from answer_attempts where student_id = '${BEN}'`);
+  eq(t.rows, [{ n: 0 }], "tries removed with the words");
+  await as(null, null, `delete from word_attempts where student_id = '${BEN}'`);
 });
 
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
