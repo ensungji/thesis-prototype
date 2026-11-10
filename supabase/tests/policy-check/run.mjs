@@ -463,5 +463,87 @@ await check("deleting an activity keeps the session and its copied name (activit
   await as(null, null, `delete from sessions where id = '5c000000-0000-0000-0000-000000000000'`);
 });
 
+// ── 19 start_activity_session ────────────────────────────────────────────────
+const SA = "5d000000-0000-0000-0000-000000000000"; // A's pending session
+const startAct = (who, sess, act) => as(who, "authenticated", `select start_activity_session('${sess}', '${act}') as n`);
+const sessionWords = (sess) => as(null, null,
+  `select word, order_index, duration_seconds from session_words where session_id = '${sess}' order by order_index`);
+await check("start: copies the words in order with their times, marks the session", async () => {
+  await as(null, null, `insert into sessions (id, teacher_id, name) values ('${SA}', '${A}', 'Act run')`);
+  const r = await startAct(A, SA, ACT);
+  eq(r.rows, [{ n: 3 }], "returned");
+  eq((await sessionWords(SA)).rows, [
+    { word: "DOG", order_index: 0, duration_seconds: 30 },
+    { word: "CAT", order_index: 1, duration_seconds: 20 },
+    { word: "SUN", order_index: 2, duration_seconds: 5 },
+  ], "session words");
+  const s = await as(null, null, `select type, status, activity_id, activity_name, current_index from sessions where id = '${SA}'`);
+  eq(s.rows, [{ type: "activity", status: "pending", activity_id: ACT, activity_name: "Animals", current_index: 0 }], "session");
+});
+await check("start: a retry does nothing and returns the count again", async () => {
+  eq((await startAct(A, SA, ACT)).rows, [{ n: 3 }], "returned");
+  eq((await sessionWords(SA)).rows.length, 3, "words");
+});
+await check("start: another activity on a session that has words is refused", async () => {
+  const id = (await as(D, "authenticated", `select duplicate_activity('${ACT}') as id`)).rows[0].id;
+  await as(D, "authenticated", `update activities set status = 'published' where id = '${id}'`);
+  await expectError(startAct(A, SA, id), /already has words/);
+  await as(null, null, `delete from activities where id = '${id}'`);
+});
+await check("start: only the session's teacher", async () => {
+  await expectError(startAct(B, SA, ACT), /Not your session/);
+  await expectError(startAct(D, SA, ACT), /Not your session/); // admins neither
+  await expectError(startAct(A, "00000000-0000-0000-0000-000000000000", ACT), /Not your session/);
+  await expectError(as(null, "anon", `select start_activity_session('${SA}', '${ACT}')`), /permission denied/);
+  await expectError(as(null, null, `select start_activity_session('${SA}', '${ACT}')`), /Not signed in/);
+});
+await check("start: draft / hidden / unknown activity refused, nothing copied", async () => {
+  const S2 = "5e000000-0000-0000-0000-000000000000";
+  await as(null, null, `insert into sessions (id, teacher_id, name) values ('${S2}', '${A}', 'Other')`);
+  const draft = (await as(D, "authenticated", `select duplicate_activity('${ACT}') as id`)).rows[0].id;
+  await expectError(startAct(A, S2, draft), /Only a published activity/);
+  await as(D, "authenticated", `update activities set status = 'hidden' where id = '${ACT}'`);
+  await expectError(startAct(A, S2, ACT), /Only a published activity/);
+  await as(D, "authenticated", `update activities set status = 'published' where id = '${ACT}'`);
+  await expectError(startAct(A, S2, "00000000-0000-0000-0000-000000000000"), /Only a published activity/);
+  eq((await sessionWords(S2)).rows.length, 0, "words");
+  const s = await as(null, null, `select type, activity_id from sessions where id = '${S2}'`);
+  eq(s.rows, [{ type: "manual", activity_id: null }], "session unchanged");
+  await as(null, null, `delete from activities where id = '${draft}'`);
+  await as(null, null, `delete from sessions where id = '${S2}'`);
+});
+await check("start: a session that has started, or already has words, is refused", async () => {
+  await expectError(startAct(A, "5a000000-0000-0000-0000-000000000000", ACT), /already started/); // in_progress
+  const S3 = "5f000000-0000-0000-0000-000000000000";
+  await as(null, null, `insert into sessions (id, teacher_id, name) values ('${S3}', '${A}', 'Has words')`);
+  await as(null, null, `insert into session_words (session_id, word, order_index) values ('${S3}', 'BEE', 0)`);
+  await expectError(startAct(A, S3, ACT), /already has words/);
+  await as(null, null, `delete from sessions where id = '${S3}'`);
+});
+await check("start: gaps in positions → order_index 0, 1, 2", async () => {
+  const G = "ac600000-0000-0000-0000-000000000000", S4 = "5f100000-0000-0000-0000-000000000000";
+  await as(D, "authenticated", `insert into activities (id, name) values ('${G}', 'Gaps')`);
+  await as(D, "authenticated", `insert into activity_words (activity_id, position, word) values ('${G}', 10, 'B'), ('${G}', 2, 'A'), ('${G}', 40, 'C')`);
+  await as(D, "authenticated", `update activities set status = 'published' where id = '${G}'`);
+  await as(null, null, `insert into sessions (id, teacher_id, name) values ('${S4}', '${A}', 'Gaps run')`);
+  await startAct(A, S4, G);
+  eq((await sessionWords(S4)).rows.map((x) => [x.word, x.order_index]), [["A", 0], ["B", 1], ["C", 2]], "order");
+});
+await check("hiding, then deleting, an activity leaves the session, its words and answers alone", async () => {
+  const G = "ac600000-0000-0000-0000-000000000000", S4 = "5f100000-0000-0000-0000-000000000000";
+  const sw = (await as(null, null, `select id from session_words where session_id = '${S4}' and order_index = 0`)).rows[0].id;
+  await as(null, null, `insert into word_attempts (student_id, session_id, session_word_id, word, is_correct, audio_path)
+    values ('${ANA}', '${S4}', '${sw}', 'A', true, '${S4}/${ANA}/1_a.wav')`);
+  await as(D, "authenticated", `update activities set status = 'hidden' where id = '${G}'`);
+  await as(null, null, `delete from activities where id = '${G}'`);
+  const s = await as(null, null, `select activity_id, activity_name from sessions where id = '${S4}'`);
+  eq(s.rows, [{ activity_id: null, activity_name: "Gaps" }], "session");
+  eq((await sessionWords(S4)).rows.map((x) => x.word), ["A", "B", "C"], "words");
+  const w = await as(null, null, `select word, is_correct, audio_path from word_attempts where session_id = '${S4}'`);
+  eq(w.rows, [{ word: "A", is_correct: true, audio_path: `${S4}/${ANA}/1_a.wav` }], "answers");
+  await as(null, null, `delete from word_attempts where session_id = '${S4}'`);
+  await as(null, null, `delete from sessions where id = '${S4}'`);
+});
+
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);
