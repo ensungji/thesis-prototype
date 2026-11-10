@@ -545,5 +545,50 @@ await check("hiding, then deleting, an activity leaves the session, its words an
   await as(null, null, `delete from sessions where id = '${S4}'`);
 });
 
+// ── 20 answer_attempts ───────────────────────────────────────────────────────
+const SW_A = "11000000-0000-0000-0000-000000000000"; // CAT in A's session 5a
+const SW_B = "1b000000-0000-0000-0000-000000000000"; // BEE in B's session 5b
+const BEA = "b1000000-0000-0000-0000-000000000000";
+await check("answer_attempts: the service role inserts", async () => {
+  await as(null, "service_role", `insert into answer_attempts (session_word_id, student_id, attempt_no, result, transcript)
+    values ('${SW_A}', '${ANA}', 1, 'wrong', 'cap'), ('${SW_A}', '${ANA}', 2, 'correct', 'cat'),
+           ('${SW_B}', '${BEA}', 1, 'review', '')`);
+});
+await check("answer_attempts: one row per try; result must be correct / wrong / review", async () => {
+  await expectError(as(null, "service_role", `insert into answer_attempts (session_word_id, student_id, attempt_no, result)
+    values ('${SW_A}', '${ANA}', 2, 'wrong')`), /answer_attempts_one_per_try/);
+  await expectError(as(null, "service_role", `insert into answer_attempts (session_word_id, student_id, attempt_no, result)
+    values ('${SW_A}', '${ANA}', 3, 'missed')`), /answer_attempts_result_check/);
+  await expectError(as(null, "service_role", `insert into answer_attempts (session_word_id, student_id, attempt_no, result)
+    values ('${SW_A}', '${ANA}', 0, 'wrong')`), /answer_attempts_attempt_no_check/);
+  await expectError(as(null, "service_role", `insert into answer_attempts (session_word_id, student_id, attempt_no, result)
+    values ('00000000-0000-0000-0000-000000000000', '${ANA}', 1, 'wrong')`), /foreign key/);
+});
+await check("answer_attempts: the session's teacher reads theirs, admin reads all, other teacher none", async () => {
+  const a = await as(A, "authenticated", `select attempt_no, result from answer_attempts order by attempt_no`);
+  eq(a.rows, [{ attempt_no: 1, result: "wrong" }, { attempt_no: 2, result: "correct" }], "teacher A");
+  const b = await as(B, "authenticated", `select count(*)::int as n from answer_attempts where student_id = '${ANA}'`);
+  eq(b.rows, [{ n: 0 }], "teacher B sees A's");
+  const d = await as(D, "authenticated", `select count(*)::int as n from answer_attempts`);
+  eq(d.rows, [{ n: 3 }], "admin");
+});
+await check("answer_attempts: teachers and admins can't write, anon can't read", async () => {
+  await expectError(as(A, "authenticated", `insert into answer_attempts (session_word_id, student_id, attempt_no, result)
+    values ('${SW_A}', '${ANA}', 9, 'correct')`), /permission denied/);
+  await expectError(as(A, "authenticated", `update answer_attempts set result = 'correct'`), /permission denied/);
+  await expectError(as(D, "authenticated", `delete from answer_attempts`), /permission denied/);
+  await expectError(as(null, "anon", `select * from answer_attempts`), /permission denied/);
+});
+await check("answer_attempts: deleting a session deletes its tries, never blocks the delete", async () => {
+  const S = "5f200000-0000-0000-0000-000000000000", W = "1f200000-0000-0000-0000-000000000000";
+  await as(null, null, `insert into sessions (id, teacher_id, name) values ('${S}', '${A}', 'Temp')`);
+  await as(null, null, `insert into session_words (id, session_id, word, order_index) values ('${W}', '${S}', 'HI', 0)`);
+  await as(null, "service_role", `insert into answer_attempts (session_word_id, student_id, attempt_no, result) values ('${W}', '${ANA}', 1, 'wrong')`);
+  const d = await as(A, "authenticated", `delete from sessions where id = '${S}' returning id`);
+  eq(d.rows.length, 1, "session deleted");
+  const n = await as(null, null, `select count(*)::int as n from answer_attempts where session_word_id = '${W}'`);
+  eq(n.rows, [{ n: 0 }], "tries left");
+});
+
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);
