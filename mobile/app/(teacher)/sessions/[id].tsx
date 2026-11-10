@@ -2196,8 +2196,8 @@ export default function SessionDetail() {
           </View>
           <Text style={styles.deleteTitle}>Delete this session?</Text>
           <Text style={styles.deleteSub}>
-            {"This permanently removes the session and all its associated data. This cannot be undone."
-            }
+            {/* Results are kept: word_attempts survive a deleted session (migration 21, ON DELETE SET NULL) */}
+            {"This deletes the session. Your students' results stay in their progress."}
           </Text>
           <View style={styles.sheetActions}>
             <Pressable
