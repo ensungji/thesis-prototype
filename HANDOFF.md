@@ -1,6 +1,6 @@
 # Braille D.O.T.S. — Handoff
 
-Last updated: 7 Nov 2026. Repo: `github.com/ensungji/thesis-prototype`.
+Last updated: 11 Nov 2026. Repo: `github.com/ensungji/thesis-prototype`.
 Companion files: `AUDIT.md` (audit findings), `TESTING.md` (test checklist), `Braille_DOTS_Test_Results.xlsx` (results + bug list).
 
 ---
@@ -11,15 +11,16 @@ Companion files: `AUDIT.md` (audit findings), `TESTING.md` (test checklist), `Br
 |---|---|
 | **`main`** | Has the full audit work (PR #9 `fix/audit` merged). |
 | **`fix/bugs`** | 7 bug fixes (B-01 to B-07), 2 firmware commits, and app changes C1–C3 (logs CSV export, 20 s break, braille preview pinned at the top). **Pushed, not merged yet.** C1 needs a new preview build. |
-| **Database** | Audit migrations 01–13 run, plus 14 (word times). **Confirm 15 ("No answer") was run.** `LATER_…sql.txt` not run, on purpose. |
-| **Edge functions** | `reset-teacher-password`, `create-teacher`, `set-teacher-active`, `grade-answer`, `register-device` deployed with the new checks. |
+| **`feature/activities`** | Branched from `fix/bugs`. Activities Phases 1–3 (section 2b). **Pushed, not merged, app part not tested.** |
+| **Database** | Migrations 01–14 and **16–22 (Activities) run**. 15 is covered by 21 (it adds the `graded_by` check). `LATER_…sql.txt` not run, on purpose. |
+| **Edge functions** | `reset-teacher-password`, `create-teacher`, `set-teacher-active`, `register-device` deployed with the new checks; **`grade-answer` v7 deployed** (every try saved, tries, correct lock). |
 | **App testing** | 22 pass, 2 partial, 15 waiting for the full device (see the Excel file). The B-01 to B-07 fixes are **not tested yet**. |
 | **Hardware** | Device assembled. Dots respond, but **weak upright** and **cells 1–3 don't respond**. See section 4. |
 
 ### Still to confirm
 - [ ] Wi-Fi password changed (the old one is in public git history, commit `d28b59e`).
 - [ ] Supabase → Authentication → "Allow new users to sign up" is **off**.
-- [ ] Migration 15 (`20261022120200_word_attempts_graded_by_missed.sql`) returned Success.
+- [x] Migration 15: no longer matters. The live table had no `graded_by` check; migration 21 adds it (auto, teacher, missed, skipped).
 
 ---
 
@@ -46,6 +47,27 @@ Companion files: `AUDIT.md` (audit findings), `TESTING.md` (test checklist), `Br
 - `PUNCH_MS` 100 → **250**, `OE_HOLD` 140 → **60** (hold power about 45% → 75%).
 - Heat model counts **real power** (punch 1.0, hold about 0.76), coils **cool slower than they heat** (`COOL_RATE 0.5`), `HEAT_LIMIT_MS` **60 s** (starting value), `[HEAT]` log line for tuning.
 - **Safe `pintest.cpp`:** every write clears all 5 chips, one coil at a time (0.3 s on / 1.2 s off), state 3 off after 10 s, everything off after 3 min. Builds: `state1`–`state5`.
+
+---
+
+## 2b. Activities (`feature/activities`, not merged)
+
+Admin-made word lists that teachers run as a teacher-paced session. Tests: `TESTING.md`, sections "Branch feature/activities" P1–P3.
+
+| Phase | What | State |
+|---|---|---|
+| **1. Database + grade-answer** | Migrations 16–22: `activities` + `activity_words` (edit lock), `duplicate_activity`, sessions type `activity` + `activity_id` / `activity_name` / `current_index`, `start_activity_session`, `answer_attempts` (every try), word_attempts `tries` + re-grade columns + `graded_by` check, grading lock trigger. grade-answer v7. | All run; **47/47** in `supabase/tests/phase1_activities_checks.sql`; v7 deployed. Device tests P1.3 not done. |
+| **2. Admin screens + follow-ups** | Admin → Activities (create, edit draft, paste / Word Bank, time per word, reorder, publish, hide, duplicate, delete draft). Delete-session text, "Activity" label, voice-grade buttons hidden during a session, outbox drops lock refusals. | **Not tested on a phone.** |
+| **3. Activity sessions** | New Session → Activity (published only). Previous / Next (1.5 s guard), skipped rows, pause / resume, end, resume on the same word after a crash. Answers card in every mode: heard / result / tries + ▶ latest try (60 s signed URL). | **Not tested on a phone.** |
+
+**Decisions (keep these)**
+- **Grading lock (all modes):** while a session isn't finished, voice grades (correct, wrong, review) can't be changed; teacher / missed / skipped rows can. Retries replace wrong / review / missed / skipped until correct by voice, which then never changes (DT001; grade-answer answers `"locked": true`). After the end, re-grade anything; the first re-grade keeps the original.
+- **Deleting a session keeps the results** (`session_id` / `session_word_id` → null), so analytics don't change. Tries in `answer_attempts` go with it. Dialog: "This deletes the session. Your students' results stay in their progress."
+- **Published activities can't be edited**, only hidden / un-hidden; duplicate to change one. Only drafts can be deleted. Level = easy / medium / hard. Words A–Z, 1–40 letters, 5–60 s (default 20); a pasted word with anything else is dropped whole and listed.
+- **Sessions copy the words** at start, so hiding / deleting an activity never touches past sessions.
+- **Types in the database:** `manual` (Live), `word_list` (Timed), `activity`. The app tries `live_session` / `timed_sequence` first and falls back on the check error; keep those refused.
+- **Outbox:** a queued change refused with 42501 / DT001 is dropped at once, logged (`sync_dropped`) and shown; other errors still get 5 retries.
+- **Activity mode:** no timer (`duration_seconds` unused), Next is refused offline, Next / End mark unanswered students Skipped, words never shown get no rows.
 
 ---
 
@@ -109,6 +131,7 @@ Coil current is about **200–250 mA** (estimated; **measure one coil's resistan
 4. **Force:** with the device upright, check that pins don't rub in the top plate; then decide on option A, B or C.
 5. **Heat tuning:** once dots lift upright, follow the `HEAT_LIMIT_MS` steps in `TESTING.md` 1.1 (needs a thermometer or IR gun).
 6. **App:** test B-01 to B-07 and C1–C3 on the phone (preview APK), record results in the Excel file, then merge `fix/bugs` into `main`.
+6a. **Activities:** new preview APK from `feature/activities`, run `TESTING.md` P1.3, P2 and P3; then Phase 4 (review screen after a session). Merge after `fix/bugs` (the branch contains it).
 6b. **Firmware team (later):** setup hold about 10 s with a warning sound, error-beep rate limit, setup password in `secrets.ini`, port the v7.1b chunk navigation into v7.3 (**don't flash v7.1b**, it lacks the heat budget and boot safety), then unlimited retries with dots dropping on a correct answer.
 7. **Before the defense:** preview APK build (`eas build --profile preview --platform android`, with `EXPO_PUBLIC_*` env vars set for the preview environment), Round 3 device tests in `TESTING.md`.
 
