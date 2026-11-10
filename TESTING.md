@@ -737,3 +737,71 @@ Sign in as the **admin**.
      Voice grades are locked until the session ends"**; the student's row goes
      back to the voice result (🔒 Voice); the waiting count goes to 0 and stays
      there (no retries). Admin → Logs: one `sync_dropped` entry.
+
+---
+
+## Branch feature/activities: Phase 3 (Activity sessions + answers card)
+
+JS-only (reload a dev build, or a new preview APK). No database changes.
+**Needs grade-answer v7 deployed** (TESTING P1.2) for tries, "locked" and
+the latest-try playback; with v6 the card still works but tries stay at 0/1
+and ▶ plays the word's saved recording.
+Before: an admin has published an activity with at least 4 words, one of
+them twice (e.g. CAT DOG SUN CAT), one 6+ letters (two chunks).
+
+### P3.1 New Session → Activity
+1. **Do:** Sessions → New. **Expect:** three modes stacked: Live Session,
+   Timed Sequence, Activity.
+2. **Do:** tap Activity. **Expect:** the published activities (name, level,
+   word count, first 5 words, "+N more"); hidden and draft ones are not
+   listed. Create is disabled until one is picked; picking one fills an
+   empty name.
+3. **Do:** Create. **Expect:** the setup screen shows
+   "ACTIVITY · <NAME>" and the words in order, read-only (no Add Word, no
+   times, no trash). Assign students like any session; Launch Session.
+4. **Refusal (optional):** pick an activity, then (before tapping Create)
+   have the admin Hide it. Create.
+   **Expect:** toast "Couldn't start the activity · Only a published
+   activity can be started"; no new empty session in the Sessions list.
+
+### P3.2 Running an activity (2 students with devices)
+1. **Launch. Expect:** preview pinned at the top; the card shows **1 / 4**
+   and **CAT** big; both devices show CAT; "Displaying".
+2. **Next** (nobody answered). **Expect:** 2 / 4 DOG on both devices. Tap
+   Next again at once: ignored for 1.5 s (both buttons dimmed).
+   SQL: `select word, student_id, graded_by from word_attempts where session_id = '<id>' order by attempted_at;`
+   → two CAT rows, graded_by **skipped**.
+3. **Previous** → 1 / 4 CAT again; a student answers "cat" by voice.
+   **Expect:** that student's row: `Heard "cat" · Correct · 1 try`; SQL:
+   their CAT row is now graded_by auto (the skipped row was replaced). The
+   other student still shows Skipped (✓ / ✗ available).
+4. **Repeated word:** go to word 4 (CAT again) and answer it.
+   **Expect:** the answer lands on word 4, not word 1 (word 1 keeps its
+   result).
+5. **Long word:** on the 6+ letter word the preview shows "Chunk 1 of 2".
+6. **Crash / reload:** on word 3, close the app from the recent-apps list
+   (or reload the dev build) and open the session again.
+   **Expect:** it comes back on **3 / 4** and the devices show that word again.
+   SQL: `select current_index from sessions where id = '<id>';` → 2.
+7. **Pause** (card or header). **Expect:** devices clear; Paused card says
+   "Word 3 / 4 · Resume shows it again". **Resume** → the word is back on
+   the devices.
+8. **60 s safety:** leave a word up for 60 s.
+   **Expect:** devices clear, safety toast, the card says "Cleared" with
+   **Show word again** (puts it back up) — Next still works.
+9. **Device reconnect:** turn one device off and on while a word is up.
+   **Expect:** "back online · re-sent" toast; the device shows the word.
+10. **End session** (on word 3, one student hasn't answered it) → confirm
+    sheet names the word → End.
+    **Expect:** finished view. SQL: word 3 has a **skipped** row for that
+    student; word 4 (never shown) has **no rows**.
+
+### P3.3 Answers card (Live, Timed and Activity)
+1. In each mode, for the current word: a student who hasn't spoken shows
+   **Waiting for an answer…**; after a wrong try `Heard "dog" · Wrong · 1 try`;
+   after a second try the count goes to 2.
+2. **▶** plays the latest try (say two different wrong words; ▶ plays the
+   second). After the word is correct, answer once more (if the firmware
+   allows): the row stays Correct, the count goes up, and ▶ plays that newest
+   try.
+3. The ✓ / ✗ rules are unchanged (🔒 Voice while the session runs).
