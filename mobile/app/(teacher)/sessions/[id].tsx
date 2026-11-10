@@ -46,6 +46,7 @@ import {
   resolveWordDuration,
   isTimedSequence,
   isLiveSession,
+  isActivitySession,
   getSessionTypeLabel,
   loadWordDurations,
   saveWordDurations,
@@ -67,6 +68,10 @@ type Session = {
   status: string;
   started_at: string | null;
   finished_at: string | null;
+  // Activity sessions (migration 18)
+  activity_id?: string | null;
+  activity_name?: string | null;
+  current_index?: number | null;
 };
 type Device = { id: string; device_code: string; status: string } | null;
 type Student = { id: string; full_name: string; device: Device };
@@ -2015,6 +2020,9 @@ export default function SessionDetail() {
   if (isTimedSequence(session?.type) && sessionWords.length === 0) {
     launchMissing.push("add at least one word");
   }
+  if (isActivitySession(session?.type) && sessionWords.length === 0) {
+    launchMissing.push("the activity's words are missing (create the session again)");
+  }
   if (validPairedAssignedCount === 0) {
     launchMissing.push(
       assignedIds.size === 0
@@ -2634,6 +2642,28 @@ export default function SessionDetail() {
             </>
           )}
 
+
+          {/* Activity: the words copied from the activity (read-only) */}
+          {isActivitySession(session.type) && (
+            <>
+              <Text style={[styles.sectionLabel, { marginTop: 4 }]}>
+                ACTIVITY{session.activity_name ? ` · ${session.activity_name.toUpperCase()}` : ""}
+              </Text>
+              <Text style={styles.sectionHint}>
+                {`${sessionWords.length} word${sessionWords.length === 1 ? "" : "s"}, in this order. You move from word to word with Next and Previous; there's no timer.`}
+              </Text>
+              {sessionWords.length > 0 && (
+                <View style={styles.wordListContainer}>
+                  {sessionWords.map((sw, i) => (
+                    <View key={sw.id} style={styles.sequenceWordRow}>
+                      <Text style={styles.wordIndex}>{String(i + 1).padStart(2, "0")}</Text>
+                      <Text style={styles.sequenceWordText}>{sw.word}</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+            </>
+          )}
 
           {/* Launch button */}
           <Pressable
