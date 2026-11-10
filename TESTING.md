@@ -655,3 +655,85 @@ order by aa.created_at desc limit 10;
    shows false / teacher / true / auto / a time.
 6. **No warnings.** Admin → Logs after the tests: no `try_not_saved` or
    `grade_failed` entries.
+
+---
+
+## Branch feature/activities: Phase 2 (admin Activities screens + follow-ups)
+
+JS-only changes (no new native packages): a dev build picks them up with a
+reload; the phone APK needs a new preview build
+(`eas build --profile preview --platform android`). No database changes.
+
+### P2.1 Admin → Activities
+Sign in as the **admin**.
+1. **Expect:** Admin Panel header has **Activities** (next to Logs). Tap it:
+   chips **All / Draft / Published / Hidden** with counts.
+2. **Do:** **New Activity**, leave the name empty.
+   **Expect:** Create is disabled. Type a name, pick a level (tap it again to
+   clear), optional description, **Create**.
+   **Expect:** the editor opens; status **Draft**, "No words yet".
+3. **Do:** type `cat`, **Add**. Then `dog's`, then `cat` again.
+   **Expect:** CAT added with **20s**. "Not added: dog's (not A–Z letters only)",
+   then "Not added: cat (already in the list)"; the text stays in the box.
+4. **Do:** **Paste a list**: `sun, moon` (new line) `star 3 café`.
+   **Expect:** preview "Will add 3: SUN, MOON, STAR" and "Not added: 3 (…),
+   café (…)". **Add 3**.
+5. **Do:** **From Word Bank**: search, tick two words, **Add 2**.
+   **Expect:** words already in the list say "in list"; the two are added at
+   the end.
+6. **Do:** tap CAT's **20s** chip; − / + and the presets; 30, **Save**.
+   **Expect:** 30s. − stops at 5, + at 60. The total time line updates.
+7. **Do:** ↑ / ↓ on a few words, 🗑 on one. Go back to the list and open it again.
+   **Expect:** the new order is kept; the removed word is gone; the list row
+   shows the right word count.
+8. **Do:** **Edit details**: change the name and level, Save.
+   **Expect:** the header and (after Back) the list row show the change.
+9. **Do:** make a second activity with no words, **Publish**.
+   **Expect:** confirm sheet: "Published activities can't be edited. To
+   change one later, duplicate it." → Publish → warning toast
+   **"Add at least one word before publishing"**; still Draft. Delete this
+   draft: **Delete draft** → confirm → back on the list, gone.
+10. **Do:** the first activity → **Publish** → Publish.
+    **Expect:** status **Published**, toast; no add box, no time / ↑ ↓ / 🗑
+    buttons, the lock note; buttons **Duplicate** and **Hide**; no Delete.
+11. **Do:** **Hide**. **Expect:** status Hidden, it shows under the Hidden chip.
+    **Unhide** → Published again.
+12. **Do:** **Duplicate**.
+    **Expect:** "<name> (copy)" opens as a **Draft** with the same words and
+    times, toast "Copy made". Back → the original is unchanged and still
+    Published.
+13. **Do:** sign in as a **teacher**.
+    **Expect:** no Activities button anywhere (P1.1 already checks that the
+    database hides drafts / hidden ones from teachers).
+
+### P2.2 Follow-ups in the teacher app
+1. **Delete session text.** Open any session → Delete.
+   **Expect:** "This deletes the session. Your students' results stay in their
+   progress." (After deleting, the student's page / Analytics still count those
+   answers.)
+2. **"Activity" label.** Nothing creates activity sessions until Phase 3. To
+   see the label now (optional): make a throwaway session, then in the SQL
+   Editor `update sessions set type = 'activity' where name = '<its name>';`
+   **Expect:** Sessions list and Dashboard show **Activity**. Delete it after.
+3. **Voice grades locked during a session.** Live session, one student with
+   a device, one without an answer.
+   - The student answers by voice.
+     **Expect:** in Grade by hand that student shows a grey **🔒 Voice** label
+     instead of ✓ / ✗ (also for a Review answer). The hint says voice grades
+     can be changed after the session ends.
+   - The student with no answer yet: ✓ / ✗ are there; tap ✓ → "graded by
+     you", buttons stay. A word that ended with **No answer** keeps ✓ / ✗ too.
+   - Finish the session → results → tap the student.
+     **Expect:** ✓ / ✗ next to every word, voice answers included; changing
+     one saves (TESTING P1.3 step 5 shows the saved original).
+4. **Outbox drops a refused grade.** Live session; a student with **no answer
+   yet** for the current word.
+   - Phone in airplane mode (red "Offline" bar). Tap ✓ for that student.
+     **Expect:** "1 change waiting".
+   - While the phone is still offline, the student answers by voice on the
+     device (the device has its own Wi-Fi).
+   - Airplane mode off.
+     **Expect:** within a few seconds a warning toast **"A grade wasn't saved ·
+     Voice grades are locked until the session ends"**; the student's row goes
+     back to the voice result (🔒 Voice); the waiting count goes to 0 and stays
+     there (no retries). Admin → Logs: one `sync_dropped` entry.
