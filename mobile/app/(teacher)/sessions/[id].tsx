@@ -142,10 +142,14 @@ function FiveCellDisplay({ chunk }: { chunk: string }) {
 
 // ── Voice answer grading helpers ──────────────────────────────────────────────
 
-type AttemptStatus = "correct" | "wrong" | "review" | "missed";
+type AttemptStatus = "correct" | "wrong" | "review" | "missed" | "skipped";
+
+// "No answer" / "Skipped": a row the app saved, not an answer the student gave
+const isNoAnswerRow = (a: WordAttempt) => a.graded_by === "missed" || a.graded_by === "skipped";
 
 function attemptStatus(a: WordAttempt): AttemptStatus {
   if (a.graded_by === "missed") return "missed"; // saved when the word ended unanswered (counts as wrong)
+  if (a.graded_by === "skipped") return "skipped"; // Activity: Next / End before an answer (counts as wrong)
   if (a.needs_review) return "review";
   return a.is_correct ? "correct" : "wrong";
 }
@@ -155,13 +159,14 @@ const STATUS_STYLE: Record<AttemptStatus, { bg: string; fg: string; label: strin
   wrong:   { bg: C.redBg,   fg: C.red,   label: "✗ Wrong",     short: "Wrong" },
   review:  { bg: C.brownBg, fg: C.brown, label: "⚠ Review",    short: "Review" },
   missed:  { bg: C.border,  fg: C.muted, label: "– No answer", short: "No answer" },
+  skipped: { bg: C.border,  fg: C.muted, label: "» Skipped",   short: "Skipped" },
 };
 
 // Where a grade change is saved. A "No answer" row is matched on student +
 // word: if a voice answer reached the server first, the row the phone made
 // was never added, and the grade must land on the voice answer instead.
 function attemptMatch(a: WordAttempt): Record<string, string> {
-  return a.graded_by === "missed" && a.session_word_id && a.student_id
+  return isNoAnswerRow(a) && a.session_word_id && a.student_id
     ? { session_word_id: a.session_word_id, student_id: a.student_id }
     : { id: a.id };
 }
@@ -816,11 +821,15 @@ export default function SessionDetail() {
     setRefreshing(false);
 
     // Restore last-broadcast word whenever the session is active or just resumed
-    if (
-      (fetchedSession?.status === "in_progress" ||
-        fetchedSession?.status === "paused") &&
-      fetchedWords.length > 0
-    ) {
+    const running =
+      fetchedSession?.status === "in_progress" || fetchedSession?.status === "paused";
+    if (isActivitySession(fetchedSession?.type)) {
+      // The position lives on the server (sessions.current_index). Only the
+      // FIRST load of this screen reads it; a pending session (Launch sets the
+      // position itself) or a finished one has nothing to restore later.
+      if (running && fetchedWords.length > 0) restoreActivityPosition(fetchedSession, fetchedWords);
+      else activityRestoredRef.current = true;
+    } else if (running && fetchedWords.length > 0) {
       await restoreWordPosition(id, fetchedWords, fetchedSession);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1182,8 +1191,13 @@ export default function SessionDetail() {
   // with an id made here, and ON CONFLICT (word, student) DO NOTHING, so a
   // retry never duplicates it and an answer already on the server is kept.
   // A later voice answer replaces it (grade-answer); a teacher's grade wins.
+  // Activity sessions save 'skipped' instead (Next / End session): same rules,
+  // and going back with Previous lets the student answer it by voice.
   const noAnswerSavedRef = useRef<Set<string>>(new Set()); // "wordId:studentId"
-  async function recordNoAnswers(sw: { id: string; word: string } | null | undefined) {
+  async function recordNoAnswers(
+    sw: { id: string; word: string } | null | undefined,
+    gradedBy: "missed" | "skipped" = "missed"
+  ) {
     const wordId = asWordId(sw?.id);
     if (!sw || !wordId || !id) return;
     const rows = allStudents
@@ -1201,7 +1215,7 @@ export default function SessionDetail() {
         session_word_id: wordId,
         is_correct: false,
         needs_review: false,
-        graded_by: "missed",
+        graded_by: gradedBy,
         response_time_ms: null,
         attempted_at: new Date().toISOString(),
       }));
@@ -1217,9 +1231,9 @@ export default function SessionDetail() {
       if (error) {
         setLiveAttempts((prev) => prev.filter((a) => a.id !== row.id));
         noAnswerSavedRef.current.delete(`${wordId}:${row.student_id}`);
-        logEvent("error", "no_answer_not_saved", `Couldn't save "No answer" for ${sw.word}: ${error}`, {
+        logEvent("error", "no_answer_not_saved", `Couldn't save "${gradedBy === "skipped" ? "Skipped" : "No answer"}" for ${sw.word}: ${error}`, {
           session_id: id,
-          meta: { session_word_id: wordId, student_id: row.student_id },
+          meta: { session_word_id: wordId, student_id: row.student_id, graded_by: gradedBy },
         });
       } else if (!queued) {
         sentNow = true;
@@ -1676,6 +1690,12 @@ export default function SessionDetail() {
       await doSendWord(firstWord.word);
     }
 
+    // Activity: the first word goes up at once; the teacher moves on with Next
+    if (isActivitySession(session?.type) && sessionWords.length > 0) {
+      saveActivityIndex(0);
+      await showActivityWord(0);
+    }
+
     setSaving(false);
   }
 
@@ -1753,6 +1773,9 @@ export default function SessionDetail() {
       // Resume on chunk 0 on hardware — teacher local chunk navigation is decoupled
       await broadcastChunk(liveChunks, 0, lastSentWord);
       startLiveSafetyTimer();
+    } else if (isActivitySession(session?.type) && sessionWords.length > 0) {
+      // Resume: the current word goes up again
+      await showActivityWord(Math.min(sessionWords.length - 1, Math.max(0, wordListIndexRef.current)));
     }
   }
 
@@ -1772,6 +1795,11 @@ export default function SessionDetail() {
     }
     await clearDevices("session_finished"); // Release solenoids + finish sound
     if (isLiveSession(session?.type)) await recordNoAnswers(lastLiveWord()); // the last word is over
+    // Activity: the current word's unanswered students are skipped; words never
+    // shown get no rows (they weren't attempted)
+    if (isActivitySession(session?.type)) {
+      await recordNoAnswers(sessionWordsRef.current[wordListIndexRef.current], "skipped");
+    }
     setActiveWordId(null);
     activeWordIdRef.current = null;
     setWordSent(false);
@@ -1971,6 +1999,100 @@ export default function SessionDetail() {
       });
     }
   }
+
+  // ══ ACTIVITY SESSION (type 'activity'): teacher-paced word list ════════════
+  // The current word is sessionWords[wordListIndex]. Its position is saved in
+  // sessions.current_index on every move, so after a crash or reload the
+  // session comes back on the same word and sends it again. Each word goes to
+  // the devices with ITS OWN session_word_id (two equal words stay apart).
+  // Live's pieces are reused: broadcastChunk, the 60 s safety kill-switch
+  // (startLiveSafetyTimer) and the re-send when a device reconnects
+  // (presenceHandler reads activeWordIdRef / chunksRef / lastSentWordRef).
+  // No timer: duration_seconds isn't used here.
+
+  const NAV_GUARD_MS = 1500; // Previous / Next: ignore a second tap this soon
+  const navLockedUntilRef = useRef(0);
+  const [navLocked, setNavLocked] = useState(false);
+  const activityRestoredRef = useRef(false); // position taken from the server once per screen
+  const [activityResendPending, setActivityResendPending] = useState(false);
+
+  /** Put word `idx` on every assigned device (and the preview), start the 60 s safety timer. */
+  async function showActivityWord(idx: number) {
+    const sw = sessionWordsRef.current[idx];
+    if (!sw) return;
+    wordListIndexRef.current = idx;
+    setWordListIndex(idx);
+    setActiveWordId(sw.id);
+    activeWordIdRef.current = sw.id; // broadcastChunk sends this as session_word_id
+    setLastSentWord(sw.word);
+    lastSentWordRef.current = sw.word;
+    const newChunks = wordToChunks(sw.word);
+    setChunks(newChunks);
+    chunksRef.current = newChunks;
+    setChunkIndex(0);
+    chunkIndexRef.current = 0;
+    setWordSent(true);
+    startLiveSafetyTimer();
+    await broadcastChunk(newChunks, 0, sw.word);
+  }
+
+  function saveActivityIndex(idx: number) {
+    setSession((prev) => (prev ? { ...prev, current_index: idx } : prev));
+    // Offline: kept on the phone and sent when the connection is back
+    updateOrQueue("sessions", { current_index: idx }, { id: id! }).then(({ error }) => {
+      if (error) {
+        logEvent("error", "activity_index_not_saved", `Word position ${idx + 1} not saved: ${error}`, {
+          session_id: id ?? null,
+        });
+      }
+    });
+  }
+
+  /** Previous (-1) / Next (+1). Next marks the current word's unanswered students as skipped. */
+  async function moveActivity(dir: -1 | 1) {
+    const now = Date.now();
+    if (now < navLockedUntilRef.current) return; // double tap
+    const words = sessionWordsRef.current;
+    const cur = wordListIndexRef.current;
+    const next = cur + dir;
+    if (next < 0 || next >= words.length) return;
+    if (!isOnline()) {
+      showValidationToast("You're offline", "Connect to the internet to send the next word.");
+      return;
+    }
+    navLockedUntilRef.current = now + NAV_GUARD_MS;
+    setNavLocked(true);
+    setTimeout(() => setNavLocked(false), NAV_GUARD_MS);
+    if (dir === 1) recordNoAnswers(words[cur], "skipped"); // moving on: no answer = skipped
+    saveActivityIndex(next);
+    await showActivityWord(next);
+  }
+
+  /** On the first load of this screen: where the session was (sessions.current_index). */
+  function restoreActivityPosition(s: Session, words: SessionWord[]) {
+    if (activityRestoredRef.current) return; // later reloads keep the position on screen
+    activityRestoredRef.current = true;
+    const idx = Math.min(words.length - 1, Math.max(0, s.current_index ?? 0));
+    wordListIndexRef.current = idx;
+    setWordListIndex(idx);
+    setLastSentWord(words[idx].word);
+    lastSentWordRef.current = words[idx].word;
+    // Still running (the app crashed or was reloaded): send the word again
+    if (s.status === "in_progress") setActivityResendPending(true);
+  }
+
+  // Runs once students / devices are on screen, so broadcastChunk reaches them
+  useEffect(() => {
+    if (!activityResendPending) return;
+    if (session?.status !== "in_progress" || allStudents.length === 0 || sessionWords.length === 0) return;
+    setActivityResendPending(false);
+    const idx = wordListIndexRef.current;
+    logEvent("info", "activity_resumed", `Activity reopened on word ${idx + 1}: re-sent "${sessionWords[idx]?.word}"`, {
+      session_id: id ?? null,
+    });
+    showActivityWord(idx);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activityResendPending, session?.status, allStudents, sessionWords]);
 
   // ── Render helpers ──────────────────────────────────────────────────────────
 
@@ -2212,9 +2334,15 @@ export default function SessionDetail() {
             <Ionicons name="flag-outline" size={28} color={C.green} />
             <Text style={styles.finishPreviewText}>{session?.name}</Text>
           </View>
-          <Text style={styles.deleteTitle}>Finish this session?</Text>
+          <Text style={styles.deleteTitle}>
+            {isActivitySession(session?.type) ? "End this session?" : "Finish this session?"}
+          </Text>
           <Text style={styles.deleteSub}>
-            {"Mark this session as finished. Students will no longer be able to respond. This cannot be undone."}
+            {isActivitySession(session?.type)
+              ? `Students who haven't answered ${
+                  sessionWords[wordListIndex] ? `"${sessionWords[wordListIndex].word}"` : "the current word"
+                } are marked Skipped. Words you didn't show get no result. This cannot be undone.`
+              : "Mark this session as finished. Students will no longer be able to respond. This cannot be undone."}
           </Text>
           <View style={styles.sheetActions}>
             <Pressable
@@ -2240,7 +2368,9 @@ export default function SessionDetail() {
               {finishingSession ? (
                 <ActivityIndicator color={C.white} />
               ) : (
-                <Text style={styles.btnFinishConfirmText}>Finish Session</Text>
+                <Text style={styles.btnFinishConfirmText}>
+                  {isActivitySession(session?.type) ? "End Session" : "Finish Session"}
+                </Text>
               )}
             </Pressable>
           </View>
@@ -2337,7 +2467,7 @@ export default function SessionDetail() {
                 pressed && { opacity: 0.8 },
               ]}
             >
-              <Text style={styles.finishBtnText}>Finish</Text>
+              <Text style={styles.finishBtnText}>{isActivitySession(session.type) ? "End" : "Finish"}</Text>
             </Pressable>
           </>
         )}
@@ -2807,9 +2937,13 @@ export default function SessionDetail() {
                 manualWord/sessionWords fallback that could show the last word
                 in the list rather than the last *sent* word. */}
             <View style={styles.pausedLastWord}>
-              <Text style={styles.pausedLastWordLabel}>Last word sent</Text>
+              <Text style={styles.pausedLastWordLabel}>
+                {isActivitySession(session.type)
+                  ? `Word ${wordListIndex + 1} / ${sessionWords.length} · Resume shows it again`
+                  : "Last word sent"}
+              </Text>
               <Text style={styles.pausedLastWordValue}>
-                {lastSentWord || "—"}
+                {(isActivitySession(session.type) ? sessionWords[wordListIndex]?.word : lastSentWord) || "—"}
               </Text>
             </View>
 
@@ -2831,7 +2965,7 @@ export default function SessionDetail() {
                   pressed && { opacity: 0.8 },
                 ]}
               >
-                <Text style={styles.finishPausedBtnText}>Finish Session</Text>
+                <Text style={styles.finishPausedBtnText}>{isActivitySession(session.type) ? "End Session" : "Finish Session"}</Text>
               </Pressable>
             </View>
           </View>
@@ -3086,7 +3220,7 @@ export default function SessionDetail() {
                         </Text>
 
                         {/* Spoken input — recording + what Whisper heard */}
-                        {attempt && attempt.graded_by !== "missed" ? (
+                        {attempt && !isNoAnswerRow(attempt) ? (
                           <View style={{ flex: 2, flexDirection: "row", alignItems: "center", gap: 6 }}>
                             <PlayRecordingButton path={attempt.audio_path ?? null} />
                             <Text
@@ -3507,6 +3641,132 @@ export default function SessionDetail() {
             )}
           </>
         )}
+
+        {/* ── ACTIVITY: teacher-paced word list (Previous / Next) ─────────── */}
+        {isActivitySession(session.type) && sessionWords.length > 0 && (() => {
+          const current = sessionWords[wordListIndex];
+          const atFirst = wordListIndex <= 0;
+          const atLast = wordListIndex >= sessionWords.length - 1;
+          const showing = !!activeWordId && wordSent;
+          return (
+            <>
+              <View style={[styles.sectionCard, styles.sectionCardActiveLive]}>
+                <View style={styles.liveCardHeader}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flex: 1 }}>
+                    <Ionicons name="list-outline" size={16} color={C.navy} />
+                    <Text style={styles.cardLabel} numberOfLines={1}>
+                      ACTIVITY{session.activity_name ? ` · ${session.activity_name.toUpperCase()}` : ""}
+                    </Text>
+                  </View>
+                  <View style={styles.activeDisplayBadge}>
+                    {showing && <Animated.View style={[styles.liveDot, { opacity: pulseAnim }]} />}
+                    <Text style={styles.activeDisplayBadgeText}>{showing ? "Displaying" : "Cleared"}</Text>
+                  </View>
+                </View>
+
+                <View style={styles.activeLiveHero} accessible accessibilityLabel={`Word ${wordListIndex + 1} of ${sessionWords.length}: ${current?.word}`}>
+                  <Text style={styles.activityCounter}>
+                    {wordListIndex + 1} / {sessionWords.length}
+                  </Text>
+                  <Text style={styles.activityWordText} adjustsFontSizeToFit numberOfLines={1}>
+                    {current?.word}
+                  </Text>
+                  {!showing && (
+                    <Text style={styles.activeLiveWordSub}>
+                      The display was cleared (60 s safety limit). Show the word again, or move on.
+                    </Text>
+                  )}
+                </View>
+
+                {!showing && (
+                  <Pressable
+                    onPress={() => showActivityWord(wordListIndex)}
+                    style={({ pressed }) => [styles.activityAgainBtn, pressed && { opacity: 0.85 }]}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Show ${current?.word} on the devices again`}
+                  >
+                    <Ionicons name="refresh" size={18} color={C.navy} />
+                    <Text style={styles.activityAgainText}>Show word again</Text>
+                  </Pressable>
+                )}
+
+                <View style={styles.activityNavRow}>
+                  <Pressable
+                    onPress={() => moveActivity(-1)}
+                    disabled={atFirst || navLocked}
+                    style={({ pressed }) => [
+                      styles.activityNavBtn,
+                      (atFirst || navLocked) && { opacity: 0.4 },
+                      pressed && { opacity: 0.8 },
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Previous word"
+                    accessibilityState={{ disabled: atFirst || navLocked }}
+                  >
+                    <Ionicons name="chevron-back" size={22} color={C.navy} />
+                    <Text style={styles.activityNavText}>Previous</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={() => moveActivity(1)}
+                    disabled={atLast || navLocked}
+                    style={({ pressed }) => [
+                      styles.activityNavBtn,
+                      styles.activityNavBtnPrimary,
+                      (atLast || navLocked) && { opacity: 0.4 },
+                      pressed && { opacity: 0.85 },
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Next word"
+                    accessibilityHint="Students who haven't answered this word are marked skipped"
+                    accessibilityState={{ disabled: atLast || navLocked }}
+                  >
+                    <Text style={[styles.activityNavText, { color: "#1A1200" }]}>Next</Text>
+                    <Ionicons name="chevron-forward" size={22} color="#1A1200" />
+                  </Pressable>
+                </View>
+                <Text style={styles.deviceHint}>
+                  {atLast
+                    ? "Last word. Tap End session when the students are done."
+                    : "Next marks students who haven't answered as Skipped. Previous lets them try it again."}
+                </Text>
+
+                <View style={styles.activityNavRow}>
+                  <Pressable
+                    onPress={() => pauseSession(false)}
+                    style={({ pressed }) => [styles.activitySecondaryBtn, pressed && { opacity: 0.8 }]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Pause: clears every device"
+                  >
+                    <Ionicons name="pause" size={16} color={C.brown} />
+                    <Text style={[styles.activitySecondaryText, { color: C.brown }]}>Pause</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={confirmFinish}
+                    style={({ pressed }) => [
+                      styles.activitySecondaryBtn,
+                      { borderColor: C.green, backgroundColor: C.greenBg },
+                      pressed && { opacity: 0.8 },
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel="End session"
+                  >
+                    <Ionicons name="flag-outline" size={16} color={C.green} />
+                    <Text style={[styles.activitySecondaryText, { color: C.green }]}>End session</Text>
+                  </Pressable>
+                </View>
+              </View>
+
+              <HandGradeCard
+                word={current?.word ?? ""}
+                wordId={current?.id ?? null}
+                students={assignedStudents}
+                attempts={liveAttempts}
+                sessionStatus={session.status}
+                onGrade={gradeByHand}
+              />
+            </>
+          );
+        })()}
 
         {/* ── TIMED SEQUENCE: Auto-cycle playback engine ──────────── */}
         {isTimedSequence(session.type) && sessionWords.length > 0 && (
@@ -4570,6 +4830,57 @@ const styles = StyleSheet.create({
     color: C.navy,
     letterSpacing: 4,
   },
+  // Activity session
+  activityCounter: { fontFamily: fonts.heading, fontSize: 18, color: C.brown, letterSpacing: 1 },
+  activityWordText: {
+    fontFamily: fonts.mono,
+    fontSize: 44,
+    fontWeight: "700",
+    color: C.navy,
+    letterSpacing: 5,
+    alignSelf: "stretch",
+    textAlign: "center",
+  },
+  activityNavRow: { flexDirection: "row", gap: 10 },
+  activityNavBtn: {
+    flex: 1,
+    minHeight: 56,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderColor: C.navy,
+    backgroundColor: C.white,
+  },
+  activityNavBtnPrimary: { backgroundColor: C.amber, borderColor: C.amber },
+  activityNavText: { fontFamily: fonts.heading, fontSize: 17, color: C.navy },
+  activityAgainBtn: {
+    minHeight: 48,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderColor: C.navy,
+    backgroundColor: C.blueWash,
+  },
+  activityAgainText: { fontFamily: fonts.heading, fontSize: 15, color: C.navy },
+  activitySecondaryBtn: {
+    flex: 1,
+    minHeight: 48,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderColor: C.amber,
+    backgroundColor: C.brownBg,
+  },
+  activitySecondaryText: { fontFamily: fonts.heading, fontSize: 15 },
   activeLiveWordSub: {
     fontFamily: fonts.body,
     fontSize: 12,
