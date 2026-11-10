@@ -93,6 +93,7 @@ type WordAttempt = {
   needs_review?: boolean | null;
   audio_path?: string | null;
   graded_by?: string | null;
+  tries?: number | null; // voice answers for this word (migration 21, set by grade-answer)
 };
 type StudentSessionStats = { student: Student; attempts: WordAttempt[] };
 
@@ -203,11 +204,42 @@ function latestAttempt(list: WordAttempt[]): WordAttempt | null {
   return best;
 }
 
-// Plays a student's recording from the private "answers" bucket
-function PlayRecordingButton({ path }: { path: string | null }) {
+// A signed link to a recording works this long (the "answers" bucket is
+// private; the storage policy lets a teacher sign only their own students')
+const RECORDING_URL_TTL_SEC = 60;
+
+// The newest recording for one student + word: the last try in answer_attempts
+// (also when the word is locked as correct, so word_attempts keeps the older
+// recording). null when there's none, e.g. before migration 20.
+async function latestRecordingPath(sessionWordId: string, studentId: string): Promise<string | null> {
+  const { data } = await supabase
+    .from("answer_attempts")
+    .select("audio_path")
+    .eq("session_word_id", sessionWordId)
+    .eq("student_id", studentId)
+    .not("audio_path", "is", null)
+    .order("attempt_no", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  return (data?.audio_path as string | undefined) ?? null;
+}
+
+// Plays a student's recording from the private "answers" bucket. Listening
+// only: it never changes a grade. With resolvePath, the path is looked up
+// when tapped (the newest try), falling back to `path`.
+function PlayRecordingButton({
+  path,
+  resolvePath,
+  label = "recording",
+}: {
+  path: string | null;
+  resolvePath?: () => Promise<string | null>;
+  label?: string;
+}) {
   const [loading, setLoading] = useState(false);
   const [playing, setPlaying] = useState(false);
   const playerRef = useRef<AudioPlayer | null>(null);
+  const playable = !!path || !!resolvePath;
 
   useEffect(() => {
     return () => {
@@ -217,14 +249,17 @@ function PlayRecordingButton({ path }: { path: string | null }) {
   }, []);
 
   async function toggle() {
-    if (!path) return;
+    if (!playable) return;
     if (playing && playerRef.current) {
       playerRef.current.pause();
       setPlaying(false);
       return;
     }
     setLoading(true);
-    const { data } = await supabase.storage.from("answers").createSignedUrl(path, 600);
+    const target = (resolvePath ? await resolvePath().catch(() => null) : null) ?? path;
+    const { data } = target
+      ? await supabase.storage.from("answers").createSignedUrl(target, RECORDING_URL_TTL_SEC)
+      : { data: null };
     setLoading(false);
     if (!data?.signedUrl) return;
 
@@ -241,14 +276,15 @@ function PlayRecordingButton({ path }: { path: string | null }) {
   return (
     <Pressable
       onPress={toggle}
-      disabled={!path || loading}
+      disabled={!playable || loading}
       hitSlop={8}
       style={({ pressed }) => [
         styles.playBtn,
-        !path && { opacity: 0.3 },
+        !playable && { opacity: 0.3 },
         pressed && { opacity: 0.7 },
       ]}
-      accessibilityLabel={playing ? "Stop recording" : "Play recording"}
+      accessibilityRole="button"
+      accessibilityLabel={playing ? `Stop ${label}` : `Play ${label}`}
     >
       {loading ? (
         <ActivityIndicator size="small" color={C.navy} />
@@ -259,7 +295,23 @@ function PlayRecordingButton({ path }: { path: string | null }) {
   );
 }
 
-// ── Teacher fallback grading (✓ / ✗ per student, current word) ─────────────
+// ── Answers to the current word: one row per student (all session types) ────
+// Waiting / heard "cat" · Correct · 2 tries, a play button for the newest
+// recording, and ✓ / ✗ for a teacher grade where the grading lock allows it.
+
+/** "Waiting for an answer…", or e.g. `Heard "cat" · Correct · 2 tries · graded by you`. */
+function answerLine(a: WordAttempt | null): string {
+  if (!a) return "Waiting for an answer…";
+  const parts: string[] = [];
+  const voiced = !isNoAnswerRow(a);
+  if (voiced && a.transcript) parts.push(`Heard "${cleanTranscript(a.transcript)}"`);
+  else if (voiced && (a.tries ?? 0) > 0) parts.push("Nothing heard");
+  parts.push(STATUS_STYLE[attemptStatus(a)].short);
+  const tries = a.tries ?? 0;
+  if (tries > 0) parts.push(`${tries} ${tries === 1 ? "try" : "tries"}`);
+  if (a.graded_by === "teacher") parts.push("graded by you");
+  return parts.join(" · ");
+}
 
 function HandGradeCard({
   word,
@@ -286,9 +338,9 @@ function HandGradeCard({
   const w = word.toUpperCase();
   return (
     <View style={styles.sectionCard}>
-      <Text style={styles.cardLabel}>GRADE BY HAND · {w}</Text>
+      <Text style={styles.cardLabel}>ANSWERS · {w}</Text>
       <Text style={hg.hint}>
-        {"Tap ✓ or ✗ if there's no voice answer. Voice grades can be changed after the session ends."}
+        {"▶ plays the student's latest try. Tap ✓ or ✗ if there's no voice answer; voice grades can be changed after the session ends."}
       </Text>
       <View style={{ gap: 8 }}>
         {students.map((st) => {
@@ -298,26 +350,26 @@ function HandGradeCard({
             wordId ? attemptsForWord(mine, { id: wordId, word: w }) : mine.filter((x) => x.word?.toUpperCase() === w)
           );
           const status = a ? attemptStatus(a) : null;
-          const byTeacher = a?.graded_by === "teacher";
+          // A recording exists once the student has spoken (tries), or the row has one
+          const hasRecording = !!a && (!!a.audio_path || (a.tries ?? 0) > 0);
           return (
             <View key={st.id} style={hg.row}>
               <View style={{ flex: 1, gap: 2 }}>
                 <Text style={hg.name} numberOfLines={1}>{st.full_name}</Text>
                 <Text
                   style={[hg.sub, status && { color: STATUS_STYLE[status].fg }]}
-                  numberOfLines={1}
+                  numberOfLines={2}
                 >
-                  {!a
-                    ? "No answer yet"
-                    : STATUS_STYLE[status!].short +
-                      (byTeacher
-                        ? " · graded by you"
-                        : a.transcript
-                        ? ` · heard "${cleanTranscript(a.transcript)}"`
-                        : "")}
+                  {answerLine(a)}
                 </Text>
               </View>
-              {a?.audio_path ? <PlayRecordingButton path={a.audio_path} /> : null}
+              {hasRecording ? (
+                <PlayRecordingButton
+                  path={a?.audio_path ?? null}
+                  resolvePath={wordId ? () => latestRecordingPath(wordId, st.id) : undefined}
+                  label={`${st.full_name}'s latest answer`}
+                />
+              ) : null}
               {voiceGradeLocked(a, sessionStatus) ? (
                 <View
                   style={hg.locked}
@@ -1091,7 +1143,7 @@ export default function SessionDetail() {
     if (!id) return;
     supabase
       .from("word_attempts")
-      .select("id, student_id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id")
+      .select("id, student_id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id, tries")
       .eq("session_id", id)
       .order("attempted_at", { ascending: false })
       .limit(200)
@@ -1114,7 +1166,7 @@ export default function SessionDetail() {
       if (r.table !== "word_attempts") return;
       const { data } = await supabase
         .from("word_attempts")
-        .select("id, student_id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id")
+        .select("id, student_id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id, tries")
         .eq("session_id", id)
         .order("attempted_at", { ascending: false })
         .limit(200);
@@ -1244,7 +1296,7 @@ export default function SessionDetail() {
     if (sentNow) {
       const { data } = await supabase
         .from("word_attempts")
-        .select("id, student_id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id")
+        .select("id, student_id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id, tries")
         .eq("session_word_id", wordId);
       if (data) {
         setLiveAttempts((prev) => [
@@ -2102,7 +2154,7 @@ export default function SessionDetail() {
     setStatsModal(true);
     const { data } = await supabase
       .from("word_attempts")
-      .select("id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id")
+      .select("id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id, tries")
       .eq("student_id", student.id)
       .eq("session_id", id!)
       .order("attempted_at", { ascending: true });
