@@ -441,5 +441,27 @@ await check("duplicate: teacher refused, unknown id refused, anon can't call it"
   eq(n.rows, [{ n: 1 }], "no stray copies");
 });
 
+// ── 18 sessions: type 'activity' + columns ───────────────────────────────────
+await check("session type: manual, word_list, activity allowed; live_session still refused (app fallback)", async () => {
+  const r = await as(A, "authenticated", `insert into sessions (teacher_id, name, type) values
+    ('${A}', 'm', 'manual'), ('${A}', 'w', 'word_list'), ('${A}', 'a', 'activity') returning current_index, activity_id`);
+  eq(r.rows, [0, 0, 0].map((n) => ({ current_index: n, activity_id: null })), "rows");
+  await expectError(as(A, "authenticated", `insert into sessions (teacher_id, name, type) values ('${A}', 'x', 'live_session')`), /sessions_type_check/);
+  await expectError(as(A, "authenticated", `insert into sessions (teacher_id, name, type) values ('${A}', 'x', 'timed_sequence')`), /sessions_type_check/);
+  await expectError(as(A, "authenticated", `update sessions set current_index = -1 where name = 'a'`), /sessions_current_index_check/);
+  await as(null, null, `delete from sessions where name in ('m', 'w', 'a')`);
+});
+await check("deleting an activity keeps the session and its copied name (activity_id → null)", async () => {
+  await as(D, "authenticated", `insert into activities (id, name) values ('ac500000-0000-0000-0000-000000000000', 'Gone')`);
+  await as(D, "authenticated", `insert into activity_words (activity_id, position, word) values ('ac500000-0000-0000-0000-000000000000', 0, 'GO')`);
+  await as(D, "authenticated", `update activities set status = 'published' where id = 'ac500000-0000-0000-0000-000000000000'`);
+  await as(null, null, `insert into sessions (id, teacher_id, name, type, status, activity_id, activity_name)
+    values ('5c000000-0000-0000-0000-000000000000', '${A}', 'S', 'activity', 'finished', 'ac500000-0000-0000-0000-000000000000', 'Gone')`);
+  await as(null, null, `delete from activities where id = 'ac500000-0000-0000-0000-000000000000'`);
+  const r = await as(null, null, `select type, status, activity_id, activity_name from sessions where id = '5c000000-0000-0000-0000-000000000000'`);
+  eq(r.rows, [{ type: "activity", status: "finished", activity_id: null, activity_name: "Gone" }], "session");
+  await as(null, null, `delete from sessions where id = '5c000000-0000-0000-0000-000000000000'`);
+});
+
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);

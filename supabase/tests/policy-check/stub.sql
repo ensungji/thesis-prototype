@@ -86,6 +86,13 @@ create policy "Users can view own profile" on profiles for select using (auth.ui
 
 create policy "Teachers can view own students" on students for select using (auth.uid() = teacher_id);
 create policy "Teachers can view own sessions" on sessions for select using (auth.uid() = teacher_id);
+create policy "Teachers can insert own sessions" on sessions for insert with check (auth.uid() = teacher_id);
+create policy "Teachers can update own sessions" on sessions for update using (auth.uid() = teacher_id);
+create policy "Teachers can delete own sessions" on sessions for delete using (auth.uid() = teacher_id);
+create policy "Teachers can insert own session words" on session_words for insert with check
+  (exists (select 1 from sessions where sessions.id = session_words.session_id and sessions.teacher_id = auth.uid()));
+create policy "Teachers can delete own session words" on session_words for delete using
+  (exists (select 1 from sessions where sessions.id = session_words.session_id and sessions.teacher_id = auth.uid()));
 create policy "Teachers can view own session words" on session_words for select using
   (exists (select 1 from sessions where sessions.id = session_words.session_id and sessions.teacher_id = auth.uid()));
 create policy "Teachers can update own session words" on session_words for update using
