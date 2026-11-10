@@ -265,6 +265,19 @@ export default function AdminDashboard() {
         </View>
         <View style={{ flexDirection: "row", gap: 8 }}>
         <Pressable
+          onPress={() => router.push("/admin/activities" as any)}
+          style={({ pressed }) => [
+            styles.signOutBtn,
+            { backgroundColor: C.blueWash },
+            pressed && { opacity: 0.7 },
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel="Activities"
+        >
+          <Ionicons name="list-outline" size={18} color={C.navy} />
+          <Text style={[styles.signOutText, { color: C.navy }]}>Activities</Text>
+        </Pressable>
+        <Pressable
           onPress={() => router.push("/admin/logs" as any)}
           style={({ pressed }) => [
             styles.signOutBtn,
