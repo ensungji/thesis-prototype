@@ -306,5 +306,107 @@ await check("teacher can override a No answer row (matched on student + word)", 
   await as(null, null, `delete from word_attempts where student_id = '${BEN}'`);
 });
 
+// ── 16 activities ────────────────────────────────────────────────────────────
+const ACT = "ac100000-0000-0000-0000-000000000000";
+await check("admin creates a draft; created_by is the admin, whatever was sent", async () => {
+  const r = await as(D, "authenticated", `insert into activities (id, name, level, created_by)
+    values ('${ACT}', 'Animals', 'easy', '${A}') returning status, created_by, published_at`);
+  eq(r.rows, [{ status: "draft", created_by: D, published_at: null }], "row");
+});
+await check("a new activity can't start as published", () =>
+  expectError(as(D, "authenticated", `insert into activities (name, status) values ('X', 'published')`), /must start as a draft/));
+await check("teacher can't create an activity", () =>
+  expectError(as(A, "authenticated", `insert into activities (name) values ('X')`), /row-level security/));
+await check("activity words: A-Z only, 1-40 letters, 5-60 s, default 20 s", async () => {
+  const r = await as(D, "authenticated", `insert into activity_words (activity_id, position, word)
+    values ('${ACT}', 0, 'CAT') returning duration_seconds`);
+  eq(r.rows, [{ duration_seconds: 20 }], "default");
+  await as(D, "authenticated", `insert into activity_words (activity_id, position, word, duration_seconds)
+    values ('${ACT}', 1, 'DOG', 30), ('${ACT}', 2, 'SUN', 5)`);
+  for (const [w, d] of [["cat", 20], ["CAT1", 20], ["", 20], ["A".repeat(41), 20], ["COW", 4], ["COW", 61]]) {
+    await expectError(as(D, "authenticated", `insert into activity_words (activity_id, position, word, duration_seconds)
+      values ('${ACT}', 9, '${w}', ${d})`), /activity_words_(word_check|duration_range)/);
+  }
+  await as(D, "authenticated", `insert into activity_words (activity_id, position, word) values ('${ACT}', 9, '${"A".repeat(40)}')`);
+  await as(D, "authenticated", `delete from activity_words where activity_id = '${ACT}' and position = 9`);
+});
+await check("draft words can be reordered in one statement (swap positions)", async () => {
+  await as(D, "authenticated", `update activity_words set position = 1 - position where activity_id = '${ACT}' and position in (0, 1)`);
+  const r = await as(D, "authenticated", `select word from activity_words where activity_id = '${ACT}' order by position`);
+  eq(r.rows.map((x) => x.word), ["DOG", "CAT", "SUN"], "order");
+});
+await check("teacher sees no drafts", async () => {
+  const r = await as(A, "authenticated", `select count(*)::int as n from activities`);
+  const w = await as(A, "authenticated", `select count(*)::int as n from activity_words`);
+  eq([r.rows[0].n, w.rows[0].n], [0, 0], "visible");
+});
+await check("a draft with no words can't be published; a draft can't be hidden", async () => {
+  await as(D, "authenticated", `insert into activities (id, name) values ('ac200000-0000-0000-0000-000000000000', 'Empty')`);
+  await expectError(as(D, "authenticated", `update activities set status = 'published' where id = 'ac200000-0000-0000-0000-000000000000'`), /at least one word/);
+  await expectError(as(D, "authenticated", `update activities set status = 'hidden' where id = 'ac200000-0000-0000-0000-000000000000'`), /before hiding/);
+});
+await check("publish sets published_at; teacher then reads it and its words", async () => {
+  const p = await as(D, "authenticated", `update activities set status = 'published' where id = '${ACT}' returning published_at`);
+  if (!p.rows[0].published_at) throw new Error("published_at not set");
+  const r = await as(A, "authenticated", `select name from activities`);
+  const w = await as(A, "authenticated", `select count(*)::int as n from activity_words`);
+  eq([r.rows.map((x) => x.name), w.rows[0].n], [["Animals"], 3], "visible");
+});
+await check("published: no edits, no word changes, no going back to draft", async () => {
+  await expectError(as(D, "authenticated", `update activities set name = 'Pets' where id = '${ACT}'`), /can't be edited/);
+  await expectError(as(D, "authenticated", `update activities set published_at = now() - interval '1 day' where id = '${ACT}'`), /can't be edited/);
+  await expectError(as(D, "authenticated", `update activities set status = 'draft' where id = '${ACT}'`), /back to draft/);
+  await expectError(as(D, "authenticated", `insert into activity_words (activity_id, position, word) values ('${ACT}', 5, 'COW')`), /can't be changed/);
+  await expectError(as(D, "authenticated", `update activity_words set duration_seconds = 10 where activity_id = '${ACT}'`), /can't be changed/);
+  await expectError(as(D, "authenticated", `delete from activity_words where activity_id = '${ACT}'`), /can't be changed/);
+  // the lock holds for the SQL editor / service role too
+  await expectError(as(null, null, `update activities set name = 'Pets' where id = '${ACT}'`), /can't be edited/);
+  await expectError(as(null, null, `update activity_words set word = 'COW' where activity_id = '${ACT}'`), /can't be changed/);
+});
+await check("a word can't be moved from a draft into a published activity", async () => {
+  await as(D, "authenticated", `insert into activity_words (activity_id, position, word) values ('ac200000-0000-0000-0000-000000000000', 0, 'COW')`);
+  return expectError(as(D, "authenticated", `update activity_words set activity_id = '${ACT}', position = 7
+    where activity_id = 'ac200000-0000-0000-0000-000000000000'`), /can't be changed/);
+});
+await check("teacher can't change or delete a published activity", async () => {
+  const u = await as(A, "authenticated", `update activities set status = 'hidden' where id = '${ACT}' returning id`);
+  const d = await as(A, "authenticated", `delete from activities where id = '${ACT}' returning id`);
+  eq([u.rows.length, d.rows.length], [0, 0], "rows");
+});
+await check("admin can't delete a published activity (hide it instead)", async () => {
+  const d = await as(D, "authenticated", `delete from activities where id = '${ACT}' returning id`);
+  eq(d.rows.length, 0, "rows deleted");
+});
+await check("hide → teachers no longer see it; un-hide keeps the first published_at", async () => {
+  const before = await as(null, null, `select published_at from activities where id = '${ACT}'`);
+  await as(D, "authenticated", `update activities set status = 'hidden' where id = '${ACT}'`);
+  const r = await as(A, "authenticated", `select count(*)::int as n from activities`);
+  const w = await as(A, "authenticated", `select count(*)::int as n from activity_words`);
+  eq([r.rows[0].n, w.rows[0].n], [0, 0], "teacher sees");
+  await expectError(as(D, "authenticated", `update activities set status = 'draft' where id = '${ACT}'`), /back to draft/);
+  await as(D, "authenticated", `update activities set status = 'published' where id = '${ACT}'`);
+  const after = await as(null, null, `select published_at from activities where id = '${ACT}'`);
+  eq(String(after.rows[0].published_at), String(before.rows[0].published_at), "published_at");
+});
+await check("admin deletes a draft; its words go with it", async () => {
+  const d = await as(D, "authenticated", `delete from activities where id = 'ac200000-0000-0000-0000-000000000000' returning id`);
+  eq(d.rows.length, 1, "deleted");
+  const w = await as(null, null, `select count(*)::int as n from activity_words where activity_id = 'ac200000-0000-0000-0000-000000000000'`);
+  eq(w.rows, [{ n: 0 }], "words left");
+});
+await check("deleting the creator's profile keeps the published activity (created_by → null)", async () => {
+  const E = "eeeeeeee-0000-0000-0000-000000000000";
+  await as(null, null, `insert into profiles (id, role) values ('${E}', 'admin')`);
+  await as(E, "authenticated", `insert into activities (id, name) values ('ac300000-0000-0000-0000-000000000000', 'Temp')`);
+  await as(E, "authenticated", `insert into activity_words (activity_id, position, word) values ('ac300000-0000-0000-0000-000000000000', 0, 'HI')`);
+  await as(E, "authenticated", `update activities set status = 'published' where id = 'ac300000-0000-0000-0000-000000000000'`);
+  await as(null, null, `delete from profiles where id = '${E}'`);
+  const r = await as(null, null, `select status, created_by from activities where id = 'ac300000-0000-0000-0000-000000000000'`);
+  eq(r.rows, [{ status: "published", created_by: null }], "row");
+  await as(null, null, `delete from activities where id = 'ac300000-0000-0000-0000-000000000000'`); // SQL editor may delete; words cascade
+});
+await check("anon can't read activities", () =>
+  expectError(as(null, "anon", `select * from activities`), /permission denied/));
+
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);

@@ -23,14 +23,23 @@ create table public.profiles (
   is_active boolean default true, active_device_id text,
   created_at timestamptz default now(), updated_at timestamptz default now());
 create table public.students (id uuid primary key default gen_random_uuid(), teacher_id uuid, full_name text);
-create table public.sessions (id uuid primary key default gen_random_uuid(), teacher_id uuid, status text);
-create table public.session_words (id uuid primary key default gen_random_uuid(), session_id uuid,
+-- sessions / session_words / word_attempts checks + FKs as in the live schema (inspect query, 11 Nov 2026)
+create table public.sessions (id uuid primary key default gen_random_uuid(), teacher_id uuid, name text,
+  status text not null default 'pending'
+    constraint sessions_status_check check (status = any (array['pending','in_progress','paused','finished'])),
+  type text not null default 'manual'
+    constraint sessions_type_check check (type = any (array['manual','word_list'])),
+  started_at timestamptz, finished_at timestamptz,
+  created_at timestamptz default now(), updated_at timestamptz default now());
+create table public.session_words (id uuid primary key default gen_random_uuid(),
+  session_id uuid references public.sessions(id) on delete cascade,
   word text, order_index int, duration_seconds int);
 create table public.session_students (session_id uuid, student_id uuid);
 create table public.devices (id uuid primary key default gen_random_uuid(), device_code text unique,
   status text, paired_student_id uuid references public.students(id));
 create table public.word_attempts (id uuid primary key default gen_random_uuid(), student_id uuid,
-  session_id uuid, session_word_id uuid, word text, is_correct boolean, response_time_ms int,
+  session_id uuid references public.sessions(id) on delete set null, session_word_id uuid, word text,
+  is_correct boolean, response_time_ms int,
   attempted_at timestamptz default now(), transcript text, transcribed_text text, confidence real,
   audio_path text, needs_review boolean default false, graded_by text default 'auto');
 create table public.letter_attempts (id uuid primary key default gen_random_uuid(),
@@ -51,6 +60,8 @@ grant usage on schema public, storage, auth to anon, authenticated;
 grant all on all tables in schema public to anon, authenticated;
 grant select on storage.objects to anon, authenticated;
 grant execute on function auth.uid() to anon, authenticated;
+-- like Supabase: tables created later (by migrations) are granted to the API roles too
+alter default privileges in schema public grant all on tables to anon, authenticated;
 
 -- Existing functions / trigger / policies (from Query 2-4)
 create function public.is_admin() returns boolean language sql stable security definer
