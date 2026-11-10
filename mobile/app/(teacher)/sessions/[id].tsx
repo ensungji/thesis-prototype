@@ -161,6 +161,14 @@ function attemptMatch(a: WordAttempt): Record<string, string> {
     : { id: a.id };
 }
 
+// Grading lock (migration 22): until the session is finished, a voice grade
+// (graded_by 'auto': correct, wrong or review) can't be changed, so its ✓ / ✗
+// buttons are hidden. "No answer", skipped, the teacher's own grades and
+// words with no answer yet can always be graded.
+function voiceGradeLocked(a: WordAttempt | null, sessionStatus?: string | null): boolean {
+  return !!a && a.graded_by === "auto" && sessionStatus !== "finished";
+}
+
 const cleanTranscript = (t?: string | null) => (t ?? "").replace(/[.!?,]/g, "").trim();
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -248,12 +256,14 @@ function HandGradeCard({
   wordId,
   students,
   attempts,
+  sessionStatus,
   onGrade,
 }: {
   word: string;
   wordId: string | null;
   students: Student[];
   attempts: WordAttempt[];
+  sessionStatus?: string | null;
   onGrade: (
     student: Student,
     word: string,
@@ -268,7 +278,7 @@ function HandGradeCard({
     <View style={styles.sectionCard}>
       <Text style={styles.cardLabel}>GRADE BY HAND · {w}</Text>
       <Text style={hg.hint}>
-        Tap ✓ or ✗ if the voice answer is missing or needs a check.
+        {"Tap ✓ or ✗ if there's no voice answer. Voice grades can be changed after the session ends."}
       </Text>
       <View style={{ gap: 8 }}>
         {students.map((st) => {
@@ -298,30 +308,43 @@ function HandGradeCard({
                 </Text>
               </View>
               {a?.audio_path ? <PlayRecordingButton path={a.audio_path} /> : null}
-              <Pressable
-                onPress={() => onGrade(st, w, wordId, true, a)}
-                hitSlop={6}
-                style={({ pressed }) => [
-                  hg.btn,
-                  status === "correct" && { backgroundColor: C.green, borderColor: C.green },
-                  pressed && { opacity: 0.7 },
-                ]}
-                accessibilityLabel={`Mark ${st.full_name} correct`}
-              >
-                <Ionicons name="checkmark" size={18} color={status === "correct" ? C.white : C.green} />
-              </Pressable>
-              <Pressable
-                onPress={() => onGrade(st, w, wordId, false, a)}
-                hitSlop={6}
-                style={({ pressed }) => [
-                  hg.btn,
-                  status === "wrong" && { backgroundColor: C.red, borderColor: C.red },
-                  pressed && { opacity: 0.7 },
-                ]}
-                accessibilityLabel={`Mark ${st.full_name} wrong`}
-              >
-                <Ionicons name="close" size={18} color={status === "wrong" ? C.white : C.red} />
-              </Pressable>
+              {voiceGradeLocked(a, sessionStatus) ? (
+                <View
+                  style={hg.locked}
+                  accessible
+                  accessibilityLabel={`${st.full_name}: voice grade. It can be changed after the session ends.`}
+                >
+                  <Ionicons name="lock-closed-outline" size={14} color={C.muted} />
+                  <Text style={hg.lockedText}>Voice</Text>
+                </View>
+              ) : (
+              <>
+                <Pressable
+                  onPress={() => onGrade(st, w, wordId, true, a)}
+                  hitSlop={6}
+                  style={({ pressed }) => [
+                    hg.btn,
+                    status === "correct" && { backgroundColor: C.green, borderColor: C.green },
+                    pressed && { opacity: 0.7 },
+                  ]}
+                  accessibilityLabel={`Mark ${st.full_name} correct`}
+                >
+                  <Ionicons name="checkmark" size={18} color={status === "correct" ? C.white : C.green} />
+                </Pressable>
+                <Pressable
+                  onPress={() => onGrade(st, w, wordId, false, a)}
+                  hitSlop={6}
+                  style={({ pressed }) => [
+                    hg.btn,
+                    status === "wrong" && { backgroundColor: C.red, borderColor: C.red },
+                    pressed && { opacity: 0.7 },
+                  ]}
+                  accessibilityLabel={`Mark ${st.full_name} wrong`}
+                >
+                  <Ionicons name="close" size={18} color={status === "wrong" ? C.white : C.red} />
+                </Pressable>
+              </>
+              )}
             </View>
           );
         })}
@@ -354,6 +377,19 @@ const hg = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+  // replaces ✓ / ✗ on a voice grade while the session runs
+  locked: {
+    height: 38,
+    minWidth: 84,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 4,
+    paddingHorizontal: 10,
+    borderRadius: 19,
+    backgroundColor: C.border,
+  },
+  lockedText: { fontFamily: fonts.mono, fontSize: 11, color: C.muted },
 });
 
 // ── Keep awake for active session ─────────────────────────────────────────────
@@ -3034,6 +3070,8 @@ export default function SessionDetail() {
                                   {STATUS_STYLE[attemptStatus(attempt)].label}
                                 </Text>
                               </View>
+                              {/* (this sheet is in the finished view, so a voice grade can be changed here) */}
+                              {!voiceGradeLocked(attempt, session.status) && (
                               <View style={{ flexDirection: "row", gap: 6 }}>
                                 <Pressable
                                   onPress={() => overrideAttempt(attempt, true)}
@@ -3060,6 +3098,7 @@ export default function SessionDetail() {
                                   <Ionicons name="close" size={12} color={C.red} />
                                 </Pressable>
                               </View>
+                              )}
                               {attempt.graded_by === "teacher" && (
                                 <Text style={styles.teacherTag}>by teacher</Text>
                               )}
@@ -3317,6 +3356,7 @@ export default function SessionDetail() {
               wordId={[...sessionWords].reverse().find((sw) => sw.word === lastSentWord)?.id ?? null}
               students={assignedStudents}
               attempts={liveAttempts}
+              sessionStatus={session.status}
               onGrade={gradeByHand}
             />
 
@@ -3611,6 +3651,7 @@ export default function SessionDetail() {
             wordId={sessionWords[wordListIndex]?.id ?? null}
             students={assignedStudents}
             attempts={liveAttempts}
+            sessionStatus={session.status}
             onGrade={gradeByHand}
           />
         )}
