@@ -408,5 +408,38 @@ await check("deleting the creator's profile keeps the published activity (create
 await check("anon can't read activities", () =>
   expectError(as(null, "anon", `select * from activities`), /permission denied/));
 
+// ── 17 duplicate_activity ────────────────────────────────────────────────────
+await check("duplicate a published activity → editable draft with the same words", async () => {
+  const r = await as(D, "authenticated", `select duplicate_activity('${ACT}') as id`);
+  const id = r.rows[0].id;
+  const a = await as(null, null, `select name, level, status, created_by, published_at from activities where id = '${id}'`);
+  eq(a.rows, [{ name: "Animals (copy)", level: "easy", status: "draft", created_by: D, published_at: null }], "copy");
+  const w = await as(null, null, `select position, word, duration_seconds from activity_words where activity_id = '${id}' order by position`);
+  eq(w.rows, [
+    { position: 0, word: "DOG", duration_seconds: 30 },
+    { position: 1, word: "CAT", duration_seconds: 20 },
+    { position: 2, word: "SUN", duration_seconds: 5 },
+  ], "words");
+  await as(D, "authenticated", `update activities set name = 'Pets' where id = '${id}'`);
+  await as(D, "authenticated", `update activity_words set word = 'COW' where activity_id = '${id}' and position = 0`);
+  const o = await as(null, null, `select word from activity_words where activity_id = '${ACT}' order by position`);
+  eq(o.rows.map((x) => x.word), ["DOG", "CAT", "SUN"], "original unchanged");
+  await as(D, "authenticated", `delete from activities where id = '${id}'`);
+});
+await check("duplicate keeps the name within 100 characters", async () => {
+  await as(D, "authenticated", `insert into activities (id, name) values ('ac400000-0000-0000-0000-000000000000', '${"N".repeat(100)}')`);
+  const r = await as(D, "authenticated", `select duplicate_activity('ac400000-0000-0000-0000-000000000000') as id`);
+  const a = await as(null, null, `select char_length(name)::int as n, right(name, 7) as tail from activities where id = '${r.rows[0].id}'`);
+  eq(a.rows, [{ n: 100, tail: " (copy)" }], "name");
+  await as(null, null, `delete from activities where id in ('ac400000-0000-0000-0000-000000000000', '${r.rows[0].id}')`);
+});
+await check("duplicate: teacher refused, unknown id refused, anon can't call it", async () => {
+  await expectError(as(A, "authenticated", `select duplicate_activity('${ACT}')`), /Only an admin/);
+  await expectError(as(D, "authenticated", `select duplicate_activity(gen_random_uuid())`), /No such activity/);
+  await expectError(as(null, "anon", `select duplicate_activity('${ACT}')`), /permission denied/);
+  const n = await as(null, null, `select count(*)::int as n from activities`);
+  eq(n.rows, [{ n: 1 }], "no stray copies");
+});
+
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);
