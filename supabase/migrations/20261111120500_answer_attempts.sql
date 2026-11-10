@@ -46,6 +46,7 @@ alter table public.answer_attempts enable row level security;
 
 revoke all on public.answer_attempts from anon;
 revoke insert, update, delete, truncate on public.answer_attempts from authenticated;
+revoke references, trigger on public.answer_attempts from authenticated; -- Supabase default grants
 grant  select on public.answer_attempts to authenticated;
 grant  select, insert, update, delete on public.answer_attempts to service_role;
 
