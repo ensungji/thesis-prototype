@@ -581,3 +581,77 @@ Use your smallest phone (or set Display size / Font size to the largest).
    **Expect:** The same preview at the top shows each word, above the
    countdown card and Pause Timer. During the Student Break it shows empty
    cells and "Display cleared · break".
+
+---
+
+## Branch feature/activities: Phase 1 (database + grade-answer)
+
+Migrations 16–22 (activities, sessions type `activity`, `start_activity_session`,
+`answer_attempts`, word_attempts columns, grading lock) and grade-answer v7.
+
+### P1.1 Database checks (any time; changes nothing)
+1. **Do:** Open `supabase/tests/phase1_activities_checks.sql`, paste the
+   **whole file** into the SQL Editor, Run.
+   **Expect:** 47 rows, all **PASS**, and the last row
+   `TOTAL · 47 passed, 0 failed`. If there's only one teacher account, row 32
+   is **SKIP** (46 passed). Any **FAIL**: send the row (its detail column has
+   the error).
+   It acts as the first active admin and the first teacher with a student,
+   makes a test activity, session and answers, and rolls everything back.
+2. **Do (optional, on your PC):** `cd supabase/tests/policy-check`, `npm run check`.
+   **Expect:** `all passed` (123 checks on a stand-in database).
+
+### P1.2 Deploy grade-answer v7
+Only after P1.1 passes:
+```
+npx supabase functions deploy grade-answer
+```
+Back to v6 if needed: `git show fix/bugs:supabase/functions/grade-answer/index.ts > supabase/functions/grade-answer/index.ts`,
+deploy, then `git checkout supabase/functions/grade-answer/index.ts`.
+
+The response gains two fields; firmware v7.4 only reads `result` and `late`:
+```
+{"result":"wrong","word":"CAT","transcript":"cap",...,"late":false,"locked":false,"tries":1}
+```
+
+Recent tries, for the checks below:
+```sql
+select sw.word, aa.attempt_no, aa.result, aa.transcript, aa.created_at,
+       wa.is_correct, wa.needs_review, wa.graded_by, wa.tries
+from answer_attempts aa
+join session_words sw on sw.id = aa.session_word_id
+left join word_attempts wa on wa.session_word_id = aa.session_word_id and wa.student_id = aa.student_id
+order by aa.created_at desc limit 10;
+```
+
+### P1.3 Device tests (one device on v7.4, serial monitor open)
+1. **Retries until correct.** Live session, send **CAT**. Student says "dog".
+   **Expect:** serial `"result":"wrong"`, `"locked":false`, `"tries":1`; dots stay up.
+   Student says "cat".
+   **Expect:** `"result":"correct"`, `"tries":2`; dots drop; the app shows CAT
+   correct. Query: attempt 1 wrong, attempt 2 correct; word_attempts
+   is_correct true, tries 2.
+2. **Correct stays correct.** If the firmware lets the student answer the same
+   word again after a correct (otherwise skip; P1.1 rows 39 and 43 cover it):
+   answer "dog".
+   **Expect:** `"result":"wrong"`, `"locked":true`, `"tries":3`. The app still
+   shows CAT correct. Query: attempt 3 wrong, word_attempts still correct.
+   Admin → Logs: `CAT → wrong (heard "dog") — already correct, kept`.
+3. **Late answer.** Timed Sequence; start an answer and finish it after the
+   word's time is over.
+   **Expect:** `"result":"review"`, `"late":true`; dots drop (as before). Query:
+   the try is saved with result review; a "No answer" row for that word
+   becomes the voice answer (graded_by auto, needs review).
+4. **Teacher grade kept.** Before the student answers a word, grade them by
+   hand (✓). Then the student answers it wrong.
+   **Expect:** `"locked":false`; the app keeps the teacher's ✓. Query:
+   graded_by teacher, tries 1, the try saved as wrong.
+5. **Voice grades locked during the session (current app).** Tap ✗ on a
+   student's voice **correct** (or a review) answer while the session runs.
+   **Expect:** "Couldn't save grade" toast and the answer stays as it was
+   (Phase 2 hides these buttons). Finish the session, tap ✗ again.
+   **Expect:** saved. Query:
+   `select is_correct, graded_by, original_is_correct, original_graded_by, regraded_at from word_attempts order by regraded_at desc nulls last limit 3;`
+   shows false / teacher / true / auto / a time.
+6. **No warnings.** Admin → Logs after the tests: no `try_not_saved` or
+   `grade_failed` entries.
