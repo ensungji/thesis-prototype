@@ -37,24 +37,36 @@ export function resolveWordDuration(
 }
 
 // ── Session Type Helpers ──────────────────────────────────────────────────────
-// "Live Session" (formerly "Manual")
-// "Timed Sequence" (formerly "Word List")
+// "Live Session" (formerly "Manual")       stored as 'manual'
+// "Timed Sequence" (formerly "Word List")  stored as 'word_list'
+// "Activity"                               stored as 'activity': words copied
+//                                          from a published activity
+//                                          (start_activity_session, migration 19)
+// The database allows only manual / word_list / activity; new.tsx tries the
+// newer names first and falls back on the check error.
 
 export type SessionType =
   | "live_session"
   | "timed_sequence"
   | "manual"
-  | "word_list";
+  | "word_list"
+  | "activity";
 
 export function isTimedSequence(type?: string | null): boolean {
   return type === "timed_sequence" || type === "word_list";
 }
 
+/** Live Session only: an activity session is NOT a live session. */
 export function isLiveSession(type?: string | null): boolean {
   return type === "live_session" || type === "live" || type === "manual";
 }
 
+export function isActivitySession(type?: string | null): boolean {
+  return type === "activity";
+}
+
 export function getSessionTypeLabel(type?: string | null): string {
+  if (isActivitySession(type)) return "Activity";
   return isTimedSequence(type) ? "Timed Sequence" : "Live Session";
 }
 
