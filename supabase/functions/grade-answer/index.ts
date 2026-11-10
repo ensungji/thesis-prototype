@@ -1,5 +1,18 @@
 // supabase/functions/grade-answer/index.ts
-// Braille D.O.T.S. — voice answer grading  (v6)
+// Braille D.O.T.S. — voice answer grading  (v7)
+//
+// v7: (Activities, Phase 1 — needs migrations 20–22)
+//     - every answer is kept in answer_attempts (attempt_no 1, 2, 3 ...) and
+//       word_attempts.tries counts them. word_attempts stays the final
+//       result per student per word.
+//     - unlimited retries: a new voice answer replaces a wrong / review /
+//       "No answer" / skipped result. Once the word is correct by voice it
+//       stays correct: a later answer is still graded and kept in
+//       answer_attempts, and the response carries "locked": true (result =
+//       that later answer's own grade). The database enforces the same rule
+//       (SQLSTATE DT001), which is caught here too.
+//     - response: unchanged for firmware v7.4 (result, late, ...), plus
+//       "locked" and "tries".
 //
 // ESP32 → POST raw audio (WAV) to:
 //   https://<project>.supabase.co/functions/v1/grade-answer?device=<device uuid>[&sw=<session word uuid>]
@@ -378,9 +391,35 @@ Deno.serve(async (req) => {
   if (late) result = "review"; // graded against the right word, but the teacher checks it
   const needsReview = result === "review";
 
-  // ── 6. Save attempt (app shows it live via Realtime) ─────────────────
+  const studentId: string = device.paired_student_id;
+
+  // ── 6. The student's current result for this word, if any ────────────
+  const findPrev = async (): Promise<PrevResult | null> =>
+    sessionWordId
+      ? (await supabase
+          .from("word_attempts")
+          .select("id, graded_by, is_correct, needs_review, tries")
+          .eq("session_word_id", sessionWordId)
+          .eq("student_id", studentId)
+          .maybeSingle()).data
+      : null;
+  let prev = await findPrev();
+
+  // ── 7. Keep this try (answer_attempts, migration 20) ─────────────────
+  // Every voice answer, also one that arrives after the word is locked.
+  const attemptNo = sessionWordId
+    ? await saveTry(sessionWordId, studentId, prev?.tries ?? 0, {
+        audio_path: audioPath,
+        transcript,
+        result,
+        confidence,
+        response_time_ms: responseTimeMs,
+      }, { device_id: deviceId, session_id: sessionId })
+    : 1;
+
+  // ── 8. Final result per word (word_attempts; the app shows it live) ──
   const attempt = {
-    student_id: device.paired_student_id,
+    student_id: studentId,
     session_id: sessionId,
     session_word_id: sessionWordId,
     word: word.toUpperCase(),
@@ -391,41 +430,57 @@ Deno.serve(async (req) => {
     audio_path: audioPath,
     needs_review: needsReview,
     graded_by: "auto",
+    tries: attemptNo,
   };
-  let { error: insErr } = await supabase.from("word_attempts").insert(attempt);
-
-  // 23505 = this student already has an answer for this word (unique index)
   let teacherGradeKept = false;
-  if (insErr?.code === "23505" && sessionWordId) {
-    const { data: prev } = await supabase
-      .from("word_attempts")
-      .select("id, graded_by")
-      .eq("session_word_id", sessionWordId)
-      .eq("student_id", device.paired_student_id)
-      .maybeSingle();
-    if (prev) {
-      teacherGradeKept = prev.graded_by === "teacher";
-      const patch = teacherGradeKept
-        ? // the teacher graded it by hand: their grade stands, add what we heard
-          { transcript, confidence, audio_path: audioPath, response_time_ms: responseTimeMs }
-        : // an earlier voice answer: the newest one counts
-          { ...attempt, attempted_at: new Date().toISOString() };
-      ({ error: insErr } = await supabase.from("word_attempts").update(patch).eq("id", prev.id));
+  let locked = false; // already correct by voice: this answer doesn't replace it
+
+  const writeOver = async (p: PrevResult) => {
+    locked = isVoiceCorrect(p);
+    teacherGradeKept = !locked && p.graded_by === "teacher";
+    const patch = locked
+      ? // correct by voice stays correct (migration 22): only count the try
+        { tries: attemptNo }
+      : teacherGradeKept
+      ? // the teacher graded it by hand: their grade stands, add what we heard
+        { transcript, confidence, audio_path: audioPath, response_time_ms: responseTimeMs, tries: attemptNo }
+      : // wrong / review / missed / skipped: the newest answer counts
+        { ...attempt, attempted_at: new Date().toISOString() };
+    let { error } = await supabase.from("word_attempts").update(patch).eq("id", p.id);
+    if (error?.code === LOCKED_SQLSTATE) {
+      // it turned correct between the read and this write
+      locked = true;
+      teacherGradeKept = false;
+      ({ error } = await supabase.from("word_attempts").update({ tries: attemptNo }).eq("id", p.id));
+    }
+    return error;
+  };
+
+  let saveErr: { message: string; code?: string } | null = null;
+  if (prev) {
+    saveErr = await writeOver(prev);
+  } else {
+    ({ error: saveErr } = await supabase.from("word_attempts").insert(attempt));
+    // 23505 = an answer for this word arrived in the meantime (unique index)
+    if (saveErr?.code === "23505" && sessionWordId) {
+      prev = await findPrev();
+      if (prev) saveErr = await writeOver(prev);
     }
   }
-  if (insErr) {
-    await log("error", "grade_failed", `Could not save the answer: ${insErr.message}`, {
+  if (saveErr) {
+    await log("error", "grade_failed", `Could not save the answer: ${saveErr.message}`, {
       device_id: deviceId,
       session_id: sessionId,
-      meta: { word: word.toUpperCase(), transcript, result },
+      meta: { word: word.toUpperCase(), transcript, result, attempt_no: attemptNo },
     });
-    return json({ error: insErr.message, transcript }, 500);
+    return json({ error: saveErr.message, transcript }, 500);
   }
 
   await log(
     "info",
     "answer_graded",
-    `${word.toUpperCase()} → ${result}${transcript ? ` (heard "${transcript}")` : " (nothing heard)"}`,
+    `${word.toUpperCase()} → ${result}${transcript ? ` (heard "${transcript}")` : " (nothing heard)"}` +
+      (locked ? " — already correct, kept" : ""),
     {
       device_id: deviceId,
       session_id: sessionId,
@@ -439,20 +494,96 @@ Deno.serve(async (req) => {
         queued,
         late,
         teacher_grade_kept: teacherGradeKept,
+        locked,
+        attempt_no: attemptNo,
         session_word_id: sessionWordId,
-        student_id: device.paired_student_id,
+        student_id: studentId,
         audio_path: audioPath,
       },
     },
   );
 
+  // Firmware v7.4 reads result and late. locked / tries are extra fields
+  // (older firmware ignores them).
   return json({
-    result,
+    result, // this answer's own grade, also when locked
     word: word.toUpperCase(),
     transcript,
     confidence,
     spelled: saidSpelled || (saidLetters && !saidWord),
     queued,
     late,
+    locked,
+    tries: attemptNo,
   });
 });
+
+// ── Helpers for steps 6–8 ─────────────────────────────────────────────────────
+
+type PrevResult = {
+  id: string;
+  graded_by: string | null;
+  is_correct: boolean;
+  needs_review: boolean | null;
+  tries: number | null;
+};
+
+// SQLSTATE raised by the grading lock (migration 22) when a voice answer
+// tries to replace a word that's already correct by voice
+const LOCKED_SQLSTATE = "DT001";
+
+// Same rule as the grading lock: a 'review' row with is_correct = true doesn't count
+const isVoiceCorrect = (p: PrevResult) =>
+  p.graded_by === "auto" && p.is_correct === true && !p.needs_review;
+
+// Inserts this try into answer_attempts as the next attempt_no for this
+// student + word, and returns that number (= the new word_attempts.tries).
+// Counts on from the row's tries too, so a word answered before migration 21
+// (tries 1, no answer_attempts row) continues at 2. A clash on attempt_no
+// (two uploads at once) takes the next number. Never fails the request: if
+// the row can't be saved, it's logged and the number is still returned.
+async function saveTry(
+  sessionWordId: string,
+  studentId: string,
+  prevTries: number,
+  row: {
+    audio_path: string;
+    transcript: string;
+    result: string;
+    confidence: number;
+    response_time_ms: number | null;
+  },
+  ctx: { device_id: string; session_id: string },
+): Promise<number> {
+  let attemptNo = prevTries + 1;
+  for (let i = 0; i < 3; i++) {
+    const { data: last } = await supabase
+      .from("answer_attempts")
+      .select("attempt_no")
+      .eq("session_word_id", sessionWordId)
+      .eq("student_id", studentId)
+      .order("attempt_no", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    attemptNo = Math.max(last?.attempt_no ?? 0, prevTries) + 1;
+    const { error } = await supabase.from("answer_attempts").insert({
+      session_word_id: sessionWordId,
+      student_id: studentId,
+      attempt_no: attemptNo,
+      ...row,
+    });
+    if (!error) return attemptNo;
+    if (error.code !== "23505") {
+      await log("warn", "try_not_saved", `Answer try not saved: ${error.message}`, {
+        ...ctx,
+        meta: { session_word_id: sessionWordId, student_id: studentId, attempt_no: attemptNo },
+      });
+      return attemptNo;
+    }
+  }
+  await log("warn", "try_not_saved", "Answer try not saved: attempt number kept clashing", {
+    ...ctx,
+    meta: { session_word_id: sessionWordId, student_id: studentId, attempt_no: attemptNo },
+  });
+  return attemptNo;
+}
