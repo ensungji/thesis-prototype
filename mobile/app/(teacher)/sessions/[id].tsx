@@ -23,7 +23,7 @@ import { useLocalSearchParams, useRouter, useFocusEffect, useNavigation } from "
 import { usePreventRemove } from "@react-navigation/native";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
-import { updateOrQueue, insertOrQueue, newId } from "../../../lib/outbox";
+import { updateOrQueue, insertOrQueue, newId, subscribeRefused } from "../../../lib/outbox";
 import { logEvent } from "../../../lib/logger";
 import { isOnline, subscribeOnline } from "../../../lib/network";
 import { onDevicePresence, type PresenceEvent } from "../../../lib/device-presence";
@@ -1088,6 +1088,36 @@ export default function SessionDetail() {
           return [...prev, ...(data as WordAttempt[]).filter((a) => !seen.has(a.id))];
         });
       });
+  }, [id]);
+
+  // ── A queued grade the server refused (grading lock): undo it on screen ────
+  // The outbox dropped it and SyncRefusedToast says why; here the screen goes
+  // back to what the server really has (matched by id, or by student + word
+  // for a "No answer" row), and a refused new row disappears.
+  useEffect(() => {
+    if (!id) return;
+    return subscribeRefused(async (r) => {
+      if (r.table !== "word_attempts") return;
+      const { data } = await supabase
+        .from("word_attempts")
+        .select("id, student_id, word, is_correct, response_time_ms, attempted_at, transcript, needs_review, audio_path, graded_by, session_word_id")
+        .eq("session_id", id)
+        .order("attempted_at", { ascending: false })
+        .limit(200);
+      if (!data) return;
+      const server = data as WordAttempt[];
+      const byId = new Map(server.map((a) => [a.id, a]));
+      const byPair = new Map(
+        server.filter((a) => a.session_word_id).map((a) => [`${a.session_word_id}:${a.student_id}`, a])
+      );
+      setLiveAttempts((prev) => {
+        const next = prev
+          .filter((a) => !(r.op === "insert" && a.id === r.match.id && !byId.has(a.id)))
+          .map((a) => byId.get(a.id) ?? (a.session_word_id ? byPair.get(`${a.session_word_id}:${a.student_id}`) : undefined) ?? a);
+        const seen = new Set<string>();
+        return next.filter((a) => !seen.has(a.id) && !!seen.add(a.id));
+      });
+    });
   }, [id]);
 
   // ── Teacher fallback grading ────────────────────────────────────────────────

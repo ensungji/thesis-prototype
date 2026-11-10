@@ -20,6 +20,7 @@ import { getDeviceId } from "../lib/device-id";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 
 import { OfflineBanner } from "../components/OfflineBanner";
+import { SyncRefusedToast } from "../components/SyncRefusedToast";
 export default function RootLayout() {
   const router = useRouter();
   const channelRef = useRef<RealtimeChannel | null>(null);
@@ -172,6 +173,7 @@ export default function RootLayout() {
       <ErrorBoundary>
         <Stack screenOptions={{ headerShown: false }} />
       <OfflineBanner />
+      <SyncRefusedToast />
       </ErrorBoundary>
     </GestureHandlerRootView>
   );

@@ -16,6 +16,11 @@
 //     "paused" then "finished" is sent once as "finished".
 //   - Real server errors (e.g. permission denied) are NOT queued — they
 //     would fail again forever. They are returned to the caller.
+//   - A QUEUED change the server refuses outright (the grading lock of
+//     migration 22, SQLSTATE 42501 / DT001) is dropped at once, logged, and
+//     announced to subscribeRefused() listeners so the app can show the error
+//     and reload what the server really has. Other server errors are retried
+//     a few times first (MAX_TRIES).
 
 import { useEffect, useState } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -201,6 +206,35 @@ export async function updateOrQueue(
   }
 }
 
+// ── Refused changes ──────────────────────────────────────────────────────────
+
+/** A queued change the server refused for good (it was dropped). */
+export type RefusedChange = {
+  table: string;
+  op: "update" | "insert";
+  match: Record<string, string>;
+  values: Record<string, unknown>;
+  code: string;
+  message: string;
+};
+
+const refusedListeners = new Set<(r: RefusedChange) => void>();
+
+/** Called for every queued change the server refused. Returns an unsubscribe function. */
+export function subscribeRefused(fn: (r: RefusedChange) => void): () => void {
+  refusedListeners.add(fn);
+  return () => {
+    refusedListeners.delete(fn);
+  };
+}
+
+// 42501 = insufficient privilege: the grading lock (a voice grade during a
+//         session, a teacher-only column) or RLS. DT001 = the word is already
+//         correct by voice. Sending it again can never work.
+const REFUSED_CODES = new Set(["42501", "DT001"]);
+const errCode = (err: unknown) => String((err as { code?: string })?.code ?? "");
+const errMessage = (err: unknown) => String((err as { message?: string })?.message ?? err);
+
 // A change the server kept refusing was thrown away — tell the admin.
 function queueDropLog(item: QueuedUpdate, err: unknown) {
   const id = newId();
@@ -214,8 +248,8 @@ function queueDropLog(item: QueuedUpdate, err: unknown) {
       level: "error",
       source: "app",
       event: "sync_dropped",
-      message: `Gave up saving a change to ${item.table}: ${String((err as { message?: string })?.message ?? err)}`.slice(0, 500),
-      meta: { table: item.table, op: item.op ?? "update", match: item.match, values: item.values },
+      message: `Gave up saving a change to ${item.table}: ${errMessage(err)}`.slice(0, 500),
+      meta: { table: item.table, op: item.op ?? "update", match: item.match, values: item.values, code: errCode(err) || null },
     },
     match: { id },
     queuedAt: Date.now(),
@@ -268,6 +302,30 @@ export async function flushOutbox() {
         if (isNetworkError(err)) {
           networkProblem = true; // connection dropped again — stop for now
           break;
+        }
+        if (REFUSED_CODES.has(errCode(err))) {
+          // refused for good: drop it now instead of retrying, and say so
+          queue = queue.filter((q) => q !== item);
+          blockedRows.add(row); // later changes to this row wait for the next pass
+          console.warn("Outbox item refused, dropped:", item.key, err);
+          if (item.table !== "system_logs") queueDropLog(item, err);
+          const refused: RefusedChange = {
+            table: item.table,
+            op: item.op ?? "update",
+            match: item.match,
+            values: item.values,
+            code: errCode(err),
+            message: errMessage(err),
+          };
+          refusedListeners.forEach((fn) => {
+            try {
+              fn(refused);
+            } catch {
+              // a listener's problem must not stop the outbox
+            }
+          });
+          await save();
+          continue;
         }
         item.tries += 1;
         blockedRows.add(row);
