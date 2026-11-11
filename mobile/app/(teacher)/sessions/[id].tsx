@@ -72,6 +72,7 @@ type Session = {
   activity_id?: string | null;
   activity_name?: string | null;
   current_index?: number | null;
+  reviewed_at?: string | null; // "Done reviewing" (migration 23)
 };
 type Device = { id: string; device_code: string; status: string } | null;
 type Student = { id: string; full_name: string; device: Device };
@@ -3020,9 +3021,12 @@ export default function SessionDetail() {
               <Text style={styles.reviewEntrySub}>
                 {(() => {
                   const toReview = liveAttempts.filter((a) => attemptStatus(a) === "review").length;
+                  if (session.reviewed_at) {
+                    return `Reviewed ${new Date(session.reviewed_at).toLocaleDateString()} · see the speech grading agreement`;
+                  }
                   return toReview > 0
-                    ? `${toReview} answer${toReview === 1 ? "" : "s"} need${toReview === 1 ? "s" : ""} review`
-                    : "Every answer and try, with recordings";
+                    ? `${toReview} answer${toReview === 1 ? "" : "s"} need${toReview === 1 ? "s" : ""} review · then tap Done reviewing`
+                    : "Every answer and try, with recordings · then tap Done reviewing";
                 })()}
               </Text>
             </View>

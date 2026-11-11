@@ -18,6 +18,7 @@ import { supabase } from "../../lib/supabase";
 import { colors as C, fonts } from "../../lib/theme";
 import { BrailleLoader } from "../../components/BrailleLoader";
 import { Toast } from "../../components/Toast";
+import { type AdminAgreement, agreementSentence, loadAdminAgreement } from "../../lib/review";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -131,7 +132,20 @@ export default function AdminDashboard() {
   type ToastState = { message: string; detail?: string; variant: "success" | "delete" } | null;
   const [toast, setToast] = useState<ToastState>(null);
 
+  // Speech grading agreement over every reviewed session (migration 23)
+  const [agreement, setAgreement] = useState<AdminAgreement | null>(null);
+  const [agreementError, setAgreementError] = useState("");
+
   // ── Load ───────────────────────────────────────────────────────────────────
+
+  const loadAgreement = useCallback(async () => {
+    const res = await loadAdminAgreement();
+    if (res.error !== null) setAgreementError(res.error);
+    else {
+      setAgreement(res.data);
+      setAgreementError("");
+    }
+  }, []);
 
   const loadTeachers = useCallback(async () => {
     const { data } = await supabase
@@ -149,6 +163,7 @@ export default function AdminDashboard() {
   useFocusEffect(
     useCallback(() => {
       loadTeachers();
+      loadAgreement();
 
       if (params.created) {
         setToast({ message: "Account created", detail: params.created, variant: "success" });
@@ -173,7 +188,7 @@ export default function AdminDashboard() {
       return () => {
         supabase.removeChannel(channel);
       };
-    }, [loadTeachers, params.created, params.updated, router]),
+    }, [loadTeachers, loadAgreement, params.created, params.updated, router]),
   );
 
   // ── Toggle active — opens custom confirm sheet ──────────────────────────────
@@ -324,6 +339,28 @@ export default function AdminDashboard() {
           </Text>
           <Text style={styles.summaryLabel}>Total</Text>
         </View>
+      </View>
+
+      {/* Speech grading agreement (reviewed sessions only) */}
+      <View style={styles.agreeCard} accessible>
+        <Text style={styles.agreeLabel}>SPEECH GRADING</Text>
+        {agreementError ? (
+          <Text style={styles.agreeSub}>{`Couldn't load: ${agreementError}`}</Text>
+        ) : !agreement ? (
+          <Text style={styles.agreeSub}>Loading…</Text>
+        ) : agreement.reviewedSessions === 0 ? (
+          <Text style={styles.agreeSub}>
+            {"No reviewed sessions yet. Teachers tap Done reviewing after checking a session's answers."}
+          </Text>
+        ) : (
+          <>
+            <Text style={styles.agreeText}>{agreementSentence(agreement, "the teachers")}</Text>
+            <Text style={styles.agreeSub}>
+              {agreement.reviewedSessions} reviewed session{agreement.reviewedSessions === 1 ? "" : "s"}
+              {agreement.stillReview > 0 ? ` · ${agreement.stillReview} still marked Review, not counted` : ""}
+            </Text>
+          </>
+        )}
       </View>
 
       {/* Teacher list */}
@@ -708,6 +745,20 @@ const styles = StyleSheet.create({
   },
   summaryValue: { fontFamily: fonts.heading, fontSize: 24 },
   summaryLabel: { fontFamily: fonts.body, fontSize: 11, color: C.ink },
+
+  agreeCard: {
+    marginHorizontal: 16,
+    marginTop: 8,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: C.white,
+    borderWidth: 1.5,
+    borderColor: C.border,
+    gap: 4,
+  },
+  agreeLabel: { fontFamily: fonts.mono, fontSize: 10, color: C.brown, letterSpacing: 0.5 },
+  agreeText: { fontFamily: fonts.heading, fontSize: 15, color: C.navy, lineHeight: 21 },
+  agreeSub: { fontFamily: fonts.body, fontSize: 12, color: C.muted },
 
   list: { padding: 16, gap: 12, paddingBottom: 100 },
 

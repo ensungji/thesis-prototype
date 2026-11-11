@@ -207,6 +207,42 @@ export async function loadTries(sessionWordId: string, studentId: string): Promi
   return { data: (data ?? []) as ReviewTry[], error: null };
 }
 
+/** "Done reviewing": sessions.reviewed_at = now (migration 23; finished sessions only). */
+export async function markReviewed(sessionId: string): Promise<Result<string>> {
+  const { data, error } = await supabase
+    .from("sessions")
+    .update({ reviewed_at: new Date().toISOString() })
+    .eq("id", sessionId)
+    .select("reviewed_at")
+    .maybeSingle();
+  if (error) return { data: null, error: error.message };
+  if (!data?.reviewed_at) return { data: null, error: "Not saved. Is this your session?" };
+  return { data: data.reviewed_at as string, error: null };
+}
+
+export type AdminAgreement = { reviewedSessions: number; voice: number; agreed: number; stillReview: number };
+
+/** Totals over every reviewed session (admin only, speech_grading_agreement in migration 23). */
+export async function loadAdminAgreement(): Promise<Result<AdminAgreement>> {
+  const { data, error } = await supabase.rpc("speech_grading_agreement");
+  if (error) return { data: null, error: error.message };
+  const row = (Array.isArray(data) ? data[0] : data) as
+    | { reviewed_sessions: number; voice_answers: number; agreed: number; still_review: number }
+    | undefined;
+  return {
+    data: {
+      reviewedSessions: row?.reviewed_sessions ?? 0,
+      voice: row?.voice_answers ?? 0,
+      agreed: row?.agreed ?? 0,
+      stillReview: row?.still_review ?? 0,
+    },
+    error: null,
+  };
+}
+
+export const shortDate = (iso: string) =>
+  new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+
 export async function reloadAttempt(id: string): Promise<ReviewAttempt | null> {
   const { data } = await supabase.from("word_attempts").select(ATTEMPT_COLUMNS).eq("id", id).maybeSingle();
   return (data as unknown as ReviewAttempt | null) ?? null;

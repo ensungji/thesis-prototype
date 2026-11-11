@@ -4,10 +4,12 @@
 // row for every try (answer_attempts) with its recording; re-grade any row.
 // Re-grading is allowed once the session is finished (grading lock,
 // migration 22); the first re-grade keeps what it was ("was: correct by voice").
+// "Done reviewing" saves sessions.reviewed_at (migration 23); from then on the
+// session counts toward the speech grading agreement shown at the top.
 
 import { useCallback, useMemo, useState } from "react";
-import { ActivityIndicator, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { ActivityIndicator, Modal, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
@@ -20,12 +22,16 @@ import {
   type ReviewFilter,
   type ReviewResult,
   type ReviewTry,
+  agreementSentence,
   gradedByLabel,
   loadReview,
   loadTries,
+  markReviewed,
   matchesFilter,
   reloadAttempt,
   resultOf,
+  shortDate,
+  speechAgreement,
   wasLabel,
 } from "../../../lib/review";
 import { BrailleLoader } from "../../../components/BrailleLoader";
@@ -71,6 +77,9 @@ export default function SessionReview() {
   const [tries, setTries] = useState<Record<string, TriesState>>({});
   const [saving, setSaving] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<{ message: string; detail?: string } | null>(null);
+  const insets = useSafeAreaInsets();
+  const [confirmDone, setConfirmDone] = useState(false);
+  const [markingDone, setMarkingDone] = useState(false);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -148,6 +157,19 @@ export default function SessionReview() {
       n.delete(a.id);
       return n;
     });
+  }
+
+  async function doneReviewing() {
+    if (!data || markingDone) return;
+    setMarkingDone(true);
+    const res = await markReviewed(data.session.id);
+    setMarkingDone(false);
+    setConfirmDone(false);
+    if (res.error !== null) {
+      setToast({ message: "Couldn't mark it reviewed", detail: res.error });
+      return;
+    }
+    setData((d) => (d ? { ...d, session: { ...d.session, reviewed_at: res.data } } : d));
   }
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -233,6 +255,39 @@ export default function SessionReview() {
           </View>
         )}
 
+        {/* Speech grading agreement: only once the teacher says they're done */}
+        {finished &&
+          (data.session.reviewed_at ? (
+            (() => {
+              const g = speechAgreement(data.attempts);
+              return (
+                <View style={styles.agreeCard} accessible accessibilityLiveRegion="polite">
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                    <Ionicons name="checkmark-done" size={16} color={C.green} />
+                    <Text style={styles.agreeLabel}>REVIEWED {shortDate(data.session.reviewed_at).toUpperCase()}</Text>
+                  </View>
+                  <Text style={styles.agreeText}>{agreementSentence(g, "you")}</Text>
+                  {g.voice > 0 && g.voice > g.agreed && (
+                    <Text style={styles.meta}>
+                      {g.voice - g.agreed} changed by you to a different result.
+                    </Text>
+                  )}
+                  {g.stillReview > 0 && (
+                    <Text style={styles.meta}>
+                      {g.stillReview} still marked Review {g.stillReview === 1 ? "isn't" : "aren't"} counted.
+                    </Text>
+                  )}
+                </View>
+              );
+            })()
+          ) : (
+            <View style={styles.notice}>
+              <Text style={styles.noticeText}>
+                {"When you've checked the answers, tap Done reviewing at the bottom. Then this session counts toward the speech grading agreement."}
+              </Text>
+            </View>
+          ))}
+
         <View style={styles.chips}>
           {FILTERS.map(({ key, label }) => {
             const on = f === key;
@@ -300,7 +355,61 @@ export default function SessionReview() {
             ))}
           </View>
         )}
+
+        {finished && !data.session.reviewed_at && (
+          <Pressable
+            onPress={() => (counts.review > 0 ? setConfirmDone(true) : doneReviewing())}
+            disabled={markingDone}
+            style={({ pressed }) => [styles.doneBtn, (pressed || markingDone) && { opacity: 0.75 }]}
+            accessibilityRole="button"
+            accessibilityHint="Counts this session toward the speech grading agreement"
+          >
+            {markingDone ? (
+              <ActivityIndicator color="#1A1200" />
+            ) : (
+              <>
+                <Ionicons name="checkmark-done" size={20} color="#1A1200" />
+                <Text style={styles.doneText}>Done reviewing</Text>
+              </>
+            )}
+          </Pressable>
+        )}
       </ScrollView>
+
+      {/* Some answers still say Review: ask before counting the session */}
+      <Modal visible={confirmDone} animationType="slide" transparent onRequestClose={() => setConfirmDone(false)}>
+        <View style={styles.overlay}>
+          <Pressable style={styles.backdrop} onPress={() => !markingDone && setConfirmDone(false)} />
+          <View style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 16) + 16 }]}>
+            <Text style={styles.sheetTitle}>
+              {counts.review} answer{counts.review === 1 ? "" : "s"} still need{counts.review === 1 ? "s" : ""} review
+            </Text>
+            <Text style={styles.sheetBody}>
+              {"Answers still marked Review won't count toward the speech grading agreement. Grade them with ✓ / ✗ first, or mark the session done anyway."}
+            </Text>
+            <View style={styles.sheetActions}>
+              <Pressable
+                onPress={() => {
+                  setConfirmDone(false);
+                  setFilter("review");
+                }}
+                style={({ pressed }) => [styles.sheetBtn, styles.sheetBtnPlain, pressed && { opacity: 0.7 }]}
+                accessibilityRole="button"
+              >
+                <Text style={styles.sheetBtnPlainText}>Show them</Text>
+              </Pressable>
+              <Pressable
+                onPress={doneReviewing}
+                disabled={markingDone}
+                style={({ pressed }) => [styles.sheetBtn, styles.sheetBtnMain, (pressed || markingDone) && { opacity: 0.75 }]}
+                accessibilityRole="button"
+              >
+                <Text style={styles.sheetBtnMainText}>{markingDone ? "Saving…" : "Done anyway"}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       <Toast
         message={toast?.message ?? ""}
@@ -540,6 +649,45 @@ const styles = StyleSheet.create({
   tries: { backgroundColor: C.bg, borderRadius: 10, padding: 10, gap: 8 },
   tryRow: { flexDirection: "row", alignItems: "center", gap: 10 },
   tryHead: { fontFamily: fonts.bodyBold, fontSize: 13, color: C.ink },
+  agreeCard: {
+    padding: 14,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderColor: C.green,
+    backgroundColor: C.greenBg,
+    gap: 4,
+  },
+  agreeLabel: { fontFamily: fonts.mono, fontSize: 11, color: C.green, letterSpacing: 1 },
+  agreeText: { fontFamily: fonts.heading, fontSize: 16, color: C.ink, lineHeight: 22 },
+  doneBtn: {
+    minHeight: 54,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    borderRadius: 14,
+    backgroundColor: C.amber,
+    marginTop: 8,
+  },
+  doneText: { fontFamily: fonts.heading, fontSize: 17, color: "#1A1200" },
+  overlay: { flex: 1, justifyContent: "flex-end" },
+  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.45)" },
+  sheet: { backgroundColor: C.white, borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, gap: 12 },
+  sheetTitle: { fontFamily: fonts.heading, fontSize: 20, color: C.navy },
+  sheetBody: { fontFamily: fonts.body, fontSize: 14, color: C.ink, lineHeight: 21 },
+  sheetActions: { flexDirection: "row", gap: 10, marginTop: 4 },
+  sheetBtn: {
+    flex: 1,
+    minHeight: MIN_TOUCH,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 14,
+    borderWidth: 1.5,
+  },
+  sheetBtnPlain: { backgroundColor: C.bg, borderColor: C.border },
+  sheetBtnPlainText: { fontFamily: fonts.heading, fontSize: 15, color: C.navy },
+  sheetBtnMain: { backgroundColor: C.amber, borderColor: C.amber },
+  sheetBtnMainText: { fontFamily: fonts.heading, fontSize: 15, color: "#1A1200" },
   errorBox: {
     margin: 16,
     padding: 12,
