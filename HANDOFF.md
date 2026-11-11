@@ -12,7 +12,7 @@ Companion files: `AUDIT.md` (audit findings), `TESTING.md` (test checklist), `Br
 | **`main`** | Has the full audit work (PR #9 `fix/audit` merged). |
 | **`fix/bugs`** | 7 bug fixes (B-01 to B-07), 2 firmware commits, and app changes C1–C3 (logs CSV export, 20 s break, braille preview pinned at the top). **Pushed, not merged yet.** C1 needs a new preview build. |
 | **`feature/activities`** | Branched from `fix/bugs`. Activities Phases 1–5 (section 2b). **Pushed, not merged, app part not tested.** |
-| **Database** | Migrations 01–14 and **16–22 (Activities) run**; **23 (reviewed_at) written, not run**. 15 is covered by 21 (it adds the `graded_by` check). `LATER_…sql.txt` not run, on purpose. |
+| **Database** | Migrations 01–14 and **16–24 (Activities) run** (23 and 24 on 2026-11-11; Phase 1 script 59/59). 15 is covered by 21 (it adds the `graded_by` check). `LATER_…sql.txt` not run, on purpose. |
 | **Edge functions** | `reset-teacher-password`, `create-teacher`, `set-teacher-active`, `register-device` deployed with the new checks; **`grade-answer` v7 deployed** (every try saved, tries, correct lock). |
 | **App testing** | 22 pass, 2 partial, 15 waiting for the full device (see the Excel file). The B-01 to B-07 fixes are **not tested yet**. |
 | **Hardware** | Device assembled. Dots respond, but **weak upright** and **cells 1–3 don't respond**. See section 4. |
@@ -59,8 +59,8 @@ Word lists run as a teacher-paced session: the admin's are shared, a teacher's o
 | **1. Database + grade-answer** | Migrations 16–22: `activities` + `activity_words` (edit lock), `duplicate_activity`, sessions type `activity` + `activity_id` / `activity_name` / `current_index`, `start_activity_session`, `answer_attempts` (every try), word_attempts `tries` + re-grade columns + `graded_by` check, grading lock trigger. grade-answer v7. | All run; **47/47** in `supabase/tests/phase1_activities_checks.sql`; v7 deployed. Device tests P1.3 not done. |
 | **2. Admin screens + follow-ups** | Admin → Activities (create, edit draft, paste / Word Bank, time per word, reorder, publish, hide, duplicate, delete draft). Delete-session text, "Activity" label, voice-grade buttons hidden during a session, outbox drops lock refusals. | **Not tested on a phone.** |
 | **3. Activity sessions** | New Session → Activity (published only). Previous / Next (1.5 s guard), skipped rows, pause / resume, end, resume on the same word after a crash. Answers card in every mode: heard / result / tries + ▶ latest try (60 s signed URL). | **Not tested on a phone.** |
-| **4. Review + agreement** | Review screen after a session (filter, every try with ▶, re-grade any row, "Re-graded by … (was: …)"). "Done reviewing" (`sessions.reviewed_at`) and "Speech grading agreed with the teacher on X of Y voice answers (Z%)" per session and on the admin panel. | **Migration 23 written, not run.** Not tested on a phone. |
-| **5. Teacher activities** | Migration 24: `activities.shared`, RLS (creator or admin manages), `duplicate_activity` for anyone who can see it, `start_activity_session` needs shared or own. Teacher Activities (Mine / Shared) from the Sessions list; admin list shows who made each; New Session › Activity tags Mine / Shared. | **Migration 24 written, not run.** Not tested on a phone. |
+| **4. Review + agreement** | Review screen after a session (filter, every try with ▶, re-grade any row, "Re-graded by … (was: …)"). "Done reviewing" (`sessions.reviewed_at`) and "Speech grading agreed with the teacher on X of Y voice answers (Z%)" per session and on the admin panel. | Migration 23 run. **Not tested on a phone.** |
+| **5. Teacher activities** | Migration 24: `activities.shared`, RLS (creator or admin manages), `duplicate_activity` for anyone who can see it, `start_activity_session` needs shared or own. Teacher Activities (Mine / Shared) from the Sessions list; admin list shows who made each; New Session › Activity tags Mine / Shared. | Migration 24 run; Phase 1 script **59/59**. **Not tested on a phone.** |
 
 **Decisions (keep these)**
 - **Grading lock (all modes):** while a session isn't finished, voice grades (correct, wrong, review) can't be changed; teacher / missed / skipped rows can. Retries replace wrong / review / missed / skipped until correct by voice, which then never changes (DT001; grade-answer answers `"locked": true`). After the end, re-grade anything; the first re-grade keeps the original.
@@ -135,7 +135,7 @@ Coil current is about **200–250 mA** (estimated; **measure one coil's resistan
 4. **Force:** with the device upright, check that pins don't rub in the top plate; then decide on option A, B or C.
 5. **Heat tuning:** once dots lift upright, follow the `HEAT_LIMIT_MS` steps in `TESTING.md` 1.1 (needs a thermometer or IR gun).
 6. **App:** test B-01 to B-07 and C1–C3 on the phone (preview APK), record results in the Excel file, then merge `fix/bugs` into `main`.
-6a. **Activities:** run migrations 23 and 24, then P1.1 again (59 rows); new preview APK from `feature/activities`, run `TESTING.md` P1.3 and P2–P5. Merge after `fix/bugs` (the branch contains it).
+6a. **Activities:** new preview APK from `feature/activities`, run `TESTING.md` P1.3 and P2–P5. Merge after `fix/bugs` (the branch contains it).
 6b. **Firmware team (later):** setup hold about 10 s with a warning sound, error-beep rate limit, setup password in `secrets.ini`, port the v7.1b chunk navigation into v7.3 (**don't flash v7.1b**, it lacks the heat budget and boot safety), then unlimited retries with dots dropping on a correct answer.
 7. **Before the defense:** preview APK build (`eas build --profile preview --platform android`, with `EXPO_PUBLIC_*` env vars set for the preview environment), Round 3 device tests in `TESTING.md`.
 
