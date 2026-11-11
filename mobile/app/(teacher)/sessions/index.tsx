@@ -180,30 +180,42 @@ export default function SessionsScreen() {
     <SafeAreaView style={styles.safe} edges={["top"]}>
       <View style={styles.header}>
         <Text style={styles.title}>Sessions</Text>
-        <Pressable
-          onPress={() => {
-            if (hasActiveSession) {
-              setErrorToast(true);
-              return;
+        <View style={styles.headerButtons}>
+          <Pressable
+            onPress={() => router.push("/(teacher)/sessions/activities" as any)}
+            style={({ pressed }) => [styles.activitiesBtn, pressed && { opacity: 0.7 }]}
+            accessibilityRole="button"
+            accessibilityLabel="Activities"
+            accessibilityHint="Your word lists and the shared ones"
+          >
+            <Ionicons name="list-outline" size={18} color={C.navy} />
+            <Text style={styles.activitiesBtnText}>Activities</Text>
+          </Pressable>
+          <Pressable
+            onPress={() => {
+              if (hasActiveSession) {
+                setErrorToast(true);
+                return;
+              }
+              router.push("/(teacher)/sessions/new" as any);
+            }}
+            style={({ pressed }) => [
+              styles.addBtn,
+              hasActiveSession && styles.addBtnDisabled,
+              pressed && !hasActiveSession && { opacity: 0.85 },
+            ]}
+            accessibilityRole="button"
+            accessibilityState={{ disabled: hasActiveSession }}
+            accessibilityHint={
+              hasActiveSession
+                ? "End the current active session before creating a new one"
+                : undefined
             }
-            router.push("/(teacher)/sessions/new" as any);
-          }}
-          style={({ pressed }) => [
-            styles.addBtn,
-            hasActiveSession && styles.addBtnDisabled,
-            pressed && !hasActiveSession && { opacity: 0.85 },
-          ]}
-          accessibilityRole="button"
-          accessibilityState={{ disabled: hasActiveSession }}
-          accessibilityHint={
-            hasActiveSession
-              ? "End the current active session before creating a new one"
-              : undefined
-          }
-        >
-          <Ionicons name="add" size={18} color={hasActiveSession ? C.muted : "#1A1200"} />
-          <Text style={[styles.addBtnText, hasActiveSession && styles.addBtnTextDisabled]}>New</Text>
-        </Pressable>
+          >
+            <Ionicons name="add" size={18} color={hasActiveSession ? C.muted : "#1A1200"} />
+            <Text style={[styles.addBtnText, hasActiveSession && styles.addBtnTextDisabled]}>New</Text>
+          </Pressable>
+        </View>
       </View>
 
       <FlatList
@@ -272,6 +284,19 @@ const styles = StyleSheet.create({
     borderBottomColor: C.border,
   },
   title: { fontFamily: fonts.heading, fontSize: 24, color: C.navy },
+  headerButtons: { flexDirection: "row", alignItems: "center", gap: 8 },
+  activitiesBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    borderRadius: 10,
+    borderWidth: 1.5,
+    borderColor: C.border,
+    backgroundColor: C.white,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  activitiesBtnText: { fontFamily: fonts.heading, fontSize: 14, color: C.navy },
   addBtn: {
     flexDirection: "row",
     alignItems: "center",
