@@ -805,3 +805,56 @@ them twice (e.g. CAT DOG SUN CAT), one 6+ letters (two chunks).
    allows): the row stays Correct, the count goes up, and ▶ plays that newest
    try.
 3. The ✓ / ✗ rules are unchanged (🔒 Voice while the session runs).
+
+---
+
+## Branch feature/activities: Phase 4 (review screen + speech grading agreement)
+
+JS-only app changes (reload / new preview APK). **Run migration 23
+(`20261111120800_sessions_reviewed_at_agreement.sql`) before P4.2.**
+Use a finished session with voice answers: some correct, some wrong, at least
+one Review, one No answer (and, for an Activity, one Skipped), and a word
+answered twice.
+
+### P4.1 Review screen
+1. **Do:** open the finished session. **Expect:** a **Review answers** card
+   ("N answers need review · then tap Done reviewing"). Tap it.
+2. **Expect:** it opens on **Needs review** (if any); chips show counts for
+   Needs review / Wrong / All. Rows are grouped by word: student, result
+   badge, `Voice · 2 tries · heard "dog"` (or Teacher / No answer / Skipped).
+   **Wrong** includes No answer and Skipped. **All** shows every word; an
+   Activity word that was never shown says "No answers".
+3. **Do:** tap the word answered twice.
+   **Expect:** Try 1 and Try 2, each with heard / result / "% sure" / time and
+   a ▶ that plays that try. A row from before Phase 1 says "No tries saved"
+   with the saved recording.
+4. **Do:** ✗ on a voice **Correct** row.
+   **Expect:** it turns Wrong, graded Teacher, and shows **"Re-graded by you
+   (was: correct by voice)"**. ✓ again: still "was: correct by voice"
+   (the first re-grade is kept). ✓ on a No answer row → "was: no answer".
+   SQL: `select is_correct, graded_by, original_is_correct, original_graded_by, regraded_at from word_attempts where session_id = '<id>' and regraded_at is not null;`
+
+### P4.2 Done reviewing + agreement (after migration 23)
+1. **Expect (before):** a note at the top says to tap Done reviewing; no
+   agreement shown. Admin panel: **SPEECH GRADING** card says "No reviewed
+   sessions yet" (or the totals of other reviewed sessions).
+2. **Do:** with a Review row left, tap **Done reviewing**.
+   **Expect:** sheet "1 answer still needs review" → **Show them** switches to
+   Needs review; **Done anyway** saves.
+3. **Expect (after):** green card "REVIEWED <date>" + "Speech grading agreed
+   with you on X of Y voice answers (Z%)", "N changed by you", "N still
+   marked Review aren't counted". The finished session's link says
+   "Reviewed <date>". Re-grading more rows updates the numbers.
+4. **Check the numbers by hand** (SQL Editor):
+   ```sql
+   select count(*) filter (where (regraded_at is null and graded_by = 'auto' and not coalesce(needs_review, false))
+                              or (regraded_at is not null and original_graded_by = 'auto')) as voice,
+          count(*) filter (where (regraded_at is null and graded_by = 'auto' and not coalesce(needs_review, false))
+                              or (regraded_at is not null and original_graded_by = 'auto' and is_correct = original_is_correct)) as agreed
+   from word_attempts where session_id = '<id>';
+   ```
+   **Expect:** the same X (agreed) and Y (voice) as the card.
+5. **Admin:** sign in as admin. **Expect:** the SPEECH GRADING card shows the
+   same sentence over all reviewed sessions, "N reviewed sessions".
+6. **Guard:** `update sessions set reviewed_at = now() where status <> 'finished';`
+   in the SQL Editor → error `sessions_reviewed_only_finished` (rolls back).

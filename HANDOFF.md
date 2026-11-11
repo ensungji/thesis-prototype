@@ -12,7 +12,7 @@ Companion files: `AUDIT.md` (audit findings), `TESTING.md` (test checklist), `Br
 | **`main`** | Has the full audit work (PR #9 `fix/audit` merged). |
 | **`fix/bugs`** | 7 bug fixes (B-01 to B-07), 2 firmware commits, and app changes C1–C3 (logs CSV export, 20 s break, braille preview pinned at the top). **Pushed, not merged yet.** C1 needs a new preview build. |
 | **`feature/activities`** | Branched from `fix/bugs`. Activities Phases 1–3 (section 2b). **Pushed, not merged, app part not tested.** |
-| **Database** | Migrations 01–14 and **16–22 (Activities) run**. 15 is covered by 21 (it adds the `graded_by` check). `LATER_…sql.txt` not run, on purpose. |
+| **Database** | Migrations 01–14 and **16–22 (Activities) run**; **23 (reviewed_at) written, not run**. 15 is covered by 21 (it adds the `graded_by` check). `LATER_…sql.txt` not run, on purpose. |
 | **Edge functions** | `reset-teacher-password`, `create-teacher`, `set-teacher-active`, `register-device` deployed with the new checks; **`grade-answer` v7 deployed** (every try saved, tries, correct lock). |
 | **App testing** | 22 pass, 2 partial, 15 waiting for the full device (see the Excel file). The B-01 to B-07 fixes are **not tested yet**. |
 | **Hardware** | Device assembled. Dots respond, but **weak upright** and **cells 1–3 don't respond**. See section 4. |
@@ -59,6 +59,7 @@ Admin-made word lists that teachers run as a teacher-paced session. Tests: `TEST
 | **1. Database + grade-answer** | Migrations 16–22: `activities` + `activity_words` (edit lock), `duplicate_activity`, sessions type `activity` + `activity_id` / `activity_name` / `current_index`, `start_activity_session`, `answer_attempts` (every try), word_attempts `tries` + re-grade columns + `graded_by` check, grading lock trigger. grade-answer v7. | All run; **47/47** in `supabase/tests/phase1_activities_checks.sql`; v7 deployed. Device tests P1.3 not done. |
 | **2. Admin screens + follow-ups** | Admin → Activities (create, edit draft, paste / Word Bank, time per word, reorder, publish, hide, duplicate, delete draft). Delete-session text, "Activity" label, voice-grade buttons hidden during a session, outbox drops lock refusals. | **Not tested on a phone.** |
 | **3. Activity sessions** | New Session → Activity (published only). Previous / Next (1.5 s guard), skipped rows, pause / resume, end, resume on the same word after a crash. Answers card in every mode: heard / result / tries + ▶ latest try (60 s signed URL). | **Not tested on a phone.** |
+| **4. Review + agreement** | Review screen after a session (filter, every try with ▶, re-grade any row, "Re-graded by … (was: …)"). "Done reviewing" (`sessions.reviewed_at`) and "Speech grading agreed with the teacher on X of Y voice answers (Z%)" per session and on the admin panel. | **Migration 23 written, not run.** Not tested on a phone. |
 
 **Decisions (keep these)**
 - **Grading lock (all modes):** while a session isn't finished, voice grades (correct, wrong, review) can't be changed; teacher / missed / skipped rows can. Retries replace wrong / review / missed / skipped until correct by voice, which then never changes (DT001; grade-answer answers `"locked": true`). After the end, re-grade anything; the first re-grade keeps the original.
@@ -68,6 +69,7 @@ Admin-made word lists that teachers run as a teacher-paced session. Tests: `TEST
 - **Types in the database:** `manual` (Live), `word_list` (Timed), `activity`. The app tries `live_session` / `timed_sequence` first and falls back on the check error; keep those refused.
 - **Outbox:** a queued change refused with 42501 / DT001 is dropped at once, logged (`sync_dropped`) and shown; other errors still get 5 retries.
 - **Activity mode:** no timer (`duration_seconds` unused), Next is refused offline, Next / End mark unanswered students Skipped, words never shown get no rows.
+- **Agreement rule:** only reviewed sessions; a voice answer = still `auto` or re-graded from `auto`; it disagrees if re-graded to a different `is_correct`; rows still marked Review aren't counted. Same rule in `lib/review.ts` and `speech_grading_agreement()`.
 
 ---
 
