@@ -1,6 +1,10 @@
 // mobile/lib/activities.ts
-// Activities (admin-made word lists, migrations 16–17): types, the word-list
-// parser, and the database calls the admin screens use.
+// Activities (word lists run as a session, migrations 16–17 and 24): types,
+// the word-list parser, and the database calls the Activities screens use.
+//
+// Admin-made activities are shared (every teacher sees them once published);
+// a teacher's own are private (that teacher and admins). The creator or an
+// admin manages one; anyone who can see one can duplicate it (migration 24).
 //
 // The database enforces the rules (RLS + triggers); these helpers only make
 // the calls and pass its error messages on, e.g. "Add at least one word
@@ -21,8 +25,33 @@ export type Activity = {
   status: ActivityStatus;
   created_at: string;
   published_at: string | null;
+  created_by: string | null;
+  shared: boolean;
+  /** The creator's name. Only an admin can read other people's profiles, so a
+   *  teacher gets null for anyone but themselves. */
+  creator_name: string | null;
   word_count: number;
 };
+
+/** Which app area an Activities screen is in: decides links and what can be managed. */
+export type ActivitiesArea = "admin" | "teacher";
+
+export const ACTIVITY_ROUTE: Record<ActivitiesArea, string> = {
+  admin: "/admin/activity",
+  teacher: "/(teacher)/sessions/activity",
+};
+
+/** Admins manage every activity; a teacher manages the ones they made. */
+export function canManage(activity: Pick<Activity, "created_by">, area: ActivitiesArea, me: string | null): boolean {
+  return area === "admin" || (!!me && activity.created_by === me);
+}
+
+/** "Made by Ms. Cruz" / "Made by you" / "Made by a deleted account" */
+export function creatorLabel(activity: Pick<Activity, "created_by" | "creator_name">, me: string | null): string {
+  if (!activity.created_by) return "Made by a deleted account";
+  if (activity.created_by === me) return "Made by you";
+  return `Made by ${activity.creator_name || "a teacher"}`;
+}
 
 export type ActivityWord = {
   id: string;
@@ -98,17 +127,33 @@ export function describeDropped(dropped: DroppedWord[]): string {
 type Result<T> = { data: T; error: null } | { data: null; error: string };
 const fail = (e: { message: string }) => ({ data: null, error: e.message }) as const;
 
+/** The signed-in user's id, from the stored session (no network call). */
+export async function myUserId(): Promise<string | null> {
+  const { data } = await supabase.auth.getSession();
+  return data.session?.user.id ?? null;
+}
+
+// creator: the one foreign key from activities to profiles (created_by)
+const ACTIVITY_COLUMNS =
+  "id, name, description, level, status, created_at, published_at, created_by, shared, creator:profiles(full_name)";
+
+type ActivityRow = Omit<Activity, "word_count" | "creator_name"> & { creator: { full_name: string | null } | null };
+
+function toActivity({ creator, ...a }: ActivityRow, word_count: number): Activity {
+  return { ...a, creator_name: creator?.full_name ?? null, word_count };
+}
+
+/** Every activity this user can see (RLS): all for an admin; shared published + own for a teacher. */
 export async function listActivities(): Promise<Result<Activity[]>> {
   const { data, error } = await supabase
     .from("activities")
-    .select("id, name, description, level, status, created_at, published_at, activity_words(count)")
+    .select(`${ACTIVITY_COLUMNS}, activity_words(count)`)
     .order("created_at", { ascending: false });
   if (error) return fail(error);
   return {
-    data: (data ?? []).map(({ activity_words, ...a }) => ({
-      ...(a as Omit<Activity, "word_count">),
-      word_count: (activity_words as { count: number }[] | null)?.[0]?.count ?? 0,
-    })),
+    data: (data ?? []).map(({ activity_words, ...a }) =>
+      toActivity(a as unknown as ActivityRow, (activity_words as { count: number }[] | null)?.[0]?.count ?? 0)
+    ),
     error: null,
   };
 }
@@ -117,7 +162,7 @@ export async function getActivity(id: string): Promise<Result<{ activity: Activi
   const [a, w] = await Promise.all([
     supabase
       .from("activities")
-      .select("id, name, description, level, status, created_at, published_at")
+      .select(ACTIVITY_COLUMNS)
       .eq("id", id)
       .maybeSingle(),
     supabase
@@ -130,7 +175,7 @@ export async function getActivity(id: string): Promise<Result<{ activity: Activi
   if (w.error) return fail(w.error);
   if (!a.data) return { data: null, error: "This activity doesn't exist any more." };
   const words = (w.data ?? []) as ActivityWord[];
-  return { data: { activity: { ...(a.data as Omit<Activity, "word_count">), word_count: words.length }, words }, error: null };
+  return { data: { activity: toActivity(a.data as unknown as ActivityRow, words.length), words }, error: null };
 }
 
 export type ActivityDetails = { name: string; description: string | null; level: Difficulty | null };
@@ -150,7 +195,7 @@ export async function updateActivityDetails(id: string, d: ActivityDetails): Pro
 export async function setActivityStatus(id: string, status: ActivityStatus): Promise<Result<true>> {
   const { data, error } = await supabase.from("activities").update({ status }).eq("id", id).select("id");
   if (error) return fail(error);
-  if (!data?.length) return { data: null, error: "Nothing changed. Is this account still an admin?" };
+  if (!data?.length) return { data: null, error: "Nothing changed. Only the person who made it, or an admin, can change it." };
   return { data: true, error: null };
 }
 
@@ -162,7 +207,8 @@ export async function deleteDraft(id: string): Promise<Result<true>> {
   return { data: true, error: null };
 }
 
-/** Copies an activity (any status) into a new draft; returns the new id. */
+/** Copies an activity this user can see into a new draft they own; returns the new id.
+ *  The copy is shared only when an admin makes it (migration 24 trigger). */
 export async function duplicateActivity(id: string): Promise<Result<string>> {
   const { data, error } = await supabase.rpc("duplicate_activity", { p_activity: id });
   if (error) return fail(error);
