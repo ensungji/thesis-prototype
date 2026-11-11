@@ -1,6 +1,6 @@
 -- Phase 1 (Activities) database checks. See TESTING.md, "Branch feature/activities".
 --
--- Run the WHOLE file at once in the Supabase SQL Editor (after migrations 16–22).
+-- Run the WHOLE file at once in the Supabase SQL Editor (after migrations 16–22 and 24).
 -- It changes nothing: every test row is made inside one block that is rolled
 -- back at the end. The last statement prints one row per check:
 --   result = PASS / FAIL / SKIP, detail = the error or value seen.
@@ -25,6 +25,9 @@ declare
   v_act     uuid;
   v_empty   uuid;
   v_dup     uuid;
+  v_mine    uuid;   -- the teacher's private activity (migration 24)
+  v_sess2   uuid;
+  v_osess   uuid;
   v_sess    uuid;
   w         uuid[];   -- the test session's words, in order
   wa_ids    uuid[];   -- the test session's word_attempts
@@ -65,6 +68,13 @@ begin
   select exists (select 1 from pg_constraint where conname = 'word_attempts_session_word_id_fkey' and confdeltype = 'n') into b;
   res := res || jsonb_build_array(jsonb_build_array('0 schema', 'word_attempts.session_word_id foreign key is ON DELETE SET NULL', b, null));
 
+  select count(*) into n from information_schema.columns
+   where table_schema = 'public' and table_name = 'activities' and column_name = 'shared';
+  select count(*) into n2 from activities a join profiles p on p.id = a.created_by
+   where p.role = 'admin' and not a.shared;
+  res := res || jsonb_build_array(jsonb_build_array('0 schema', 'activities.shared exists; every activity an admin made is shared (migration 24)',
+           n = 1 and n2 = 0, format('column %s, admin-made not shared %s', n, n2)));
+
   -- ── setup: pick the users ──────────────────────────────────────────────────
   select id into v_admin from profiles
    where role = 'admin' and is_active is not false order by id limit 1;
@@ -88,9 +98,10 @@ begin
           set_config('request.jwt.claims', json_build_object('sub', v_admin, 'role', 'authenticated')::text, true),
           set_config('role', 'authenticated', true);
 
-  insert into activities (name, level, created_by) values ('P1 test', 'easy', v_teacher) returning id into v_act;
-  select status, created_by into t, u from activities where id = v_act;
-  res := res || jsonb_build_array(jsonb_build_array('1 activities', 'admin creates a draft; created_by is the admin (not what was sent)', t = 'draft' and u = v_admin, t));
+  insert into activities (name, level, created_by, shared) values ('P1 test', 'easy', v_teacher, false) returning id into v_act;
+  select status, created_by, shared into t, u, b from activities where id = v_act;
+  res := res || jsonb_build_array(jsonb_build_array('1 activities', 'admin creates a draft; created_by is the admin and it is shared (not what was sent)',
+           t = 'draft' and u = v_admin and b, t || ', shared ' || b));
 
   insert into activity_words (activity_id, position, word) values (v_act, 0, 'CAT');
   insert into activity_words (activity_id, position, word, duration_seconds) values (v_act, 1, 'DOG', 30), (v_act, 2, 'SUN', 5);
@@ -116,9 +127,12 @@ begin
   select count(*) into n from activities where id in (v_act, v_empty);
   select count(*) into n2 from activity_words where activity_id = v_act;
   res := res || jsonb_build_array(jsonb_build_array('1 activities', 'a teacher can''t see drafts or their words', n = 0 and n2 = 0, n || ' / ' || n2));
-  e := null; begin insert into activities (name) values ('P1 teacher');
+  e := null; n := 0; begin
+    insert into activities (name) values ('P1 teacher') returning id into u;
+    delete from activities where id = u;
+    get diagnostics n = row_count;
   exception when others then e := sqlstate || ' ' || sqlerrm; end;
-  res := res || jsonb_build_array(jsonb_build_array('1 activities', 'a teacher can''t create an activity', e like '%row-level security%', e));
+  res := res || jsonb_build_array(jsonb_build_array('1 activities', 'a teacher can create and delete their own draft', e is null and n = 1, coalesce(e, n || ' deleted')));
 
   -- as admin: publish
   perform set_config('request.jwt.claim.sub', v_admin::text, true),
@@ -172,9 +186,13 @@ begin
   perform set_config('request.jwt.claim.sub', v_teacher::text, true),
           set_config('request.jwt.claims', json_build_object('sub', v_teacher, 'role', 'authenticated')::text, true),
           set_config('role', 'authenticated', true);
-  e := null; begin perform duplicate_activity(v_act);
+  e := null; begin
+    u := duplicate_activity(v_act);
+    select status, shared, created_by = v_teacher, (select count(*) from activity_words where activity_id = u)
+      into t, b, b2, n from activities where id = u;
   exception when others then e := sqlstate || ' ' || sqlerrm; end;
-  res := res || jsonb_build_array(jsonb_build_array('1 activities', 'a teacher can''t duplicate', e like '%Only an admin%', e));
+  res := res || jsonb_build_array(jsonb_build_array('1 activities', 'a teacher duplicates a shared activity: their own private draft, same words',
+           e is null and t = 'draft' and not b and b2 and n = 3, coalesce(e, format('%s, shared %s, theirs %s, %s words', t, b, b2, n))));
 
   -- as anon
   perform set_config('request.jwt.claim.sub', '', true), set_config('request.jwt.claims', '', true), set_config('role', 'anon', true);
@@ -372,6 +390,84 @@ begin
   res := res || jsonb_build_array(jsonb_build_array('5 safety', 'a teacher can delete an active session; results stay (ids emptied), tries go',
            n = 1 and n2 = 3 and n3 = 0, format('deleted %s, results kept %s, tries left %s', n, n2, n3)));
   res := res || jsonb_build_array(jsonb_build_array('5 safety', 'the student''s analytics are the same after the delete', j = j2, j2::text));
+
+  -- ── 6 teacher activities (migration 24) ────────────────────────────────────
+  perform set_config('request.jwt.claim.sub', v_teacher::text, true),
+          set_config('request.jwt.claims', json_build_object('sub', v_teacher, 'role', 'authenticated')::text, true),
+          set_config('role', 'authenticated', true);
+  insert into activities (name, shared) values ('P1 mine', true) returning id into v_mine;
+  select created_by, shared into u, b from activities where id = v_mine;
+  res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'a teacher''s new activity is theirs and private (shared sent true is ignored)',
+           u = v_teacher and not b, 'shared ' || b));
+  e := null; begin
+    insert into activity_words (activity_id, position, word) values (v_mine, 0, 'HAT'), (v_mine, 1, 'MAP'), (v_mine, 2, 'PEN');
+    update activity_words set duration_seconds = 10 where activity_id = v_mine and position = 1;
+    delete from activity_words where activity_id = v_mine and position = 2;
+    update activities set description = 'edited', level = 'hard' where id = v_mine;
+  exception when others then e := sqlstate || ' ' || sqlerrm; end;
+  select count(*) into n from activity_words where activity_id = v_mine;
+  res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'the teacher edits their draft and its words', e is null and n = 2, coalesce(e, n || ' words')));
+  e := null; begin update activities set shared = true where id = v_mine;
+  exception when others then e := sqlstate || ' ' || sqlerrm; end;
+  res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'a teacher can''t share their own activity', e like '%Only an admin can change whether%', e));
+  e := null; begin
+    update activities set status = 'published' where id = v_mine;
+    update activities set status = 'hidden' where id = v_mine;
+    update activities set status = 'published' where id = v_mine;
+  exception when others then e := sqlstate || ' ' || sqlerrm; end;
+  select status into t from activities where id = v_mine;
+  res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'the teacher publishes, hides and un-hides their own', e is null and t = 'published', coalesce(e, t)));
+  e := null; begin update activities set name = 'P1 renamed' where id = v_mine;
+  exception when others then e := sqlstate || ' ' || sqlerrm; end;
+  delete from activities where id = v_mine;
+  get diagnostics n = row_count;
+  res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'published: locked for the teacher too, and can''t be deleted',
+           e like '%can''t be edited%' and n = 0, e || ' / ' || n || ' deleted'));
+
+  if v_other is not null then
+    perform set_config('request.jwt.claim.sub', v_other::text, true),
+            set_config('request.jwt.claims', json_build_object('sub', v_other, 'role', 'authenticated')::text, true),
+            set_config('role', 'authenticated', true);
+    select count(*) into n from activities where id = v_mine;
+    select count(*) into n2 from activity_words where activity_id = v_mine;
+    res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'another teacher can''t see it or its words', n = 0 and n2 = 0, n || ' / ' || n2));
+    update activities set status = 'hidden' where id = v_mine;
+    get diagnostics n = row_count;
+    e := null; begin insert into activity_words (activity_id, position, word) values (v_mine, 5, 'COW');
+    exception when others then e := sqlstate || ' ' || sqlerrm; end;
+    res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'another teacher can''t change it or add words (refused by RLS or the edit lock)',
+             n = 0 and (e like '%row-level security%' or e like '%can''t be changed%'), n || ' rows / ' || e));
+    e := null; begin perform duplicate_activity(v_mine);
+    exception when others then e := sqlstate || ' ' || sqlerrm; end;
+    res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'another teacher can''t duplicate it', e like '%No such activity%', e));
+    insert into sessions (teacher_id, name) values (v_other, 'P1 other session') returning id into v_osess;
+    e := null; begin perform start_activity_session(v_osess, v_mine);
+    exception when others then e := sqlstate || ' ' || sqlerrm; end;
+    res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'another teacher can''t start it', e like '%Only a published activity%', e));
+  else
+    res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'another teacher can''t see it or its words', null, 'SKIP: no second teacher'));
+    res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'another teacher can''t change it or add words (refused by RLS or the edit lock)', null, 'SKIP: no second teacher'));
+    res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'another teacher can''t duplicate it', null, 'SKIP: no second teacher'));
+    res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'another teacher can''t start it', null, 'SKIP: no second teacher'));
+  end if;
+
+  perform set_config('request.jwt.claim.sub', v_admin::text, true),
+          set_config('request.jwt.claims', json_build_object('sub', v_admin, 'role', 'authenticated')::text, true),
+          set_config('role', 'authenticated', true);
+  select count(*) into n from activity_words where activity_id = v_mine;
+  u := duplicate_activity(v_mine);
+  select shared, created_by = v_admin into b, b2 from activities where id = u;
+  res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'an admin sees it; the admin''s copy of it is shared',
+           n = 2 and b and b2, format('%s words, copy shared %s, admin''s %s', n, b, b2)));
+
+  perform set_config('request.jwt.claim.sub', v_teacher::text, true),
+          set_config('request.jwt.claims', json_build_object('sub', v_teacher, 'role', 'authenticated')::text, true),
+          set_config('role', 'authenticated', true);
+  insert into sessions (teacher_id, name) values (v_teacher, 'P1 mine session') returning id into v_sess2;
+  e := null; n := null; begin n := start_activity_session(v_sess2, v_mine);
+  exception when others then e := sqlstate || ' ' || sqlerrm; end;
+  res := res || jsonb_build_array(jsonb_build_array('6 teacher activities', 'the teacher starts a session with their own private activity',
+           e is null and n = 2, coalesce(e, n || ' words')));
 
   raise exception 'P1_DONE';
   exception when others then
