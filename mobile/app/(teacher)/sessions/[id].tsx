@@ -37,7 +37,7 @@ import { fisherYatesShuffle, saveWordOrder } from "../../../lib/word-order";
 import { useWordBank, filterWordBank } from "../../../lib/word-bank";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useKeepAwake } from "expo-keep-awake";
-import { createAudioPlayer, type AudioPlayer } from "expo-audio";
+import { PlayRecordingButton, latestRecordingPath } from "../../../components/PlayRecordingButton";
 import {
   MIN_WORD_DURATION_SEC,
   MAX_WORD_DURATION_SEC,
@@ -202,97 +202,6 @@ function latestAttempt(list: WordAttempt[]): WordAttempt | null {
     if (!best || Date.parse(a.attempted_at) > Date.parse(best.attempted_at)) best = a;
   }
   return best;
-}
-
-// A signed link to a recording works this long (the "answers" bucket is
-// private; the storage policy lets a teacher sign only their own students')
-const RECORDING_URL_TTL_SEC = 60;
-
-// The newest recording for one student + word: the last try in answer_attempts
-// (also when the word is locked as correct, so word_attempts keeps the older
-// recording). null when there's none, e.g. before migration 20.
-async function latestRecordingPath(sessionWordId: string, studentId: string): Promise<string | null> {
-  const { data } = await supabase
-    .from("answer_attempts")
-    .select("audio_path")
-    .eq("session_word_id", sessionWordId)
-    .eq("student_id", studentId)
-    .not("audio_path", "is", null)
-    .order("attempt_no", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  return (data?.audio_path as string | undefined) ?? null;
-}
-
-// Plays a student's recording from the private "answers" bucket. Listening
-// only: it never changes a grade. With resolvePath, the path is looked up
-// when tapped (the newest try), falling back to `path`.
-function PlayRecordingButton({
-  path,
-  resolvePath,
-  label = "recording",
-}: {
-  path: string | null;
-  resolvePath?: () => Promise<string | null>;
-  label?: string;
-}) {
-  const [loading, setLoading] = useState(false);
-  const [playing, setPlaying] = useState(false);
-  const playerRef = useRef<AudioPlayer | null>(null);
-  const playable = !!path || !!resolvePath;
-
-  useEffect(() => {
-    return () => {
-      playerRef.current?.remove();
-      playerRef.current = null;
-    };
-  }, []);
-
-  async function toggle() {
-    if (!playable) return;
-    if (playing && playerRef.current) {
-      playerRef.current.pause();
-      setPlaying(false);
-      return;
-    }
-    setLoading(true);
-    const target = (resolvePath ? await resolvePath().catch(() => null) : null) ?? path;
-    const { data } = target
-      ? await supabase.storage.from("answers").createSignedUrl(target, RECORDING_URL_TTL_SEC)
-      : { data: null };
-    setLoading(false);
-    if (!data?.signedUrl) return;
-
-    playerRef.current?.remove();
-    const player = createAudioPlayer({ uri: data.signedUrl });
-    playerRef.current = player;
-    player.addListener("playbackStatusUpdate", (st) => {
-      if (st.didJustFinish) setPlaying(false);
-    });
-    player.play();
-    setPlaying(true);
-  }
-
-  return (
-    <Pressable
-      onPress={toggle}
-      disabled={!playable || loading}
-      hitSlop={8}
-      style={({ pressed }) => [
-        styles.playBtn,
-        !playable && { opacity: 0.3 },
-        pressed && { opacity: 0.7 },
-      ]}
-      accessibilityRole="button"
-      accessibilityLabel={playing ? `Stop ${label}` : `Play ${label}`}
-    >
-      {loading ? (
-        <ActivityIndicator size="small" color={C.navy} />
-      ) : (
-        <Ionicons name={playing ? "stop" : "play"} size={12} color={C.navy} />
-      )}
-    </Pressable>
-  );
 }
 
 // ── Answers to the current word: one row per student (all session types) ────
@@ -3096,6 +3005,30 @@ export default function SessionDetail() {
             </View>
           </View>
 
+          {/* ── Review: every answer, every try, re-grade ─────────── */}
+          <Pressable
+            onPress={() =>
+              router.push({ pathname: "/(teacher)/sessions/review" as any, params: { id: session.id } })
+            }
+            style={({ pressed }) => [styles.reviewEntry, pressed && { opacity: 0.85 }]}
+            accessibilityRole="button"
+            accessibilityHint="Every answer and try, with recordings. Re-grade any of them."
+          >
+            <Ionicons name="checkmark-done-outline" size={22} color={C.navy} />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.reviewEntryTitle}>Review answers</Text>
+              <Text style={styles.reviewEntrySub}>
+                {(() => {
+                  const toReview = liveAttempts.filter((a) => attemptStatus(a) === "review").length;
+                  return toReview > 0
+                    ? `${toReview} answer${toReview === 1 ? "" : "s"} need${toReview === 1 ? "s" : ""} review`
+                    : "Every answer and try, with recordings";
+                })()}
+              </Text>
+            </View>
+            <Ionicons name="chevron-forward" size={18} color={C.navy} />
+          </Pressable>
+
           {/* ── Words sent during session ──────────────────────── */}
           <Text style={styles.sectionLabel}>WORDS SENT</Text>
           {sessionWords.length === 0 ? (
@@ -4882,6 +4815,20 @@ const styles = StyleSheet.create({
     color: C.navy,
     letterSpacing: 4,
   },
+  // Finished view: link to the review screen
+  reviewEntry: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    minHeight: 64,
+    padding: 14,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderColor: C.navy,
+    backgroundColor: C.blueWash,
+  },
+  reviewEntryTitle: { fontFamily: fonts.heading, fontSize: 16, color: C.navy },
+  reviewEntrySub: { fontFamily: fonts.body, fontSize: 13, color: C.ink, marginTop: 2 },
   // Activity session
   activityCounter: { fontFamily: fonts.heading, fontSize: 18, color: C.brown, letterSpacing: 1 },
   activityWordText: {
