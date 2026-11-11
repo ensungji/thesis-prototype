@@ -17,7 +17,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-import { supabase } from "../../../lib/supabase";
+import { saveWordToBank } from "../../../lib/word-bank";
 import { colors as C, fonts, radius } from "../../../lib/theme";
 import { isValidWord } from "../../../lib/braille";
 import {
@@ -74,37 +74,18 @@ export default function NewWordScreen() {
       return;
     }
 
+    // Same save as add-word's "Save to my Word Bank" (case-insensitive
+    // duplicate check, no silent skip when signed out)
     setSaving(true);
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) { setSaving(false); return; }
-
-    // Check for duplicate
-    const { data: existing } = await supabase
-      .from("word_library")
-      .select("id")
-      .eq("teacher_id", user.id)
-      .eq("word", w)
-      .maybeSingle();
-
-    if (existing) {
+    const result = await saveWordToBank(w, effectiveDifficulty);
+    setSaving(false);
+    if (result.status === "exists") {
       setError(`"${w}" is already in your word bank.`);
-      setSaving(false);
       return;
     }
-
-    const { error: insertError } = await supabase.from("word_library").insert({
-      teacher_id: user.id,
-      word: w,
-      category: "My Words",
-      difficulty: effectiveDifficulty,
-    });
-
-    setSaving(false);
-    if (insertError) {
-      console.log("Supabase Error:", insertError);
-      setError("Something went wrong. Please try again.");
+    if (result.status === "error") {
+      console.log("Save to Word Bank failed:", result.message);
+      setError(`Couldn't save the word: ${result.message}`);
       return;
     }
 

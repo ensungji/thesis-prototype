@@ -3,7 +3,7 @@
 // Receives sessionId via params.
 // Tabs: New Word | Word Bank | Word List (preview + reorder)
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   View,
   Text,
@@ -42,7 +42,7 @@ import {
 } from "../../../lib/session-timer";
 import { updateOrQueue } from "../../../lib/outbox";
 import { fisherYatesShuffle, saveWordOrder } from "../../../lib/word-order";
-import { useWordBank, filterWordBank, wordDifficulty } from "../../../lib/word-bank";
+import { useWordBank, filterWordBank, wordDifficulty, saveWordToBank } from "../../../lib/word-bank";
 import DraggableFlatList, {
   ScaleDecorator,
 } from "react-native-draggable-flatlist";
@@ -87,6 +87,9 @@ export default function AddWordScreen() {
   const [bankDurations, setBankDurations] = useState<Record<string, number>>({});
   const [saveToBank, setSaveToBank] = useState(false);
   const [saving, setSaving] = useState(false);
+  // Set at once (state isn't): Enter on the keyboard isn't blocked by the
+  // disabled Add button, so a quick double submit would add the word twice
+  const addingRef = useRef(false);
   const [errorModal, setErrorModal] = useState<{ title: string; message: string } | null>(null);
 
   function getBankWordDuration(id: string) {
@@ -232,8 +235,33 @@ export default function AddWordScreen() {
       });
       return;
     }
+    if (addingRef.current) return;
+    addingRef.current = true;
+    try {
+      await addWordNow(w, fromBank, duration);
+    } finally {
+      addingRef.current = false;
+      setSaving(false);
+    }
+  }
 
+  async function addWordNow(w: string, fromBank: boolean, duration: number) {
     setSaving(true);
+
+    // "Save to my Word Bank" first, on its own: the word is saved even when it
+    // is already in the sequence or the sequence insert fails below
+    if (saveToBank && !fromBank) {
+      const bank = await saveWordToBank(w, effectiveDifficulty);
+      if (bank.status === "saved") {
+        showToast("Added to Word Bank", `"${w}" was saved to your Word Bank.`, "success");
+        loadWordBank(); // so it shows in the Word Bank tab right away
+      } else if (bank.status === "exists") {
+        showToast("Already in your Word Bank", `"${w}" is already in your Word Bank, so it wasn't saved again.`, "success");
+      } else {
+        showToast("Couldn't save to Word Bank", bank.message, "delete");
+      }
+    }
+
     // Hard-cap duration strictly between 5s and 60s (Hardware Safety)
     const safeDuration = clampDuration(duration);
 
@@ -248,20 +276,19 @@ export default function AddWordScreen() {
       .maybeSingle();
     const nextIndex = (lastRow?.order_index ?? -1) + 1;
 
-    // Check for duplicate
+    // Check for duplicate (limit 1: maybeSingle errors on 2+ rows, which read as "not there")
     const { data: existing } = await supabase
       .from("session_words")
       .select("id")
       .eq("session_id", sessionId!)
       .eq("word", w)
-      .maybeSingle();
+      .limit(1);
 
-    if (existing) {
+    if (existing && existing.length > 0) {
       setErrorModal({
         title: "Already in sequence",
         message: `"${w}" is already in this session's sequence. Each word can only appear once.`,
       });
-      setSaving(false);
       return;
     }
 
@@ -286,7 +313,6 @@ export default function AddWordScreen() {
       insertedId = fallbackData?.id ?? null;
     } else if (insertError) {
       setErrorModal({ title: "Couldn't add the word", message: insertError.message });
-      setSaving(false);
       return;
     } else {
       insertedId = insertData?.id ?? null;
@@ -300,47 +326,6 @@ export default function AddWordScreen() {
       await saveWordDurations(sessionId, currentDurations);
     }
 
-    // Optionally save to word bank (with duplicate check)
-    if (saveToBank && !fromBank) {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-      if (user) {
-        // Check for existing entry in word_library
-        const { data: existingInBank } = await supabase
-          .from("word_library")
-          .select("id")
-          .eq("teacher_id", user.id)
-          .eq("word", w)
-          .maybeSingle();
-
-        if (existingInBank) {
-          // Word already in bank — don't duplicate; just inform the user.
-          showToast(
-            "Word already in your Word Bank",
-            `"${w}" already exists in your Word Bank and was added to your word list instead.`,
-            "success",
-          );
-        } else {
-          const { error: bankError } = await supabase.from("word_library").insert({
-            teacher_id: user.id,
-            word: w,
-            category: "My Words",
-            difficulty: effectiveDifficulty,
-          });
-
-          if (bankError) {
-            showToast("Failed to save to Word Bank", bankError.message, "delete");
-          } else {
-            showToast("Added to Word Bank", `"${w}" was saved to your Word Bank.`, "success");
-            // Refresh word bank so newly saved word appears immediately
-            await loadWordBank();
-          }
-        }
-      }
-    }
-
-    setSaving(false);
     setNewWord("");
     setOverrideDifficulty(null);
 
@@ -640,10 +625,14 @@ export default function AddWordScreen() {
                 </View>
               </View>
 
+              {/* Tapping the row toggles it. Tapping the Switch itself doesn't also
+                  fire the row: the Switch takes the touch (React Native Switch.js) */}
               <Pressable
                 style={styles.saveToBankRow}
                 onPress={() => setSaveToBank((v) => !v)}
                 accessibilityRole="switch"
+                accessibilityLabel="Save to my Word Bank"
+                accessibilityState={{ checked: saveToBank }}
               >
                 <View style={styles.saveToBankText}>
                   <Ionicons name="library-outline" size={16} color={C.navy} />

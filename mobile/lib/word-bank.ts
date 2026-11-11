@@ -32,6 +32,49 @@ export function filterWordBank(words: WordBankItem[], search: string, difficulty
   );
 }
 
+export type SaveToBankResult =
+  | { status: "saved" }
+  | { status: "exists" } // already in the teacher's own Word Bank (any letter case)
+  | { status: "error"; message: string };
+
+/**
+ * Saves a word to the signed-in teacher's own Word Bank (category "My Words"),
+ * unless they already have it.
+ *   - The user comes from the stored session (no network call), so a slow
+ *     auth server can't silently skip the save.
+ *   - The "already saved" lookup ignores letter case (older words may be
+ *     lower case) and tolerates copies saved twice (limit 1, not maybeSingle,
+ *     which errors on 2+ rows).
+ *   - A failed lookup is reported, not taken as "not saved yet".
+ * Words are saved in capitals, as typed (A–Z only, so ilike has no wildcards).
+ */
+export async function saveWordToBank(word: string, difficulty: Difficulty): Promise<SaveToBankResult> {
+  const w = word.trim().toUpperCase();
+  if (!/^[A-Z]+$/.test(w)) return { status: "error", message: "Only letters A–Z can be saved." };
+
+  const { data: sessionData } = await supabase.auth.getSession();
+  const uid = sessionData.session?.user.id;
+  if (!uid) return { status: "error", message: "You're signed out. Sign in again to save to your Word Bank." };
+
+  const { data: existing, error: lookupError } = await supabase
+    .from("word_library")
+    .select("id")
+    .eq("teacher_id", uid)
+    .ilike("word", w)
+    .limit(1);
+  if (lookupError) return { status: "error", message: lookupError.message };
+  if (existing && existing.length > 0) return { status: "exists" };
+
+  const { error: insertError } = await supabase.from("word_library").insert({
+    teacher_id: uid,
+    word: w,
+    category: "My Words",
+    difficulty,
+  });
+  if (insertError) return { status: "error", message: insertError.message };
+  return { status: "saved" };
+}
+
 /**
  * Loads the Word Bank. By default it reloads every time the screen comes into
  * focus, so words added in the Word Bank tab show up; pass
