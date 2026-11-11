@@ -814,5 +814,49 @@ await check("teacher deletes an ACTIVE session: allowed, voice rows kept (ids em
   await as(null, null, `delete from word_attempts where id::text like 'fa40000%'`);
 });
 
+// ── 23 reviewed_at + speech_grading_agreement ────────────────────────────────
+await check("reviewed_at: only a finished session can be marked reviewed; the teacher sets it", async () => {
+  await expectError(as(A, "authenticated", `update sessions set reviewed_at = now() where id = '5a000000-0000-0000-0000-000000000000'`),
+    /sessions_reviewed_only_finished/); // 5a is in_progress
+  const S = "5f500000-0000-0000-0000-000000000000";
+  await as(null, null, `insert into sessions (id, teacher_id, name, status) values ('${S}', '${A}', 'Rev', 'finished')`);
+  const r = await as(A, "authenticated", `update sessions set reviewed_at = now() where id = '${S}' returning reviewed_at is not null as ok`);
+  eq(r.rows, [{ ok: true }], "teacher set it");
+  const b = await as(B, "authenticated", `update sessions set reviewed_at = null where id = '${S}' returning id`);
+  eq(b.rows.length, 0, "another teacher can't");
+});
+await check("speech_grading_agreement: admin only", async () => {
+  await expectError(as(A, "authenticated", `select * from speech_grading_agreement()`), /Only an admin/);
+  await expectError(as(null, "anon", `select * from speech_grading_agreement()`), /permission denied/);
+});
+await check("speech_grading_agreement: counts voice answers of reviewed sessions only", async () => {
+  const S = "5f500000-0000-0000-0000-000000000000";   // finished + reviewed
+  const U = "5f600000-0000-0000-0000-000000000000";   // finished, NOT reviewed
+  await as(null, null, `insert into sessions (id, teacher_id, name, status) values ('${U}', '${A}', 'Unrev', 'finished')`);
+  const W = (n) => `1f50000${n}-0000-0000-0000-000000000000`;
+  for (let n = 1; n <= 7; n++) {
+    await as(null, null, `insert into session_words (id, session_id, word, order_index) values ('${W(n)}', '${n === 7 ? U : S}', 'W${n}', ${n})`);
+  }
+  // device rows (service role): 1 correct, 2 wrong, 3 review, 4 correct, 5 wrong, 6 missed, 7 correct in the unreviewed session
+  await as(null, "service_role", `insert into word_attempts (student_id, session_id, session_word_id, word, is_correct, needs_review, graded_by) values
+    ('${ANA}', '${S}', '${W(1)}', 'W1', true,  false, 'auto'),
+    ('${ANA}', '${S}', '${W(2)}', 'W2', false, false, 'auto'),
+    ('${ANA}', '${S}', '${W(3)}', 'W3', true,  true,  'auto'),
+    ('${ANA}', '${S}', '${W(4)}', 'W4', true,  false, 'auto'),
+    ('${ANA}', '${S}', '${W(5)}', 'W5', false, false, 'auto'),
+    ('${ANA}', '${S}', '${W(6)}', 'W6', false, false, 'missed'),
+    ('${ANA}', '${U}', '${W(7)}', 'W7', true,  false, 'auto')`);
+  // teacher re-grades after the end: W4 correct → wrong (disagree), W5 wrong → wrong + reviewed flag stays
+  // (same result = agree), W6 missed → correct (not a voice answer)
+  await as(A, "authenticated", `update word_attempts set is_correct = false, graded_by = 'teacher' where session_word_id = '${W(4)}'`);
+  await as(A, "authenticated", `update word_attempts set is_correct = false, needs_review = false, graded_by = 'teacher' where session_word_id = '${W(5)}'`);
+  await as(A, "authenticated", `update word_attempts set is_correct = true, graded_by = 'teacher' where session_word_id = '${W(6)}'`);
+  const r = await as(D, "authenticated", `select * from speech_grading_agreement()`);
+  // reviewed sessions: S only. voice: W1 W2 W4 W5 (W3 still review, W6 missed, W7 unreviewed) → 4, agreed W1 W2 W5 → 3
+  eq(r.rows, [{ reviewed_sessions: 1, voice_answers: 4, agreed: 3, still_review: 1 }], "totals");
+  await as(null, null, `delete from sessions where id in ('${S}', '${U}')`);
+  await as(null, null, `delete from word_attempts where session_id is null and student_id = '${ANA}' and word like 'W_'`);
+});
+
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);
