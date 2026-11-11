@@ -209,6 +209,29 @@ await check("shared words: readable, not deletable", async () => {
   eq(o.rows.length, 1, "own deleted");
 });
 
+// "Save to my Word Bank" (add-word / wordbank/new → lib/word-bank.ts saveWordToBank).
+// OLD = the lookup the app used: .eq("word", "CAT").maybeSingle(); NEW = .ilike("word", "CAT").limit(1).
+const bankOld = (w) => as(A, "authenticated", `select id from word_library where teacher_id = '${A}' and word = '${w}'`);
+const bankNew = (w) => as(A, "authenticated", `select id from word_library where teacher_id = '${A}' and word ilike '${w}' limit 1`);
+await check("word bank lookup: OLD misses the teacher's lowercase 'cat' when saving CAT; NEW finds it", async () => {
+  await as(A, "authenticated", `insert into word_library (teacher_id, word) values ('${A}', 'cat')`);
+  eq([(await bankOld("CAT")).rows.length, (await bankNew("CAT")).rows.length], [0, 1], "OLD / NEW rows");
+  await as(null, null, `delete from word_library where teacher_id = '${A}'`);
+});
+await check("word bank lookup: with 2 copies, OLD gets 2 rows (maybeSingle errors, read as 'not in bank'); NEW gets 1", async () => {
+  await as(A, "authenticated", `insert into word_library (teacher_id, word) values ('${A}', 'SUN'), ('${A}', 'SUN')`);
+  eq([(await bankOld("SUN")).rows.length, (await bankNew("SUN")).rows.length], [2, 1], "OLD / NEW rows");
+  await as(null, null, `delete from word_library where teacher_id = '${A}'`);
+});
+await check("word bank save: a shared word doesn't count as the teacher's; the teacher's insert passes RLS", async () => {
+  eq((await bankNew("SHARED")).rows.length, 0, "shared counted as own");
+  const r = await as(A, "authenticated", `insert into word_library (teacher_id, word, category, difficulty)
+    values ('${A}', 'SHARED', 'My Words', 'hard') returning word`);
+  eq(r.rows, [{ word: "SHARED" }], "saved");
+  await expectError(as(A, "authenticated", `insert into word_library (teacher_id, word) values ('${B}', 'X')`), /row-level security/);
+  await as(null, null, `delete from word_library where teacher_id = '${A}'`);
+});
+
 // ── 10 session_students ──────────────────────────────────────────────────────
 await check("can't assign another class's student to your session", () =>
   expectError(as(A, "authenticated", `insert into session_students values ('5a000000-0000-0000-0000-000000000000', 'b1000000-0000-0000-0000-000000000000')`), /row-level security/));

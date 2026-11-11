@@ -44,7 +44,7 @@ create table public.word_attempts (id uuid primary key default gen_random_uuid()
   audio_path text, needs_review boolean default false, graded_by text default 'auto');
 create table public.letter_attempts (id uuid primary key default gen_random_uuid(),
   word_attempt_id uuid references public.word_attempts(id));
-create table public.word_library (id uuid primary key default gen_random_uuid(), teacher_id uuid, word text);
+create table public.word_library (id uuid primary key default gen_random_uuid(), teacher_id uuid, word text, category text, difficulty text);
 create table public.device_events (id uuid primary key default gen_random_uuid(), device_id uuid);
 create table public.system_logs (id uuid primary key default gen_random_uuid(), source text,
   user_id uuid default auth.uid());
