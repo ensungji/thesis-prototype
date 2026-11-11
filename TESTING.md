@@ -592,14 +592,15 @@ Migrations 16–22 (activities, sessions type `activity`, `start_activity_sessio
 ### P1.1 Database checks (any time; changes nothing)
 1. **Do:** Open `supabase/tests/phase1_activities_checks.sql`, paste the
    **whole file** into the SQL Editor, Run.
-   **Expect:** 47 rows, all **PASS**, and the last row
-   `TOTAL · 47 passed, 0 failed`. If there's only one teacher account, row 32
-   is **SKIP** (46 passed). Any **FAIL**: send the row (its detail column has
+   **Expect (after migration 24):** 59 rows, all **PASS**, and the last row
+   `TOTAL · 59 passed, 0 failed`. If there's only one teacher account, rows 33
+   and 54–57 are **SKIP** (54 passed). (Before migration 24 this file was 47
+   rows; it now needs migration 24.) Any **FAIL**: send the row (its detail column has
    the error).
    It acts as the first active admin and the first teacher with a student,
    makes a test activity, session and answers, and rolls everything back.
 2. **Do (optional, on your PC):** `cd supabase/tests/policy-check`, `npm run check`.
-   **Expect:** `all passed` (123 checks on a stand-in database).
+   **Expect:** `all passed` (136 checks on a stand-in database).
 
 ### P1.2 Deploy grade-answer v7
 Only after P1.1 passes:
@@ -702,9 +703,7 @@ Sign in as the **admin**.
     **Expect:** "<name> (copy)" opens as a **Draft** with the same words and
     times, toast "Copy made". Back → the original is unchanged and still
     Published.
-13. **Do:** sign in as a **teacher**.
-    **Expect:** no Activities button anywhere (P1.1 already checks that the
-    database hides drafts / hidden ones from teachers).
+13. *(Changed by Phase 5: teachers now have Activities too, see P5.)*
 
 ### P2.2 Follow-ups in the teacher app
 1. **Delete session text.** Open any session → Delete.
@@ -858,3 +857,54 @@ answered twice.
    same sentence over all reviewed sessions, "N reviewed sessions".
 6. **Guard:** `update sessions set reviewed_at = now() where status <> 'finished';`
    in the SQL Editor → error `sessions_reviewed_only_finished` (rolls back).
+
+## Branch feature/activities: Phase 5 (teachers make activities)
+
+**Run migration 24 (`20261111120900_teacher_activities.sql`) first**, then
+P1.1 again (59 rows). JS-only app changes (reload / new preview APK). You need
+the admin, teacher **T1** and, if you have one, teacher **T2**.
+
+### P5.1 Migration 24
+1. **Before running:** the check at the top of the file
+   (`select p.role, count(*) …`). **Expect:** only `admin` (or empty, for a
+   deleted account).
+2. **After:** `select shared, count(*) from public.activities group by 1;`
+   **Expect:** every existing activity `true`. Then P1.1: 59 PASS.
+
+### P5.2 Teacher → Activities (T1)
+1. **Do:** Sessions tab → **Activities** (top right, next to New).
+   **Expect:** tabs **Mine 0 / Shared N**; Mine has the status chips and
+   **New Activity**; Shared lists the admin's published activities, no
+   status chips, no New Activity.
+2. **Do:** Mine → **New Activity**, add words, change a time, reorder,
+   **Publish**. **Expect:** the same editor as the admin's (P2.1 steps 2–10).
+   The details card says "Private: only you and admins see it"; the publish
+   sheet ends "Only you (and admins) will see it."; toast "You can now run it
+   from New Session › Activity."
+3. **Do:** **Hide**, **Unhide**; make a second draft and **Delete draft**.
+   **Expect:** all work; a published one has no Delete.
+4. **Do:** Shared → open one. **Expect:** badge **Shared**, read-only words,
+   "Shared activities can't be edited. Duplicate it to make your own copy.",
+   only **Duplicate** (no Hide). **Duplicate** → "<name> (copy)" opens as
+   **your Draft** (editable, Private); it's under Mine.
+5. **T2 (if you have one):** Activities → T1's activity isn't in Mine or
+   Shared; New Session › Activity doesn't list it.
+
+### P5.3 New Session › Activity (T1)
+1. **Expect:** your published activities first, tagged **Mine**, then the
+   admin's, tagged **Shared**; no drafts or hidden ones.
+   **Manage activities** opens Activities; publish something there, come back:
+   it's in the list.
+2. **Do:** start a session with your own activity. **Expect:** it runs like
+   any Activity session (P3.2).
+
+### P5.4 Admin
+1. **Expect:** Activities list rows say **Made by you** or **Made by <teacher>**,
+   and a teacher's own have a **Private** tag. A teacher's drafts and hidden
+   ones are listed too.
+2. **Do:** open T1's published activity. **Expect:** "Made by <T1> · Private:
+   only its teacher and admins see it"; **Duplicate** and **Hide** both work.
+   Duplicate → the copy is the admin's and **shared** (no Private tag), so
+   teachers see it once it's published.
+3. **Do:** open T1's draft. **Expect:** the admin can edit it (admins manage
+   every activity).
