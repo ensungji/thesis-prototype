@@ -4,8 +4,10 @@
 // created as a pending session with type 'activity', then
 // start_activity_session (migration 19) copies the activity's words into it in
 // one step. If that refuses, the empty session is deleted again.
+// The Activity list: published activities the teacher can see (RLS, migration
+// 24): shared ones and their own, marked "Mine" / "Shared", their own first.
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   View,
   Text,
@@ -18,7 +20,7 @@ import {
   ScrollView,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { useRouter } from "expo-router";
+import { useFocusEffect, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../../lib/supabase";
 import { colors as C, fonts } from "../../../lib/theme";
@@ -30,13 +32,15 @@ import {
   isActivitySession,
 } from "../../../lib/session-timer";
 import { DIFFICULTY_META, type Difficulty } from "../../../lib/difficulty";
+import { myUserId } from "../../../lib/activities";
 
-// A published activity, as a teacher sees it (RLS: published only)
+// A published activity the teacher can run: shared, or their own
 type PickActivity = {
   id: string;
   name: string;
   description: string | null;
   level: Difficulty | null;
+  mine: boolean;
   words: string[]; // in order
 };
 
@@ -73,34 +77,44 @@ export default function NewSessionScreen() {
   const [activityId, setActivityId] = useState<string | null>(null);
   const chosen = activities?.find((a) => a.id === activityId) ?? null;
 
-  // Load the published activities the first time Activity is picked
+  // Load the published activities the first time Activity is picked, and again
+  // on coming back (e.g. from Activities after publishing one)
   useEffect(() => {
     if (!isActivitySession(type) || activities !== null) return;
-    supabase
-      .from("activities")
-      .select("id, name, description, level, activity_words(word, position)")
-      .eq("status", "published")
-      .order("name")
-      .then(({ data, error }) => {
-        if (error) {
-          setActivitiesError(error.message);
-          setActivities([]);
-          return;
-        }
-        setActivitiesError("");
-        setActivities(
-          (data ?? []).map((a) => ({
-            id: a.id,
-            name: a.name,
-            description: a.description,
-            level: a.level as Difficulty | null,
-            words: [...((a.activity_words as { word: string; position: number }[]) ?? [])]
-              .sort((x, y) => x.position - y.position)
-              .map((w) => w.word),
-          }))
-        );
-      });
+    Promise.all([
+      myUserId(),
+      supabase
+        .from("activities")
+        .select("id, name, description, level, created_by, activity_words(word, position)")
+        .eq("status", "published")
+        .order("name"),
+    ]).then(([me, { data, error }]) => {
+      if (error) {
+        setActivitiesError(error.message);
+        setActivities([]);
+        return;
+      }
+      setActivitiesError("");
+      const list = (data ?? []).map((a) => ({
+        id: a.id,
+        name: a.name,
+        description: a.description,
+        level: a.level as Difficulty | null,
+        mine: !!me && a.created_by === me,
+        words: [...((a.activity_words as { word: string; position: number }[]) ?? [])]
+          .sort((x, y) => x.position - y.position)
+          .map((w) => w.word),
+      }));
+      // their own first, each group by name (stable sort keeps the name order)
+      setActivities(list.sort((x, y) => Number(y.mine) - Number(x.mine)));
+    });
   }, [type, activities]);
+
+  useFocusEffect(
+    useCallback(() => {
+      return () => setActivities(null); // reload next time the screen shows
+    }, [])
+  );
 
   function pickActivity(a: PickActivity) {
     setActivityId(a.id);
@@ -312,14 +326,26 @@ export default function NewSessionScreen() {
           {/* Activity: pick a published activity */}
           {isActivitySession(type) && (
             <View style={styles.fieldGroup}>
-              <Text style={styles.label}>Activity</Text>
+              <View style={styles.labelRow}>
+                <Text style={styles.label}>Activity</Text>
+                <Pressable
+                  onPress={() => router.push("/(teacher)/sessions/activities" as any)}
+                  style={({ pressed }) => [styles.manageLink, pressed && { opacity: 0.6 }]}
+                  accessibilityRole="link"
+                  accessibilityLabel="Manage activities"
+                  accessibilityHint="Make your own activities or copy a shared one"
+                >
+                  <Text style={styles.manageLinkText}>Manage activities</Text>
+                  <Ionicons name="chevron-forward" size={14} color={C.navy} />
+                </Pressable>
+              </View>
               {activities === null ? (
                 <ActivityIndicator color={C.navy} style={{ marginVertical: 12 }} />
               ) : activities.length === 0 ? (
                 <Text style={styles.emptyText}>
                   {activitiesError
                     ? `Couldn't load activities: ${activitiesError}`
-                    : "No published activities yet. Ask your admin to publish one."}
+                    : "No activities to run yet. Make and publish your own in Manage activities, or ask your admin to share one."}
                 </Text>
               ) : (
                 activities.map((a) => {
@@ -333,7 +359,7 @@ export default function NewSessionScreen() {
                       style={({ pressed }) => [styles.activityCard, on && styles.activityCardActive, pressed && { opacity: 0.85 }]}
                       accessibilityRole="radio"
                       accessibilityState={{ selected: on }}
-                      accessibilityLabel={`${a.name}, ${level ? level.label + ", " : ""}${a.words.length} words: ${a.words
+                      accessibilityLabel={`${a.name}, ${a.mine ? "mine" : "shared"}, ${level ? level.label + ", " : ""}${a.words.length} words: ${a.words
                         .slice(0, PREVIEW_WORDS)
                         .join(", ")}`}
                     >
@@ -352,9 +378,21 @@ export default function NewSessionScreen() {
                           </View>
                         )}
                       </View>
-                      <Text style={styles.activityMeta}>
-                        {a.words.length} word{a.words.length === 1 ? "" : "s"}
-                      </Text>
+                      <View style={styles.activityMetaRow}>
+                        <View style={[styles.ownerTag, a.mine && styles.ownerTagMine]}>
+                          <Ionicons
+                            name={a.mine ? "person-outline" : "people-outline"}
+                            size={11}
+                            color={a.mine ? C.navy : C.muted}
+                          />
+                          <Text style={[styles.ownerTagText, a.mine && { color: C.navy }]}>
+                            {a.mine ? "Mine" : "Shared"}
+                          </Text>
+                        </View>
+                        <Text style={[styles.activityMeta, { marginLeft: 0 }]}>
+                          {a.words.length} word{a.words.length === 1 ? "" : "s"}
+                        </Text>
+                      </View>
                       <Text style={styles.activityWords} numberOfLines={1}>
                         {a.words.slice(0, PREVIEW_WORDS).join(" · ")}
                         {rest > 0 ? `  +${rest} more` : ""}
@@ -500,6 +538,22 @@ const styles = StyleSheet.create({
   activityName: { flex: 1, fontFamily: fonts.heading, fontSize: 15, color: C.navy },
   activityMeta: { fontFamily: fonts.body, fontSize: 12, color: C.muted, marginLeft: 30 },
   activityWords: { fontFamily: fonts.mono, fontSize: 13, color: C.ink, letterSpacing: 0.5, marginLeft: 30 },
+  labelRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 8 },
+  manageLink: { flexDirection: "row", alignItems: "center", gap: 2, minHeight: 40, paddingLeft: 12 },
+  manageLinkText: { fontFamily: fonts.headingSemi, fontSize: 13, color: C.navy },
+  activityMetaRow: { flexDirection: "row", alignItems: "center", gap: 8, marginLeft: 30 },
+  ownerTag: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 100,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  ownerTagMine: { borderColor: C.navy, backgroundColor: C.blueWash },
+  ownerTagText: { fontFamily: fonts.mono, fontSize: 10, color: C.muted },
   levelBadge: { paddingHorizontal: 8, paddingVertical: 2, borderRadius: 100, borderWidth: 1 },
   levelBadgeText: { fontFamily: fonts.mono, fontSize: 10 },
 
