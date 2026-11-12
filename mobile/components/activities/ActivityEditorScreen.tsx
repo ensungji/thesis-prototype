@@ -10,6 +10,8 @@
 //   Teacher, someone else's:   read-only words, "by <author>"; Duplicate (the
 //                              copy is their own private draft).
 //   Admin:                     read-only; Hide / Unhide a published one.
+// Maintenance mode (migration 26): a teacher's screen turns read-only with a
+// note (the database refuses every activity write anyway); admins aren't affected.
 // Every change is saved right away. The database has the final say (migration
 // 16: a published activity and its words can't change), and its message is
 // shown when it refuses something.
@@ -63,6 +65,7 @@ import {
   updateActivityDetails,
 } from "../../lib/activities";
 import { BrailleLoader } from "../../components/BrailleLoader";
+import { useMaintenance } from "../../lib/maintenance";
 import { Toast } from "../../components/Toast";
 import { ActivityDetailsSheet } from "../../components/ActivityDetailsSheet";
 
@@ -124,6 +127,10 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
   const manage = !!activity && canManage(activity, area, me);
   const isDraft = manage && activity?.status === "draft";
   const moderate = area === "admin";
+  // frozen: maintenance mode for a teacher. editable: a draft they can change now.
+  const maintenance = useMaintenance();
+  const frozen = area === "teacher" && maintenance.on;
+  const editable = isDraft && !frozen;
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -396,6 +403,17 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
       </Header>
 
       <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
+        {frozen && (
+          <View style={[styles.card, styles.hiddenCard]} accessibilityLiveRegion="polite">
+            <Text style={styles.sectionTitle}>
+              <Ionicons name="construct-outline" size={16} color={C.brown} /> Maintenance mode
+            </Text>
+            <Text style={styles.description}>
+              {"You can look at this activity, but it can't be changed, published, shared, duplicated or deleted until maintenance ends."}
+            </Text>
+          </View>
+        )}
+
         {/* Details */}
         <View style={styles.card}>
           <View style={styles.metaRow}>
@@ -418,9 +436,9 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
             <Ionicons name={activity.shared ? "people-outline" : "lock-closed-outline"} size={12} color={C.muted} />
             {` ${visibilityLine(activity, area, me)}`}
           </Text>
-          {isDraft ? (
+          {editable ? (
             <SmallButton icon="pencil-outline" label="Edit details" onPress={() => { setDetailsError(""); setDetailsOpen(true); }} disabled={busy} />
-          ) : moderate ? (
+          ) : isDraft ? null : moderate ? (
             <Text style={styles.lockedNote}>
               <Ionicons name="eye-outline" size={12} color={C.muted} />
               {activity.status === "draft"
@@ -464,7 +482,7 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
               <Switch
                 value={activity.shared}
                 onValueChange={toggleShared}
-                disabled={busy}
+                disabled={busy || frozen}
                 trackColor={{ true: C.green, false: C.border }}
                 thumbColor={C.white}
                 accessibilityLabel="Share with all teachers"
@@ -474,7 +492,7 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
         )}
 
         {/* Add words (draft) */}
-        {isDraft && (
+        {editable && (
           <View style={styles.card}>
             <Text style={styles.sectionTitle}>Add words</Text>
             <View style={styles.addRow}>
@@ -541,7 +559,7 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
               <Text style={styles.word} numberOfLines={1}>
                 {w.word}
               </Text>
-              {isDraft ? (
+              {editable ? (
                 <>
                   <Pressable
                     onPress={() => openTime(w)}
@@ -583,9 +601,9 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
                 setPublishShared(false);
                 setPublishOpen(true);
               }}
-              disabled={busy}
+              disabled={busy || frozen}
             />
-            <BigButton icon="trash-outline" label="Delete draft" kind="danger" onPress={() => setDeleteOpen(true)} disabled={busy} />
+            <BigButton icon="trash-outline" label="Delete draft" kind="danger" onPress={() => setDeleteOpen(true)} disabled={busy || frozen} />
           </View>
         ) : moderate ? (
           activity.status !== "draft" && (
@@ -602,7 +620,7 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
         ) : (
           activity.status !== "hidden" && (
             <View style={styles.actions}>
-              <BigButton icon="copy-outline" label="Duplicate" kind="primary" onPress={duplicate} disabled={busy} />
+              <BigButton icon="copy-outline" label="Duplicate" kind="primary" onPress={duplicate} disabled={busy || frozen} />
             </View>
           )
         )}

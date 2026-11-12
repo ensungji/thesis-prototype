@@ -1,6 +1,6 @@
 // mobile/app/admin/index.tsx
 // Admin dashboard: teacher accounts (create, edit, deactivate), speech grading
-// agreement, and links to Activities (read-only overview + hide / unhide) and Logs.
+// agreement, maintenance mode switch, and links to Activities (read-only overview + hide / unhide) and Logs.
 
 import { useState, useCallback } from "react";
 import {
@@ -20,6 +20,7 @@ import { colors as C, fonts } from "../../lib/theme";
 import { BrailleLoader } from "../../components/BrailleLoader";
 import { Toast } from "../../components/Toast";
 import { type AdminAgreement, agreementSentence, loadAdminAgreement } from "../../lib/review";
+import { MaintenanceCard } from "../../components/MaintenanceCard";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -130,7 +131,7 @@ export default function AdminDashboard() {
   const [confirming, setConfirming] = useState(false);
 
   // Toast
-  type ToastState = { message: string; detail?: string; variant: "success" | "delete" } | null;
+  type ToastState = { message: string; detail?: string; variant: "success" | "delete" | "warning" } | null;
   const [toast, setToast] = useState<ToastState>(null);
 
   // Speech grading agreement over every reviewed session (migration 23)
@@ -341,6 +342,11 @@ export default function AdminDashboard() {
           <Text style={styles.summaryLabel}>Total</Text>
         </View>
       </View>
+
+      {/* Maintenance mode (migration 26) */}
+      <MaintenanceCard
+        onDone={(message, detail, ok) => setToast({ message, detail, variant: ok ? "success" : "warning" })}
+      />
 
       {/* Speech grading agreement (reviewed sessions only) */}
       <View style={styles.agreeCard} accessible>

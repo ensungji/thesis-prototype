@@ -26,6 +26,7 @@ import { supabase } from "../../../lib/supabase";
 import { updateOrQueue, insertOrQueue, newId, subscribeRefused } from "../../../lib/outbox";
 import { logEvent } from "../../../lib/logger";
 import { isOnline, subscribeOnline } from "../../../lib/network";
+import { isMaintenanceError, useMaintenance } from "../../../lib/maintenance";
 import { onDevicePresence, type PresenceEvent } from "../../../lib/device-presence";
 import { colors as C, fonts } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
@@ -708,6 +709,11 @@ export default function SessionDetail() {
   function showValidationToast(message: string, detail?: string) {
     setValidationToast({ visible: true, message, detail });
   }
+
+  // Maintenance mode (migration 26): a pending session can't be launched.
+  // A session that already started carries on as normal (Next, pause,
+  // resume, grading, finish); the database only refuses pending → started.
+  const maintenance = useMaintenance();
 
 
 
@@ -1570,6 +1576,10 @@ export default function SessionDetail() {
   // ── Session lifecycle ───────────────────────────────────────────────────────
 
   async function launchSession() {
+    if (maintenance.on) {
+      showValidationToast("Maintenance mode is on", "Sessions can't be started until it ends.");
+      return;
+    }
     if (!isOnline()) {
       showValidationToast("You're offline", "Connect to the internet to launch.");
       return;
@@ -1633,10 +1643,21 @@ export default function SessionDetail() {
     // ─────────────────────────────────────────────────────────────────────────
 
     setSaving(true);
-    await supabase
+    const { error: startError } = await supabase
       .from("sessions")
       .update({ status: "in_progress", started_at: new Date().toISOString() })
       .eq("id", id!);
+    if (startError) {
+      // Refused (maintenance mode, or anything else): nothing goes to the devices
+      setSaving(false);
+      if (isMaintenanceError(startError)) {
+        showValidationToast("Maintenance mode is on", "Sessions can't be started until it ends.");
+      } else {
+        showValidationToast("Couldn't start the session", startError.message);
+      }
+      await loadData();
+      return;
+    }
     await loadData();
     await clearDevices("session_started"); // start sound on every device
 
@@ -2116,7 +2137,7 @@ export default function SessionDetail() {
         : "pair a device to an assigned student"
     );
   }
-  const launchBlocked = launchMissing.length > 0;
+  const launchBlocked = launchMissing.length > 0 || maintenance.on;
 
   if (loading) {
     return (
@@ -2789,10 +2810,16 @@ export default function SessionDetail() {
               </>
             )}
           </Pressable>
-          {launchBlocked && (
+          {maintenance.on ? (
             <Text style={styles.launchHint}>
-              To launch, {launchMissing.join(" and ")}.
+              Maintenance mode is on: sessions can&apos;t be started until it ends.
             </Text>
+          ) : (
+            launchBlocked && (
+              <Text style={styles.launchHint}>
+                To launch, {launchMissing.join(" and ")}.
+              </Text>
+            )
           )}
         </ScrollView>
 

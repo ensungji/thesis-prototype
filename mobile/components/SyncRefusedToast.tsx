@@ -10,6 +10,7 @@ import { Toast } from "./Toast";
 
 function describe(r: RefusedChange): string {
   if (r.code === "DT001") return "This word was already answered correctly by voice.";
+  if (r.code === "DT002") return "Maintenance mode is on. Try again when it ends.";
   return r.message || "The server refused it.";
 }
 

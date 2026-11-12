@@ -18,6 +18,7 @@ import { colors as C, fonts } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
 import { BrailleLoader } from "../../../components/BrailleLoader";
 import { Toast } from "../../../components/Toast";
+import { MAINTENANCE_BLOCKED_HINT, useMaintenance } from "../../../lib/maintenance";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -108,6 +109,9 @@ export default function SessionsScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [toast, setToast] = useState<{ name: string } | null>(null);
   const [errorToast, setErrorToast] = useState(false);
+  const [maintenanceToast, setMaintenanceToast] = useState(false);
+  // Maintenance mode (migration 26): no new sessions; the banner explains
+  const maintenance = useMaintenance();
 
   // Show toast when arriving back after a deletion
   useEffect(() => {
@@ -193,6 +197,10 @@ export default function SessionsScreen() {
           </Pressable>
           <Pressable
             onPress={() => {
+              if (maintenance.on) {
+                setMaintenanceToast(true);
+                return;
+              }
               if (hasActiveSession) {
                 setErrorToast(true);
                 return;
@@ -201,19 +209,21 @@ export default function SessionsScreen() {
             }}
             style={({ pressed }) => [
               styles.addBtn,
-              hasActiveSession && styles.addBtnDisabled,
-              pressed && !hasActiveSession && { opacity: 0.85 },
+              (hasActiveSession || maintenance.on) && styles.addBtnDisabled,
+              pressed && !hasActiveSession && !maintenance.on && { opacity: 0.85 },
             ]}
             accessibilityRole="button"
-            accessibilityState={{ disabled: hasActiveSession }}
+            accessibilityState={{ disabled: hasActiveSession || maintenance.on }}
             accessibilityHint={
-              hasActiveSession
+              maintenance.on
+                ? MAINTENANCE_BLOCKED_HINT
+                : hasActiveSession
                 ? "End the current active session before creating a new one"
                 : undefined
             }
           >
-            <Ionicons name="add" size={18} color={hasActiveSession ? C.muted : "#1A1200"} />
-            <Text style={[styles.addBtnText, hasActiveSession && styles.addBtnTextDisabled]}>New</Text>
+            <Ionicons name="add" size={18} color={hasActiveSession || maintenance.on ? C.muted : "#1A1200"} />
+            <Text style={[styles.addBtnText, (hasActiveSession || maintenance.on) && styles.addBtnTextDisabled]}>New</Text>
           </Pressable>
         </View>
       </View>
@@ -264,6 +274,14 @@ export default function SessionsScreen() {
         variant="delete"
         duration={3500}
         onDismiss={() => setErrorToast(false)}
+      />
+      <Toast
+        message="Maintenance mode is on"
+        detail="New sessions can't be created until it ends. You can still open your sessions and results."
+        visible={maintenanceToast}
+        variant="warning"
+        duration={4500}
+        onDismiss={() => setMaintenanceToast(false)}
       />
     </SafeAreaView>
   );

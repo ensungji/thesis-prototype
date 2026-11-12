@@ -35,6 +35,7 @@ import {
 } from "../../lib/activities";
 import { BrailleLoader } from "../../components/BrailleLoader";
 import { ActivityDetailsSheet } from "../../components/ActivityDetailsSheet";
+import { MAINTENANCE_BLOCKED_HINT, useMaintenance } from "../../lib/maintenance";
 
 type Filter = "all" | ActivityStatus;
 const FILTERS: Filter[] = ["all", "draft", "published", "hidden"];
@@ -129,6 +130,7 @@ export function ActivityListScreen({ area }: { area: ActivitiesArea }) {
   const [createOpen, setCreateOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState("");
+  const maintenance = useMaintenance();
 
   const load = useCallback(async () => {
     const [uid, res] = await Promise.all([myUserId(), listActivities()]);
@@ -171,8 +173,10 @@ export function ActivityListScreen({ area }: { area: ActivitiesArea }) {
   const onShared = !isAdmin && tab === "shared";
   const pool = isAdmin ? activities : onShared ? shared : mine;
   const showFilters = !onShared;
-  // only a teacher makes activities (migration 25), on their Mine tab
+  // only a teacher makes activities (migration 25), on their Mine tab;
+  // not during maintenance mode (migration 26: the banner says why)
   const canCreate = !isAdmin && !onShared;
+  const frozen = !isAdmin && maintenance.on;
   const shown = !showFilters || filter === "all" ? pool : pool.filter((a) => a.status === filter);
   const count = (f: Filter) => (f === "all" ? pool.length : pool.filter((a) => a.status === f).length);
 
@@ -301,13 +305,17 @@ export function ActivityListScreen({ area }: { area: ActivitiesArea }) {
             setCreateError("");
             setCreateOpen(true);
           }}
+          disabled={frozen}
           style={({ pressed }) => [
             styles.fab,
             // the teacher screen sits above the tab bar, which already clears the inset
             { bottom: 16 },
+            frozen && { opacity: 0.45 },
             pressed && { opacity: 0.85 },
           ]}
           accessibilityRole="button"
+          accessibilityState={{ disabled: frozen }}
+          accessibilityHint={frozen ? MAINTENANCE_BLOCKED_HINT : undefined}
           accessibilityLabel="New activity"
         >
           <Ionicons name="add" size={24} color="#1A1200" />

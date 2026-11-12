@@ -7,6 +7,8 @@
 // The Activity list: published activities the teacher can see (RLS, migrations
 // 24, 25): their own ("Mine") first, then other teachers' shared ones
 // ("by <author> · Shared"). Hidden and draft ones aren't listed.
+// Maintenance mode (migration 26): Create is greyed out with a note; the
+// database refuses the insert anyway (DT002) and its message is shown.
 
 import { useState, useEffect, useCallback } from "react";
 import {
@@ -34,6 +36,7 @@ import {
 } from "../../../lib/session-timer";
 import { DIFFICULTY_META, type Difficulty } from "../../../lib/difficulty";
 import { byAuthor, myUserId } from "../../../lib/activities";
+import { isMaintenanceError, useMaintenance } from "../../../lib/maintenance";
 
 // A published activity the teacher can run: shared, or their own
 type PickActivity = {
@@ -72,6 +75,16 @@ export default function NewSessionScreen() {
   const [blocked, setBlocked] = useState(false);
   const [errorToast, setErrorToast] = useState(false);
   const [createError, setCreateError] = useState<{ message: string; detail?: string } | null>(null);
+  const maintenance = useMaintenance();
+
+  /** A refused insert / start: maintenance gets its own title. */
+  function showCreateError(message: string, err: { code?: string; message?: string } | null | undefined) {
+    setCreateError(
+      isMaintenanceError(err)
+        ? { message: "Maintenance mode is on", detail: "New sessions can't be created until it ends." }
+        : { message, detail: err?.message }
+    );
+  }
 
   // Activity mode
   const [activities, setActivities] = useState<PickActivity[] | null>(null); // null = not loaded yet
@@ -150,6 +163,10 @@ export default function NewSessionScreen() {
 
   async function createSession() {
     if (!name.trim()) return;
+    if (maintenance.on) {
+      showCreateError("", { code: "DT002" });
+      return;
+    }
     setSaving(true);
 
     // ── Pre-flight check ─────────────────────────────────────────────────────
@@ -184,7 +201,7 @@ export default function NewSessionScreen() {
         .single();
       if (insertError || !created) {
         setSaving(false);
-        setCreateError({ message: "Couldn't create the session", detail: insertError?.message });
+        showCreateError("Couldn't create the session", insertError);
         return;
       }
       const { error: startError } = await supabase.rpc("start_activity_session", {
@@ -195,7 +212,7 @@ export default function NewSessionScreen() {
         // Don't leave an empty session behind
         await supabase.from("sessions").delete().eq("id", created.id);
         setSaving(false);
-        setCreateError({ message: "Couldn't start the activity", detail: startError.message });
+        showCreateError("Couldn't start the activity", startError);
         return;
       }
       setSaving(false);
@@ -233,7 +250,10 @@ export default function NewSessionScreen() {
     }
 
     setSaving(false);
-    if (error || !data) return;
+    if (error || !data) {
+      showCreateError("Couldn't create the session", error);
+      return;
+    }
     router.replace(`/(teacher)/sessions/${data.id}` as any);
   }
 
@@ -410,15 +430,26 @@ export default function NewSessionScreen() {
 
         {/* Sticky create button */}
         <View style={styles.footer}>
+          {maintenance.on && (
+            <Text style={styles.maintenanceNote} accessibilityLiveRegion="polite">
+              Maintenance mode is on: new sessions can&apos;t be created until it ends.
+            </Text>
+          )}
           <Pressable
             onPress={createSession}
-            disabled={saving || !name.trim() || blocked || (isActivitySession(type) && !chosen)}
+            disabled={saving || !name.trim() || blocked || maintenance.on || (isActivitySession(type) && !chosen)}
             style={({ pressed }) => [
               styles.createBtn,
-              (saving || !name.trim() || blocked || (isActivitySession(type) && !chosen)) && { opacity: 0.5 },
+              (saving || !name.trim() || blocked || maintenance.on || (isActivitySession(type) && !chosen)) && { opacity: 0.5 },
               pressed && { opacity: 0.85 },
             ]}
-            accessibilityHint={isActivitySession(type) && !chosen ? "Pick an activity first" : undefined}
+            accessibilityHint={
+              maintenance.on
+                ? "Maintenance mode is on"
+                : isActivitySession(type) && !chosen
+                ? "Pick an activity first"
+                : undefined
+            }
           >
             {saving ? (
               <ActivityIndicator color="#1A1200" />
@@ -555,6 +586,16 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: C.border,
     flexShrink: 1,
+  },
+  maintenanceNote: {
+    fontFamily: fonts.body,
+    fontSize: 13,
+    color: C.brown,
+    backgroundColor: C.brownBg,
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 8,
+    textAlign: "center",
   },
   ownerTagMine: { borderColor: C.navy, backgroundColor: C.blueWash },
   ownerTagText: { fontFamily: fonts.mono, fontSize: 10, color: C.muted },

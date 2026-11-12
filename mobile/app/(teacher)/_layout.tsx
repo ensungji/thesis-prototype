@@ -1,13 +1,17 @@
 // mobile/app/(teacher)/_layout.tsx
 // Tab navigator for the authenticated teacher area.
 // Auth guard: redirects to login if no active session.
+// Maintenance mode (migration 26): a banner sits just above the tab bar on
+// every teacher screen while it's on.
 
 import { useEffect } from "react";
 import { Tabs, useRouter } from "expo-router";
+import { BottomTabBar } from "@react-navigation/bottom-tabs";
 import { Ionicons } from "@expo/vector-icons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { supabase } from "../../lib/supabase";
 import { colors as C, fonts } from "../../lib/theme";
+import { MaintenanceBanner } from "../../components/MaintenanceBanner";
 
 export default function TeacherLayout() {
   const insets = useSafeAreaInsets();
@@ -34,6 +38,12 @@ export default function TeacherLayout() {
 
   return (
     <Tabs
+      tabBar={(props) => (
+        <>
+          <MaintenanceBanner />
+          <BottomTabBar {...props} />
+        </>
+      )}
       screenOptions={{
         headerShown: false,
         tabBarActiveTintColor: C.navy,

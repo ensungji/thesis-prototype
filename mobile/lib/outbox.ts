@@ -17,7 +17,8 @@
 //   - Real server errors (e.g. permission denied) are NOT queued — they
 //     would fail again forever. They are returned to the caller.
 //   - A QUEUED change the server refuses outright (the grading lock of
-//     migration 22, SQLSTATE 42501 / DT001) is dropped at once, logged, and
+//     migration 22, SQLSTATE 42501 / DT001; maintenance mode, migration 26,
+//     DT002) is dropped at once, logged, and
 //     announced to subscribeRefused() listeners so the app can show the error
 //     and reload what the server really has. Other server errors are retried
 //     a few times first (MAX_TRIES).
@@ -230,8 +231,10 @@ export function subscribeRefused(fn: (r: RefusedChange) => void): () => void {
 
 // 42501 = insufficient privilege: the grading lock (a voice grade during a
 //         session, a teacher-only column) or RLS. DT001 = the word is already
-//         correct by voice. Sending it again can never work.
-const REFUSED_CODES = new Set(["42501", "DT001"]);
+//         correct by voice. DT002 = maintenance mode (migration 26); the change
+//         is one a teacher can't make right now, so it's dropped, not kept for later.
+// Sending any of these again can never work.
+const REFUSED_CODES = new Set(["42501", "DT001", "DT002"]);
 const errCode = (err: unknown) => String((err as { code?: string })?.code ?? "");
 const errMessage = (err: unknown) => String((err as { message?: string })?.message ?? err);
 
