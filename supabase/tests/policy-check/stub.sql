@@ -46,8 +46,10 @@ create table public.letter_attempts (id uuid primary key default gen_random_uuid
   word_attempt_id uuid references public.word_attempts(id));
 create table public.word_library (id uuid primary key default gen_random_uuid(), teacher_id uuid, word text, category text, difficulty text);
 create table public.device_events (id uuid primary key default gen_random_uuid(), device_id uuid);
+-- columns as the app, grade-answer and migration 26 write them
 create table public.system_logs (id uuid primary key default gen_random_uuid(), source text,
-  user_id uuid default auth.uid());
+  user_id uuid default auth.uid(), created_at timestamptz default now(), level text, event text,
+  message text, session_id uuid, device_id uuid, meta jsonb default '{}');
 
 do $$ declare t text; begin
   foreach t in array array['profiles','students','sessions','session_words','session_students','devices',

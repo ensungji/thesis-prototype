@@ -337,145 +337,177 @@ await check("teacher can override a No answer row (matched on student + word)", 
   await as(null, null, `delete from word_attempts where student_id = '${BEN}'`);
 });
 
-// ── 16 activities ────────────────────────────────────────────────────────────
+// ── 16 + 25 activities: teachers own them, the admin only hides / unhides ────
+// A = Alice (named above), the creator of "Animals"; B = another teacher; D = admin.
 const ACT = "ac100000-0000-0000-0000-000000000000";
-await check("admin creates a draft; created_by is the admin, whatever was sent", async () => {
-  const r = await as(D, "authenticated", `insert into activities (id, name, level, created_by, shared)
-    values ('${ACT}', 'Animals', 'easy', '${A}', false) returning status, created_by, published_at, shared`);
-  eq(r.rows, [{ status: "draft", created_by: D, published_at: null, shared: true }], "row");
+const ACT2 = "ac200000-0000-0000-0000-000000000000"; // A's empty draft
+const visible = async (who, id) => {
+  const a = await as(who, "authenticated", `select count(*)::int as n from activities where id = '${id}'`);
+  const w = await as(who, "authenticated", `select count(*)::int as n from activity_words where activity_id = '${id}'`);
+  return [a.rows[0].n, w.rows[0].n];
+};
+await check("teacher creates a draft; created_by, author_name and shared (false) are set by the database", async () => {
+  const r = await as(A, "authenticated", `insert into activities (id, name, level, created_by, shared, author_name)
+    values ('${ACT}', 'Animals', 'easy', '${D}', true, 'Fake') returning status, created_by, published_at, shared, author_name`);
+  eq(r.rows, [{ status: "draft", created_by: A, published_at: null, shared: false, author_name: "Alice" }], "row");
 });
 await check("a new activity can't start as published", () =>
-  expectError(as(D, "authenticated", `insert into activities (name, status) values ('X', 'published')`), /must start as a draft/));
-await check("teacher creates a private draft (shared false, even if sent true) and can delete it", async () => {
-  const r = await as(A, "authenticated", `insert into activities (name, shared, created_by) values ('X', true, '${D}')
-    returning status, shared, created_by`);
-  eq(r.rows, [{ status: "draft", shared: false, created_by: A }], "row");
-  const d = await as(A, "authenticated", `delete from activities where name = 'X' returning id`);
-  eq(d.rows.length, 1, "deleted");
-});
+  expectError(as(A, "authenticated", `insert into activities (name, status) values ('X', 'published')`), /must start as a draft/));
+await check("an admin can't create an activity", () =>
+  expectError(as(D, "authenticated", `insert into activities (name) values ('X')`), /row-level security/));
 await check("activity words: A-Z only, 1-40 letters, 5-60 s, default 20 s", async () => {
-  const r = await as(D, "authenticated", `insert into activity_words (activity_id, position, word)
+  const r = await as(A, "authenticated", `insert into activity_words (activity_id, position, word)
     values ('${ACT}', 0, 'CAT') returning duration_seconds`);
   eq(r.rows, [{ duration_seconds: 20 }], "default");
-  await as(D, "authenticated", `insert into activity_words (activity_id, position, word, duration_seconds)
+  await as(A, "authenticated", `insert into activity_words (activity_id, position, word, duration_seconds)
     values ('${ACT}', 1, 'DOG', 30), ('${ACT}', 2, 'SUN', 5)`);
   for (const [w, d] of [["cat", 20], ["CAT1", 20], ["", 20], ["A".repeat(41), 20], ["COW", 4], ["COW", 61]]) {
-    await expectError(as(D, "authenticated", `insert into activity_words (activity_id, position, word, duration_seconds)
+    await expectError(as(A, "authenticated", `insert into activity_words (activity_id, position, word, duration_seconds)
       values ('${ACT}', 9, '${w}', ${d})`), /activity_words_(word_check|duration_range)/);
   }
-  await as(D, "authenticated", `insert into activity_words (activity_id, position, word) values ('${ACT}', 9, '${"A".repeat(40)}')`);
-  await as(D, "authenticated", `delete from activity_words where activity_id = '${ACT}' and position = 9`);
+  await as(A, "authenticated", `insert into activity_words (activity_id, position, word) values ('${ACT}', 9, '${"A".repeat(40)}')`);
+  await as(A, "authenticated", `delete from activity_words where activity_id = '${ACT}' and position = 9`);
 });
 await check("draft words can be reordered in one statement (swap positions)", async () => {
-  await as(D, "authenticated", `update activity_words set position = 1 - position where activity_id = '${ACT}' and position in (0, 1)`);
-  const r = await as(D, "authenticated", `select word from activity_words where activity_id = '${ACT}' order by position`);
+  await as(A, "authenticated", `update activity_words set position = 1 - position where activity_id = '${ACT}' and position in (0, 1)`);
+  const r = await as(A, "authenticated", `select word from activity_words where activity_id = '${ACT}' order by position`);
   eq(r.rows.map((x) => x.word), ["DOG", "CAT", "SUN"], "order");
 });
-await check("teacher sees no drafts", async () => {
-  const r = await as(A, "authenticated", `select count(*)::int as n from activities`);
-  const w = await as(A, "authenticated", `select count(*)::int as n from activity_words`);
-  eq([r.rows[0].n, w.rows[0].n], [0, 0], "visible");
+await check("a draft: another teacher sees nothing; the admin sees it and its words (overview)", async () => {
+  eq([await visible(B, ACT), await visible(D, ACT)], [[0, 0], [1, 3]], "B / admin");
 });
-await check("a draft with no words can't be published; a draft can't be hidden", async () => {
-  await as(D, "authenticated", `insert into activities (id, name) values ('ac200000-0000-0000-0000-000000000000', 'Empty')`);
-  await expectError(as(D, "authenticated", `update activities set status = 'published' where id = 'ac200000-0000-0000-0000-000000000000'`), /at least one word/);
-  await expectError(as(D, "authenticated", `update activities set status = 'hidden' where id = 'ac200000-0000-0000-0000-000000000000'`), /before hiding/);
+await check("a draft with no words can't be published; a draft can't be hidden or shared", async () => {
+  await as(A, "authenticated", `insert into activities (id, name) values ('${ACT2}', 'Empty')`);
+  await expectError(as(A, "authenticated", `update activities set status = 'published' where id = '${ACT2}'`), /at least one word/);
+  await expectError(as(A, "authenticated", `update activities set status = 'hidden' where id = '${ACT2}'`), /Only an admin can hide/);
+  await expectError(as(D, "authenticated", `update activities set status = 'hidden' where id = '${ACT2}'`), /admin can only hide or unhide a published/);
+  await expectError(as(A, "authenticated", `update activities set shared = true where id = '${ACT}'`), /Only a published activity can be shared/);
+  await expectError(as(null, null, `update activities set shared = true where id = '${ACT}'`), /activities_draft_not_shared|Only a published/);
 });
-await check("publish sets published_at; teacher then reads it and its words", async () => {
-  const p = await as(D, "authenticated", `update activities set status = 'published' where id = '${ACT}' returning published_at`);
+await check("an admin can't edit, publish, add words to or delete a teacher's draft", async () => {
+  await expectError(as(D, "authenticated", `update activities set name = 'Pets' where id = '${ACT}'`), /admin can only hide/);
+  await expectError(as(D, "authenticated", `update activities set status = 'published' where id = '${ACT}'`), /admin can only hide/);
+  await expectError(as(D, "authenticated", `insert into activity_words (activity_id, position, word) values ('${ACT}', 9, 'COW')`), /row-level security/);
+  const uw = await as(D, "authenticated", `update activity_words set duration_seconds = 9 where activity_id = '${ACT}' returning id`);
+  const d = await as(D, "authenticated", `delete from activities where id = '${ACT}' returning id`);
+  eq([uw.rows.length, d.rows.length], [0, 0], "rows changed");
+});
+await check("publish sets published_at; private until shared; shared → another teacher sees it and its author", async () => {
+  const p = await as(A, "authenticated", `update activities set status = 'published' where id = '${ACT}' returning published_at, shared`);
   if (!p.rows[0].published_at) throw new Error("published_at not set");
-  const r = await as(A, "authenticated", `select name from activities`);
-  const w = await as(A, "authenticated", `select count(*)::int as n from activity_words`);
-  eq([r.rows.map((x) => x.name), w.rows[0].n], [["Animals"], 3], "visible");
+  eq(p.rows[0].shared, false, "shared after publish");
+  eq(await visible(B, ACT), [0, 0], "B sees private");
+  await as(A, "authenticated", `update activities set shared = true where id = '${ACT}'`);
+  eq(await visible(B, ACT), [1, 3], "B sees shared");
+  const r = await as(B, "authenticated", `select author_name from activities where id = '${ACT}'`);
+  eq(r.rows, [{ author_name: "Alice" }], "author");
+});
+await check("publish and share in one update", async () => {
+  const P = "ac210000-0000-0000-0000-000000000000";
+  await as(A, "authenticated", `insert into activities (id, name) values ('${P}', 'One go')`);
+  await as(A, "authenticated", `insert into activity_words (activity_id, position, word) values ('${P}', 0, 'GO')`);
+  const r = await as(A, "authenticated", `update activities set status = 'published', shared = true where id = '${P}' returning status, shared`);
+  eq(r.rows, [{ status: "published", shared: true }], "row");
+  await as(null, null, `delete from activities where id = '${P}'`);
 });
 await check("published: no edits, no word changes, no going back to draft", async () => {
-  await expectError(as(D, "authenticated", `update activities set name = 'Pets' where id = '${ACT}'`), /can't be edited/);
-  await expectError(as(D, "authenticated", `update activities set published_at = now() - interval '1 day' where id = '${ACT}'`), /can't be edited/);
-  await expectError(as(D, "authenticated", `update activities set status = 'draft' where id = '${ACT}'`), /back to draft/);
-  await expectError(as(D, "authenticated", `insert into activity_words (activity_id, position, word) values ('${ACT}', 5, 'COW')`), /can't be changed/);
-  await expectError(as(D, "authenticated", `update activity_words set duration_seconds = 10 where activity_id = '${ACT}'`), /can't be changed/);
-  await expectError(as(D, "authenticated", `delete from activity_words where activity_id = '${ACT}'`), /can't be changed/);
+  await expectError(as(A, "authenticated", `update activities set name = 'Pets' where id = '${ACT}'`), /can't be edited/);
+  await expectError(as(A, "authenticated", `update activities set published_at = now() - interval '1 day' where id = '${ACT}'`), /can't be edited/);
+  await expectError(as(A, "authenticated", `update activities set status = 'draft' where id = '${ACT}'`), /back to draft/);
+  await expectError(as(A, "authenticated", `insert into activity_words (activity_id, position, word) values ('${ACT}', 5, 'COW')`), /can't be changed/);
+  await expectError(as(A, "authenticated", `update activity_words set duration_seconds = 10 where activity_id = '${ACT}'`), /can't be changed/);
+  await expectError(as(A, "authenticated", `delete from activity_words where activity_id = '${ACT}'`), /can't be changed/);
   // the lock holds for the SQL editor / service role too
   await expectError(as(null, null, `update activities set name = 'Pets' where id = '${ACT}'`), /can't be edited/);
   await expectError(as(null, null, `update activity_words set word = 'COW' where activity_id = '${ACT}'`), /can't be changed/);
 });
 await check("a word can't be moved from a draft into a published activity", async () => {
-  await as(D, "authenticated", `insert into activity_words (activity_id, position, word) values ('ac200000-0000-0000-0000-000000000000', 0, 'COW')`);
-  return expectError(as(D, "authenticated", `update activity_words set activity_id = '${ACT}', position = 7
-    where activity_id = 'ac200000-0000-0000-0000-000000000000'`), /can't be changed/);
+  await as(A, "authenticated", `insert into activity_words (activity_id, position, word) values ('${ACT2}', 0, 'COW')`);
+  return expectError(as(A, "authenticated", `update activity_words set activity_id = '${ACT}', position = 7
+    where activity_id = '${ACT2}'`), /can't be changed/);
 });
-await check("teacher can't change or delete a published activity", async () => {
-  const u = await as(A, "authenticated", `update activities set status = 'hidden' where id = '${ACT}' returning id`);
+await check("published: its teacher can't delete or hide it; another teacher can't change, share or delete it", async () => {
   const d = await as(A, "authenticated", `delete from activities where id = '${ACT}' returning id`);
-  eq([u.rows.length, d.rows.length], [0, 0], "rows");
+  await expectError(as(A, "authenticated", `update activities set status = 'hidden' where id = '${ACT}'`), /Only an admin can hide/);
+  const bs = await as(B, "authenticated", `update activities set shared = false where id = '${ACT}' returning id`);
+  const bh = await as(B, "authenticated", `update activities set status = 'hidden' where id = '${ACT}' returning id`);
+  const bd = await as(B, "authenticated", `delete from activities where id = '${ACT}' returning id`);
+  eq([d.rows.length, bs.rows.length, bh.rows.length, bd.rows.length], [0, 0, 0, 0], "rows changed");
 });
-await check("admin can't delete a published activity (hide it instead)", async () => {
+await check("an admin can't delete a published activity or change its sharing", async () => {
   const d = await as(D, "authenticated", `delete from activities where id = '${ACT}' returning id`);
   eq(d.rows.length, 0, "rows deleted");
+  await expectError(as(D, "authenticated", `update activities set shared = false where id = '${ACT}'`), /admin can only hide/);
 });
-await check("hide → teachers no longer see it; un-hide keeps the first published_at", async () => {
+await check("admin hides: hidden_at / hidden_by set; others stop seeing it; its teacher sees it but can't share, unhide or duplicate", async () => {
   const before = await as(null, null, `select published_at from activities where id = '${ACT}'`);
-  await as(D, "authenticated", `update activities set status = 'hidden' where id = '${ACT}'`);
-  const r = await as(A, "authenticated", `select count(*)::int as n from activities`);
-  const w = await as(A, "authenticated", `select count(*)::int as n from activity_words`);
-  eq([r.rows[0].n, w.rows[0].n], [0, 0], "teacher sees");
-  await expectError(as(D, "authenticated", `update activities set status = 'draft' where id = '${ACT}'`), /back to draft/);
-  await as(D, "authenticated", `update activities set status = 'published' where id = '${ACT}'`);
+  const h = await as(D, "authenticated", `update activities set status = 'hidden' where id = '${ACT}' returning hidden_by, hidden_at is not null as at`);
+  eq(h.rows, [{ hidden_by: D, at: true }], "hidden row");
+  eq([await visible(B, ACT), await visible(A, ACT)], [[0, 0], [1, 3]], "B / A see");
+  await expectError(as(A, "authenticated", `update activities set shared = false where id = '${ACT}'`), /Only a published activity can be shared/);
+  await expectError(as(A, "authenticated", `update activities set status = 'published' where id = '${ACT}'`), /Only an admin can hide/);
+  await expectError(as(A, "authenticated", `select duplicate_activity('${ACT}')`), /hidden activity can't be duplicated/);
+  await expectError(as(D, "authenticated", `update activities set status = 'draft' where id = '${ACT}'`), /admin can only hide|back to draft/);
+  const u = await as(D, "authenticated", `update activities set status = 'published' where id = '${ACT}'
+    returning hidden_by, hidden_at, shared`);
+  eq(u.rows, [{ hidden_by: null, hidden_at: null, shared: true }], "unhidden");
   const after = await as(null, null, `select published_at from activities where id = '${ACT}'`);
   eq(String(after.rows[0].published_at), String(before.rows[0].published_at), "published_at");
+  eq(await visible(B, ACT), [1, 3], "B sees it again");
 });
-await check("admin deletes a draft; its words go with it", async () => {
-  const d = await as(D, "authenticated", `delete from activities where id = 'ac200000-0000-0000-0000-000000000000' returning id`);
+await check("a teacher deletes their own draft; its words go with it", async () => {
+  const d = await as(A, "authenticated", `delete from activities where id = '${ACT2}' returning id`);
   eq(d.rows.length, 1, "deleted");
-  const w = await as(null, null, `select count(*)::int as n from activity_words where activity_id = 'ac200000-0000-0000-0000-000000000000'`);
+  const w = await as(null, null, `select count(*)::int as n from activity_words where activity_id = '${ACT2}'`);
   eq(w.rows, [{ n: 0 }], "words left");
 });
-await check("deleting the creator's profile keeps the published activity (created_by → null)", async () => {
+await check("deleting the creator's profile keeps the published activity (created_by → null, author_name kept)", async () => {
   const E = "eeeeeeee-0000-0000-0000-000000000000";
-  await as(null, null, `insert into profiles (id, role) values ('${E}', 'admin')`);
+  await as(null, null, `insert into profiles (id, role, full_name) values ('${E}', 'teacher', ' Eve ')`);
   await as(E, "authenticated", `insert into activities (id, name) values ('ac300000-0000-0000-0000-000000000000', 'Temp')`);
   await as(E, "authenticated", `insert into activity_words (activity_id, position, word) values ('ac300000-0000-0000-0000-000000000000', 0, 'HI')`);
   await as(E, "authenticated", `update activities set status = 'published' where id = 'ac300000-0000-0000-0000-000000000000'`);
   await as(null, null, `delete from profiles where id = '${E}'`);
-  const r = await as(null, null, `select status, created_by from activities where id = 'ac300000-0000-0000-0000-000000000000'`);
-  eq(r.rows, [{ status: "published", created_by: null }], "row");
+  const r = await as(null, null, `select status, created_by, author_name from activities where id = 'ac300000-0000-0000-0000-000000000000'`);
+  eq(r.rows, [{ status: "published", created_by: null, author_name: "Eve" }], "row");
   await as(null, null, `delete from activities where id = 'ac300000-0000-0000-0000-000000000000'`); // SQL editor may delete; words cascade
 });
 await check("anon can't read activities", () =>
   expectError(as(null, "anon", `select * from activities`), /permission denied/));
 
-// ── 17 duplicate_activity ────────────────────────────────────────────────────
-await check("duplicate a published activity → editable draft with the same words", async () => {
-  const r = await as(D, "authenticated", `select duplicate_activity('${ACT}') as id`);
+// ── 17 + 25 duplicate_activity ───────────────────────────────────────────────
+await check("duplicate a published activity → the teacher's private draft with the same words", async () => {
+  const r = await as(A, "authenticated", `select duplicate_activity('${ACT}') as id`);
   const id = r.rows[0].id;
-  const a = await as(null, null, `select name, level, status, created_by, published_at from activities where id = '${id}'`);
-  eq(a.rows, [{ name: "Animals (copy)", level: "easy", status: "draft", created_by: D, published_at: null }], "copy");
+  const a = await as(null, null, `select name, level, status, created_by, published_at, shared, author_name from activities where id = '${id}'`);
+  eq(a.rows, [{ name: "Animals (copy)", level: "easy", status: "draft", created_by: A, published_at: null, shared: false, author_name: "Alice" }], "copy");
   const w = await as(null, null, `select position, word, duration_seconds from activity_words where activity_id = '${id}' order by position`);
   eq(w.rows, [
     { position: 0, word: "DOG", duration_seconds: 30 },
     { position: 1, word: "CAT", duration_seconds: 20 },
     { position: 2, word: "SUN", duration_seconds: 5 },
   ], "words");
-  await as(D, "authenticated", `update activities set name = 'Pets' where id = '${id}'`);
-  await as(D, "authenticated", `update activity_words set word = 'COW' where activity_id = '${id}' and position = 0`);
+  await as(A, "authenticated", `update activities set name = 'Pets' where id = '${id}'`);
+  await as(A, "authenticated", `update activity_words set word = 'COW' where activity_id = '${id}' and position = 0`);
   const o = await as(null, null, `select word from activity_words where activity_id = '${ACT}' order by position`);
   eq(o.rows.map((x) => x.word), ["DOG", "CAT", "SUN"], "original unchanged");
-  await as(D, "authenticated", `delete from activities where id = '${id}'`);
+  await as(A, "authenticated", `delete from activities where id = '${id}'`);
 });
 await check("duplicate keeps the name within 100 characters", async () => {
-  await as(D, "authenticated", `insert into activities (id, name) values ('ac400000-0000-0000-0000-000000000000', '${"N".repeat(100)}')`);
-  const r = await as(D, "authenticated", `select duplicate_activity('ac400000-0000-0000-0000-000000000000') as id`);
+  await as(A, "authenticated", `insert into activities (id, name) values ('ac400000-0000-0000-0000-000000000000', '${"N".repeat(100)}')`);
+  const r = await as(A, "authenticated", `select duplicate_activity('ac400000-0000-0000-0000-000000000000') as id`);
   const a = await as(null, null, `select char_length(name)::int as n, right(name, 7) as tail from activities where id = '${r.rows[0].id}'`);
   eq(a.rows, [{ n: 100, tail: " (copy)" }], "name");
   await as(null, null, `delete from activities where id in ('ac400000-0000-0000-0000-000000000000', '${r.rows[0].id}')`);
 });
-await check("duplicate: a teacher's copy of a shared activity is their private draft; unknown id refused; anon can't call it", async () => {
-  const id = (await as(A, "authenticated", `select duplicate_activity('${ACT}') as id`)).rows[0].id;
-  const a = await as(null, null, `select status, shared, created_by,
+await check("duplicate: another teacher's copy of a shared one is their private draft; admin refused; unknown id refused; anon can't call it", async () => {
+  const id = (await as(B, "authenticated", `select duplicate_activity('${ACT}') as id`)).rows[0].id;
+  const a = await as(null, null, `select status, shared, created_by, author_name,
     (select count(*)::int from activity_words where activity_id = '${id}') as words from activities where id = '${id}'`);
-  eq(a.rows, [{ status: "draft", shared: false, created_by: A, words: 3 }], "copy");
-  await as(A, "authenticated", `delete from activities where id = '${id}'`);
-  await expectError(as(D, "authenticated", `select duplicate_activity(gen_random_uuid())`), /No such activity/);
+  eq(a.rows, [{ status: "draft", shared: false, created_by: B, author_name: null, words: 3 }], "copy (B has no name)");
+  await as(B, "authenticated", `delete from activities where id = '${id}'`);
+  await expectError(as(D, "authenticated", `select duplicate_activity('${ACT}')`), /Only a teacher/);
+  await expectError(as(A, "authenticated", `select duplicate_activity(gen_random_uuid())`), /No such activity/);
   await expectError(as(null, "anon", `select duplicate_activity('${ACT}')`), /permission denied/);
   const n = await as(null, null, `select count(*)::int as n from activities`);
   eq(n.rows, [{ n: 1 }], "no stray copies");
@@ -491,15 +523,15 @@ await check("session type: manual, word_list, activity allowed; live_session sti
   await expectError(as(A, "authenticated", `update sessions set current_index = -1 where name = 'a'`), /sessions_current_index_check/);
   await as(null, null, `delete from sessions where name in ('m', 'w', 'a')`);
 });
-await check("deleting an activity keeps the session and its copied name (activity_id → null)", async () => {
-  await as(D, "authenticated", `insert into activities (id, name) values ('ac500000-0000-0000-0000-000000000000', 'Gone')`);
-  await as(D, "authenticated", `insert into activity_words (activity_id, position, word) values ('ac500000-0000-0000-0000-000000000000', 0, 'GO')`);
-  await as(D, "authenticated", `update activities set status = 'published' where id = 'ac500000-0000-0000-0000-000000000000'`);
-  await as(null, null, `insert into sessions (id, teacher_id, name, type, status, activity_id, activity_name)
-    values ('5c000000-0000-0000-0000-000000000000', '${A}', 'S', 'activity', 'finished', 'ac500000-0000-0000-0000-000000000000', 'Gone')`);
+await check("deleting an activity keeps the session and its copied name and author (activity_id → null)", async () => {
+  await as(A, "authenticated", `insert into activities (id, name) values ('ac500000-0000-0000-0000-000000000000', 'Gone')`);
+  await as(A, "authenticated", `insert into activity_words (activity_id, position, word) values ('ac500000-0000-0000-0000-000000000000', 0, 'GO')`);
+  await as(A, "authenticated", `update activities set status = 'published' where id = 'ac500000-0000-0000-0000-000000000000'`);
+  await as(null, null, `insert into sessions (id, teacher_id, name, type, status, activity_id, activity_name, activity_author)
+    values ('5c000000-0000-0000-0000-000000000000', '${A}', 'S', 'activity', 'finished', 'ac500000-0000-0000-0000-000000000000', 'Gone', 'Alice')`);
   await as(null, null, `delete from activities where id = 'ac500000-0000-0000-0000-000000000000'`);
-  const r = await as(null, null, `select type, status, activity_id, activity_name from sessions where id = '5c000000-0000-0000-0000-000000000000'`);
-  eq(r.rows, [{ type: "activity", status: "finished", activity_id: null, activity_name: "Gone" }], "session");
+  const r = await as(null, null, `select type, status, activity_id, activity_name, activity_author from sessions where id = '5c000000-0000-0000-0000-000000000000'`);
+  eq(r.rows, [{ type: "activity", status: "finished", activity_id: null, activity_name: "Gone", activity_author: "Alice" }], "session");
   await as(null, null, `delete from sessions where id = '5c000000-0000-0000-0000-000000000000'`);
 });
 
@@ -508,7 +540,7 @@ const SA = "5d000000-0000-0000-0000-000000000000"; // A's pending session
 const startAct = (who, sess, act) => as(who, "authenticated", `select start_activity_session('${sess}', '${act}') as n`);
 const sessionWords = (sess) => as(null, null,
   `select word, order_index, duration_seconds from session_words where session_id = '${sess}' order by order_index`);
-await check("start: copies the words in order with their times, marks the session", async () => {
+await check("start: copies the words in order with their times, marks the session, copies name + author", async () => {
   await as(null, null, `insert into sessions (id, teacher_id, name) values ('${SA}', '${A}', 'Act run')`);
   const r = await startAct(A, SA, ACT);
   eq(r.rows, [{ n: 3 }], "returned");
@@ -517,22 +549,22 @@ await check("start: copies the words in order with their times, marks the sessio
     { word: "CAT", order_index: 1, duration_seconds: 20 },
     { word: "SUN", order_index: 2, duration_seconds: 5 },
   ], "session words");
-  const s = await as(null, null, `select type, status, activity_id, activity_name, current_index from sessions where id = '${SA}'`);
-  eq(s.rows, [{ type: "activity", status: "pending", activity_id: ACT, activity_name: "Animals", current_index: 0 }], "session");
+  const s = await as(null, null, `select type, status, activity_id, activity_name, activity_author, current_index from sessions where id = '${SA}'`);
+  eq(s.rows, [{ type: "activity", status: "pending", activity_id: ACT, activity_name: "Animals", activity_author: "Alice", current_index: 0 }], "session");
 });
 await check("start: a retry does nothing and returns the count again", async () => {
   eq((await startAct(A, SA, ACT)).rows, [{ n: 3 }], "returned");
   eq((await sessionWords(SA)).rows.length, 3, "words");
 });
 await check("start: another activity on a session that has words is refused", async () => {
-  const id = (await as(D, "authenticated", `select duplicate_activity('${ACT}') as id`)).rows[0].id;
-  await as(D, "authenticated", `update activities set status = 'published' where id = '${id}'`);
+  const id = (await as(A, "authenticated", `select duplicate_activity('${ACT}') as id`)).rows[0].id;
+  await as(A, "authenticated", `update activities set status = 'published' where id = '${id}'`);
   await expectError(startAct(A, SA, id), /already has words/);
   await as(null, null, `delete from activities where id = '${id}'`);
 });
-await check("start: only the session's teacher", async () => {
+await check("start: only the session's teacher; an admin never", async () => {
   await expectError(startAct(B, SA, ACT), /Not your session/);
-  await expectError(startAct(D, SA, ACT), /Not your session/); // admins neither
+  await expectError(startAct(D, SA, ACT), /Only a teacher can start/);
   await expectError(startAct(A, "00000000-0000-0000-0000-000000000000", ACT), /Not your session/);
   await expectError(as(null, "anon", `select start_activity_session('${SA}', '${ACT}')`), /permission denied/);
   await expectError(as(null, null, `select start_activity_session('${SA}', '${ACT}')`), /Not signed in/);
@@ -540,7 +572,7 @@ await check("start: only the session's teacher", async () => {
 await check("start: draft / hidden / unknown activity refused, nothing copied", async () => {
   const S2 = "5e000000-0000-0000-0000-000000000000";
   await as(null, null, `insert into sessions (id, teacher_id, name) values ('${S2}', '${A}', 'Other')`);
-  const draft = (await as(D, "authenticated", `select duplicate_activity('${ACT}') as id`)).rows[0].id;
+  const draft = (await as(A, "authenticated", `select duplicate_activity('${ACT}') as id`)).rows[0].id;
   await expectError(startAct(A, S2, draft), /Only a published activity/);
   await as(D, "authenticated", `update activities set status = 'hidden' where id = '${ACT}'`);
   await expectError(startAct(A, S2, ACT), /Only a published activity/);
@@ -562,9 +594,9 @@ await check("start: a session that has started, or already has words, is refused
 });
 await check("start: gaps in positions → order_index 0, 1, 2", async () => {
   const G = "ac600000-0000-0000-0000-000000000000", S4 = "5f100000-0000-0000-0000-000000000000";
-  await as(D, "authenticated", `insert into activities (id, name) values ('${G}', 'Gaps')`);
-  await as(D, "authenticated", `insert into activity_words (activity_id, position, word) values ('${G}', 10, 'B'), ('${G}', 2, 'A'), ('${G}', 40, 'C')`);
-  await as(D, "authenticated", `update activities set status = 'published' where id = '${G}'`);
+  await as(A, "authenticated", `insert into activities (id, name) values ('${G}', 'Gaps')`);
+  await as(A, "authenticated", `insert into activity_words (activity_id, position, word) values ('${G}', 10, 'B'), ('${G}', 2, 'A'), ('${G}', 40, 'C')`);
+  await as(A, "authenticated", `update activities set status = 'published' where id = '${G}'`);
   await as(null, null, `insert into sessions (id, teacher_id, name) values ('${S4}', '${A}', 'Gaps run')`);
   await startAct(A, S4, G);
   eq((await sessionWords(S4)).rows.map((x) => [x.word, x.order_index]), [["A", 0], ["B", 1], ["C", 2]], "order");
@@ -890,78 +922,145 @@ await check("speech_grading_agreement: counts voice answers of reviewed sessions
   await as(null, null, `delete from word_attempts where session_id is null and student_id = '${ANA}' and word like 'W_'`);
 });
 
-// ── 24 teacher activities (shared / private) ─────────────────────────────────
-const TA = "ac700000-0000-0000-0000-000000000000"; // A's private activity
-const visible = async (who, id) => {
-  const a = await as(who, "authenticated", `select count(*)::int as n from activities where id = '${id}'`);
-  const w = await as(who, "authenticated", `select count(*)::int as n from activity_words where activity_id = '${id}'`);
-  return [a.rows[0].n, w.rows[0].n];
-};
-await check("24: teacher A makes a draft with words; only A and admins see it", async () => {
-  await as(A, "authenticated", `insert into activities (id, name) values ('${TA}', 'Mine')`);
-  await as(A, "authenticated", `insert into activity_words (activity_id, position, word) values ('${TA}', 0, 'AB'), ('${TA}', 1, 'CD')`);
-  await as(A, "authenticated", `update activity_words set duration_seconds = 10 where activity_id = '${TA}' and position = 1`);
-  await as(A, "authenticated", `update activities set name = 'Mine 2', level = 'hard' where id = '${TA}'`);
-  eq([await visible(A, TA), await visible(B, TA), await visible(D, TA)], [[1, 2], [0, 0], [1, 2]], "A / B / admin see");
+// ── 25 private activities, sharing, re-run ───────────────────────────────────
+const TB = "ac700000-0000-0000-0000-000000000000"; // B's private activity
+await check("25: B's private published activity: only B and admins see it; A can't start or duplicate it; B can run it", async () => {
+  await as(B, "authenticated", `insert into activities (id, name) values ('${TB}', 'Mine')`);
+  await as(B, "authenticated", `insert into activity_words (activity_id, position, word) values ('${TB}', 0, 'AB'), ('${TB}', 1, 'CD')`);
+  await as(B, "authenticated", `update activities set status = 'published' where id = '${TB}'`);
+  eq([await visible(B, TB), await visible(A, TB), await visible(D, TB)], [[1, 2], [0, 0], [1, 2]], "B / A / admin see");
+  const SA2 = "5f700000-0000-0000-0000-000000000000", SB2 = "5f800000-0000-0000-0000-000000000000";
+  await as(null, null, `insert into sessions (id, teacher_id, name) values ('${SA2}', '${A}', 'a'), ('${SB2}', '${B}', 'b')`);
+  await expectError(startAct(A, SA2, TB), /Only a published activity/);
+  await expectError(as(A, "authenticated", `select duplicate_activity('${TB}')`), /No such activity/);
+  eq((await startAct(B, SB2, TB)).rows, [{ n: 2 }], "B's start");
+  const s = await as(null, null, `select activity_author from sessions where id = '${SB2}'`);
+  eq(s.rows, [{ activity_author: null }], "author (B has no name)");
+  await as(null, null, `delete from sessions where id in ('${SA2}', '${SB2}')`);
 });
-await check("24: another teacher can't edit, add words to, or delete A's draft", async () => {
-  const u = await as(B, "authenticated", `update activities set name = 'Hacked' where id = '${TA}' returning id`);
-  const uw = await as(B, "authenticated", `update activity_words set word = 'ZZ' where activity_id = '${TA}' returning id`);
-  const dw = await as(B, "authenticated", `delete from activity_words where activity_id = '${TA}' returning id`);
-  const d = await as(B, "authenticated", `delete from activities where id = '${TA}' returning id`);
+await check("25: another teacher can't edit, add words to, or delete a teacher's draft, or move a word into it", async () => {
+  const DR = "ac710000-0000-0000-0000-000000000000";
+  await as(B, "authenticated", `insert into activities (id, name) values ('${DR}', 'Draft')`);
+  await as(B, "authenticated", `insert into activity_words (activity_id, position, word) values ('${DR}', 0, 'EF')`);
+  const u = await as(A, "authenticated", `update activities set name = 'Hacked' where id = '${DR}' returning id`);
+  const uw = await as(A, "authenticated", `update activity_words set word = 'ZZ' where activity_id = '${DR}' returning id`);
+  const dw = await as(A, "authenticated", `delete from activity_words where activity_id = '${DR}' returning id`);
+  const d = await as(A, "authenticated", `delete from activities where id = '${DR}' returning id`);
   eq([u.rows.length, uw.rows.length, dw.rows.length, d.rows.length], [0, 0, 0, 0], "rows changed");
-  await expectError(as(B, "authenticated", `insert into activity_words (activity_id, position, word) values ('${TA}', 5, 'EF')`), /row-level security/);
+  await expectError(as(A, "authenticated", `insert into activity_words (activity_id, position, word) values ('${DR}', 5, 'GH')`), /row-level security/);
+  await as(null, null, `delete from activities where id = '${DR}'`);
 });
-await check("24: a teacher can't see the admin's draft, add words to it, or move a word into it", async () => {
-  const D2 = "ac800000-0000-0000-0000-000000000000";
-  await as(D, "authenticated", `insert into activities (id, name) values ('${D2}', 'Admin draft')`);
-  eq(await visible(A, D2), [0, 0], "A sees the admin's draft");
-  await expectError(as(A, "authenticated", `insert into activity_words (activity_id, position, word) values ('${D2}', 0, 'EF')`), /row-level security/);
-  await expectError(as(A, "authenticated", `update activity_words set activity_id = '${D2}' where activity_id = '${TA}' and position = 0`), /row-level security/);
-  await as(D, "authenticated", `delete from activities where id = '${D2}'`);
+await check("25: un-sharing: other teachers can't start it any more; their earlier sessions keep their words", async () => {
+  const SB = "5f810000-0000-0000-0000-000000000000", SB3 = "5f820000-0000-0000-0000-000000000000";
+  await as(null, null, `insert into sessions (id, teacher_id, name) values ('${SB}', '${B}', 'b1'), ('${SB3}', '${B}', 'b2')`);
+  eq((await startAct(B, SB, ACT)).rows, [{ n: 3 }], "B runs the shared one");
+  await as(A, "authenticated", `update activities set shared = false where id = '${ACT}'`);
+  await expectError(startAct(B, SB3, ACT), /Only a published activity/);
+  eq((await sessionWords(SB)).rows.length, 3, "B's earlier session");
+  const s = await as(null, null, `select activity_id, activity_name, activity_author from sessions where id = '${SB}'`);
+  eq(s.rows, [{ activity_id: ACT, activity_name: "Animals", activity_author: "Alice" }], "session kept");
+  await as(A, "authenticated", `update activities set shared = true where id = '${ACT}'`);
+  await as(null, null, `delete from sessions where id in ('${SB}', '${SB3}')`);
 });
-await check("24: only an admin changes shared (teacher refused on own activity, admin allowed on any)", async () => {
-  await expectError(as(A, "authenticated", `update activities set shared = true where id = '${TA}'`), /Only an admin can change whether/);
-  await as(D, "authenticated", `update activities set shared = true where id = '${TA}'`);
-  await as(D, "authenticated", `update activities set shared = false where id = '${TA}'`);
-  const r = await as(null, null, `select shared from activities where id = '${TA}'`);
-  eq(r.rows, [{ shared: false }], "shared");
-});
-await check("24: A publishes, hides, un-hides their own; still private; the edit lock holds for A", async () => {
-  await as(A, "authenticated", `update activities set status = 'published' where id = '${TA}'`);
-  eq(await visible(B, TA), [0, 0], "B sees published private");
-  await expectError(as(A, "authenticated", `update activities set name = 'Again' where id = '${TA}'`), /can't be edited/);
-  await expectError(as(A, "authenticated", `delete from activity_words where activity_id = '${TA}'`), /can't be changed/);
-  await as(A, "authenticated", `update activities set status = 'hidden' where id = '${TA}'`);
-  eq(await visible(A, TA), [1, 2], "A still sees own hidden");
-  await as(A, "authenticated", `update activities set status = 'published' where id = '${TA}'`);
-  const d = await as(A, "authenticated", `delete from activities where id = '${TA}' returning id`);
-  eq(d.rows.length, 0, "A deleted a published one");
-});
-await check("24: duplicate: B can't copy A's private one; an admin's copy of it is shared", async () => {
-  await expectError(as(B, "authenticated", `select duplicate_activity('${TA}')`), /No such activity/);
-  const id = (await as(D, "authenticated", `select duplicate_activity('${TA}') as id`)).rows[0].id;
-  const r = await as(null, null, `select name, shared, created_by, status from activities where id = '${id}'`);
-  eq(r.rows, [{ name: "Mine 2 (copy)", shared: true, created_by: D, status: "draft" }], "copy");
-  await as(null, null, `delete from activities where id = '${id}'`);
-});
-await check("24: start: A runs their own private activity; B and an admin can't run it", async () => {
-  const SA2 = "5f700000-0000-0000-0000-000000000000", SB2 = "5f800000-0000-0000-0000-000000000000", SD2 = "5f900000-0000-0000-0000-000000000000";
-  await as(null, null, `insert into sessions (id, teacher_id, name) values ('${SA2}', '${A}', 'a'), ('${SB2}', '${B}', 'b'), ('${SD2}', '${D}', 'd')`);
-  eq((await startAct(A, SA2, TA)).rows, [{ n: 2 }], "A's start");
-  await expectError(startAct(B, SB2, TA), /Only a published activity/);
-  await expectError(startAct(D, SD2, TA), /Only a published activity/);
-  eq((await startAct(B, SB2, ACT)).rows, [{ n: 3 }], "B runs the shared one");
-  await as(null, null, `delete from sessions where id in ('${SA2}', '${SB2}', '${SD2}')`);
-});
-await check("24: migration 24 runs again without changing anything", async () => {
-  await db.exec(readFileSync(join(migDir, "20261111120900_teacher_activities.sql"), "utf8"));
-  const r = await as(null, null, `select name, shared from activities where id in ('${ACT}', '${TA}') order by name`);
-  eq(r.rows, [{ name: "Animals", shared: true }, { name: "Mine 2", shared: false }], "shared kept");
+await check("25 + 26: both migrations run again without changing anything", async () => {
+  await db.exec(readFileSync(join(migDir, "20261112120100_teacher_owned_activities.sql"), "utf8"));
+  await db.exec(readFileSync(join(migDir, "20261112120200_maintenance_mode.sql"), "utf8"));
+  const r = await as(null, null, `select name, shared, author_name from activities where id in ('${ACT}', '${TB}') order by name`);
+  eq(r.rows, [{ name: "Animals", shared: true, author_name: "Alice" }, { name: "Mine", shared: false, author_name: null }], "kept");
   const p = await as(null, null, `select count(*)::int as n from pg_policies where tablename in ('activities', 'activity_words')`);
   eq(p.rows, [{ n: 10 }], "policies");
-  await as(A, "authenticated", `update activities set status = 'hidden' where id = '${TA}'`);
-  await as(null, null, `delete from activities where id = '${TA}'`);
+  const a = await as(null, null, `select count(*)::int as n, bool_or(maintenance) as on from app_settings`);
+  eq(a.rows, [{ n: 1, on: false }], "app_settings");
+  // start_activity_session still has the maintenance check (26 runs after 25)
+  const f = await as(null, null, `select prosrc like '%maintenance_blocks_me%' as ok from pg_proc where proname = 'start_activity_session'`);
+  eq(f.rows, [{ ok: true }], "function");
+});
+
+// ── 26 maintenance mode ──────────────────────────────────────────────────────
+const RUN = "5fa00000-0000-0000-0000-000000000000", PEND = "5fb00000-0000-0000-0000-000000000000";
+const RUNW = "1fa00000-0000-0000-0000-000000000000";
+const DRAFT = "ac900000-0000-0000-0000-000000000000";
+const expectDT002 = async (p) => {
+  try { await p; } catch (e) {
+    if (e.code === "DT002" && /Maintenance mode is on/.test(e.message)) return;
+    throw new Error(`wrong error: ${e.code} ${e.message}`);
+  }
+  throw new Error("expected DT002, got none");
+};
+await check("26: app_settings: signed-in users read the one row; only an admin changes it; anon nothing", async () => {
+  eq((await as(A, "authenticated", `select maintenance from app_settings`)).rows, [{ maintenance: false }], "teacher reads");
+  eq((await as(A, "authenticated", `update app_settings set maintenance = true returning id`)).rows.length, 0, "teacher update");
+  await expectError(as(A, "authenticated", `insert into app_settings (id) values (true)`), /permission denied/);
+  await expectError(as(A, "authenticated", `delete from app_settings`), /permission denied/);
+  await expectError(as(null, "anon", `select * from app_settings`), /permission denied/);
+  await expectError(as(null, null, `insert into app_settings (id) values (false)`), /app_settings_single_row/);
+});
+await check("26: setup before it's on: A's draft, a pending and a running session", async () => {
+  await as(A, "authenticated", `insert into activities (id, name) values ('${DRAFT}', 'Maint draft')`);
+  await as(null, null, `insert into sessions (id, teacher_id, name, status) values ('${PEND}', '${A}', 'pend', 'pending'), ('${RUN}', '${A}', 'run', 'in_progress')`);
+  await as(null, null, `insert into session_words (id, session_id, word, order_index) values ('${RUNW}', '${RUN}', 'HAT', 0)`);
+  await as(null, "service_role", `insert into word_attempts (student_id, session_id, session_word_id, word, is_correct, graded_by, tries)
+    values ('${ANA}', '${RUN}', '${RUNW}', 'HAT', false, 'missed', 0)`);
+});
+await check("26: an admin turns it on: started_at / set_by set by the database, message trimmed, maintenance_on logged", async () => {
+  const r = await as(D, "authenticated", `update app_settings set maintenance = true, maintenance_message = '  Back at 3  ',
+    maintenance_set_by = '${A}', maintenance_started_at = '2000-01-01' returning maintenance_set_by, maintenance_message,
+    maintenance_started_at > now() - interval '1 minute' as recent`);
+  eq(r.rows, [{ maintenance_set_by: D, maintenance_message: "Back at 3", recent: true }], "row");
+  const l = await as(null, null, `select level, source, event, message, user_id from system_logs where event like 'maintenance%'`);
+  eq(l.rows, [{ level: "warn", source: "server", event: "maintenance_on", message: "Maintenance mode turned on: Back at 3", user_id: D }], "log");
+  eq((await as(A, "authenticated", `select maintenance_on() as on, maintenance_blocks_me() as me`)).rows, [{ on: true, me: true }], "teacher");
+  eq((await as(D, "authenticated", `select maintenance_blocks_me() as me`)).rows, [{ me: false }], "admin");
+});
+await check("26: teacher refused (DT002): create / start a session, start an activity", async () => {
+  await expectDT002(as(A, "authenticated", `insert into sessions (teacher_id, name) values ('${A}', 'x')`));
+  await expectDT002(as(A, "authenticated", `update sessions set status = 'in_progress', started_at = now() where id = '${PEND}'`));
+  await expectDT002(as(A, "authenticated", `update sessions set status = 'paused' where id = '${PEND}'`));
+  await expectDT002(startAct(A, PEND, ACT));
+});
+await check("26: teacher refused (DT002): create, edit, publish, share, delete, duplicate activities; any word change", async () => {
+  await expectDT002(as(A, "authenticated", `insert into activities (name) values ('x')`));
+  await expectDT002(as(A, "authenticated", `update activities set description = 'x' where id = '${DRAFT}'`));
+  await expectDT002(as(A, "authenticated", `update activities set status = 'published' where id = '${DRAFT}'`));
+  await expectDT002(as(A, "authenticated", `update activities set shared = false where id = '${ACT}'`));
+  await expectDT002(as(A, "authenticated", `delete from activities where id = '${DRAFT}'`));
+  await expectDT002(as(B, "authenticated", `select duplicate_activity('${ACT}')`));
+  await expectDT002(as(A, "authenticated", `insert into activity_words (activity_id, position, word) values ('${DRAFT}', 0, 'HI')`));
+});
+await check("26: teacher can still read everything, and a started session carries on", async () => {
+  eq((await visible(A, ACT))[0], 1, "reads activities");
+  await as(A, "authenticated", `update sessions set current_index = 1 where id = '${RUN}'`);       // Next
+  await as(A, "authenticated", `update sessions set status = 'paused' where id = '${RUN}'`);       // Pause
+  await as(A, "authenticated", `update sessions set status = 'in_progress' where id = '${RUN}'`);  // Resume
+  await as(A, "authenticated", `insert into session_words (session_id, word, order_index) values ('${RUN}', 'MAP', 1)`); // Live word
+  eq((await as(A, "authenticated", `update word_attempts set is_correct = true, needs_review = false, graded_by = 'teacher'
+    where session_word_id = '${RUNW}' returning id`)).rows.length, 1, "grade");
+  await as(A, "authenticated", `update sessions set status = 'finished', finished_at = now() where id = '${RUN}'`); // Finish
+  await as(A, "authenticated", `update sessions set reviewed_at = now() where id = '${RUN}'`);     // Done reviewing
+  eq((await as(null, null, `select status from sessions where id = '${RUN}'`)).rows, [{ status: "finished" }], "finished");
+});
+await check("26: not blocked: the device (service role), the admin, the SQL editor", async () => {
+  await as(null, "service_role", `insert into answer_attempts (session_word_id, student_id, attempt_no, result) values ('${RUNW}', '${ANA}', 1, 'wrong')`);
+  await as(D, "authenticated", `update activities set status = 'hidden' where id = '${ACT}'`);
+  await as(D, "authenticated", `update activities set status = 'published' where id = '${ACT}'`);
+  await as(null, null, `update activities set description = 'by hand' where id = '${DRAFT}'`);
+});
+await check("26: an admin turns it off: maintenance_off logged, started_at cleared, set_by = who turned it off; teacher unblocked", async () => {
+  const r = await as(D, "authenticated", `update app_settings set maintenance = false returning maintenance_started_at, maintenance_set_by, maintenance_message`);
+  eq(r.rows, [{ maintenance_started_at: null, maintenance_set_by: D, maintenance_message: "Back at 3" }], "row");
+  const l = await as(null, null, `select event, message from system_logs where event = 'maintenance_off'`);
+  eq(l.rows, [{ event: "maintenance_off", message: "Maintenance mode turned off" }], "log");
+  await as(A, "authenticated", `update sessions set status = 'in_progress', started_at = now() where id = '${PEND}'`);
+  await as(A, "authenticated", `delete from activities where id = '${DRAFT}'`);
+  await as(null, null, `delete from sessions where id in ('${RUN}', '${PEND}')`);
+});
+await check("26: changing only the message logs nothing; the SQL editor can switch it off in an emergency", async () => {
+  await as(D, "authenticated", `update app_settings set maintenance = true`);
+  await as(D, "authenticated", `update app_settings set maintenance_message = 'New text'`);
+  await as(null, null, `update app_settings set maintenance = false`);
+  const l = await as(null, null, `select event, user_id from system_logs where event like 'maintenance%' order by created_at, event`);
+  eq(l.rows.map((x) => x.event).sort(), ["maintenance_off", "maintenance_off", "maintenance_on", "maintenance_on"], "logs");
+  eq((await as(null, null, `select maintenance, maintenance_set_by from app_settings`)).rows, [{ maintenance: false, maintenance_set_by: null }], "off");
 });
 
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
