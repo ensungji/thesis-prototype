@@ -1,10 +1,13 @@
 // mobile/lib/activities.ts
-// Activities (word lists run as a session, migrations 16–17 and 24): types,
+// Activities (word lists run as a session, migrations 16–17, 24, 25): types,
 // the word-list parser, and the database calls the Activities screens use.
 //
-// Admin-made activities are shared (every teacher sees them once published);
-// a teacher's own are private (that teacher and admins). The creator or an
-// admin manages one; anyone who can see one can duplicate it (migration 24).
+// Teachers own activities (migration 25). The teacher who made one edits the
+// draft, publishes it, deletes the draft, and shares / un-shares it once it's
+// published ("Share with all teachers"). Other teachers see shared published
+// ones, run them and duplicate them (the copy is their own private draft).
+// Admins only oversee: they read every activity and hide / unhide published
+// ones. status "hidden" always means hidden by an admin.
 //
 // The database enforces the rules (RLS + triggers); these helpers only make
 // the calls and pass its error messages on, e.g. "Add at least one word
@@ -27,9 +30,12 @@ export type Activity = {
   published_at: string | null;
   created_by: string | null;
   shared: boolean;
-  /** The creator's name. Only an admin can read other people's profiles, so a
-   *  teacher gets null for anyone but themselves. */
-  creator_name: string | null;
+  /** The creator's name, copied when it was made (teachers can't read each
+   *  other's profiles). Empty if their profile had no name. */
+  author_name: string | null;
+  /** When / which admin hid it (status "hidden"). */
+  hidden_at: string | null;
+  hidden_by: string | null;
   word_count: number;
 };
 
@@ -41,16 +47,32 @@ export const ACTIVITY_ROUTE: Record<ActivitiesArea, string> = {
   teacher: "/(teacher)/sessions/activity",
 };
 
-/** Admins manage every activity; a teacher manages the ones they made. */
+/** Only the teacher who made an activity manages it (edit, publish, share,
+ *  delete the draft). Admins never do: they only hide / unhide. */
 export function canManage(activity: Pick<Activity, "created_by">, area: ActivitiesArea, me: string | null): boolean {
-  return area === "admin" || (!!me && activity.created_by === me);
+  return area === "teacher" && !!me && activity.created_by === me;
 }
 
-/** "Made by Ms. Cruz" / "Made by you" / "Made by a deleted account" */
-export function creatorLabel(activity: Pick<Activity, "created_by" | "creator_name">, me: string | null): string {
-  if (!activity.created_by) return "Made by a deleted account";
-  if (activity.created_by === me) return "Made by you";
-  return `Made by ${activity.creator_name || "a teacher"}`;
+/** "Ms. Cruz", or "a teacher" when the name is empty. */
+export function authorName(author: string | null | undefined): string {
+  return author?.trim() || "a teacher";
+}
+
+/** "by Ms. Cruz" */
+export function byAuthor(activity: Pick<Activity, "author_name">): string {
+  return `by ${authorName(activity.author_name)}`;
+}
+
+/** The status as its owner sees it: "Hidden by admin" instead of "Hidden". */
+export function ownerStatusLabel(status: ActivityStatus): string {
+  return status === "hidden" ? "Hidden by admin" : STATUS_LABEL[status];
+}
+
+/** For an activity session: "Animals · by Ms. Cruz" (or just the name for a
+ *  session started before migration 25 copied the author). */
+export function activitySessionLabel(name: string | null | undefined, author: string | null | undefined): string {
+  if (!name) return "";
+  return author?.trim() ? `${name} · by ${author.trim()}` : name;
 }
 
 export type ActivityWord = {
@@ -133,14 +155,13 @@ export async function myUserId(): Promise<string | null> {
   return data.session?.user.id ?? null;
 }
 
-// creator: the one foreign key from activities to profiles (created_by)
 const ACTIVITY_COLUMNS =
-  "id, name, description, level, status, created_at, published_at, created_by, shared, creator:profiles(full_name)";
+  "id, name, description, level, status, created_at, published_at, created_by, shared, author_name, hidden_at, hidden_by";
 
-type ActivityRow = Omit<Activity, "word_count" | "creator_name"> & { creator: { full_name: string | null } | null };
+type ActivityRow = Omit<Activity, "word_count">;
 
-function toActivity({ creator, ...a }: ActivityRow, word_count: number): Activity {
-  return { ...a, creator_name: creator?.full_name ?? null, word_count };
+function toActivity(a: ActivityRow, word_count: number): Activity {
+  return { ...a, word_count };
 }
 
 /** Every activity this user can see (RLS): all for an admin; shared published + own for a teacher. */
@@ -191,11 +212,36 @@ export async function updateActivityDetails(id: string, d: ActivityDetails): Pro
   return error ? fail(error) : { data: true, error: null };
 }
 
-/** draft → published, published ↔ hidden. The database refuses anything else. */
-export async function setActivityStatus(id: string, status: ActivityStatus): Promise<Result<true>> {
-  const { data, error } = await supabase.from("activities").update({ status }).eq("id", id).select("id");
+/** The owner publishes a draft, shared with every teacher or not (one update). */
+export async function publishActivity(id: string, shared: boolean): Promise<Result<true>> {
+  const { data, error } = await supabase
+    .from("activities")
+    .update({ status: "published", shared })
+    .eq("id", id)
+    .select("id");
   if (error) return fail(error);
-  if (!data?.length) return { data: null, error: "Nothing changed. Only the person who made it, or an admin, can change it." };
+  if (!data?.length) return { data: null, error: "Nothing changed. Only the teacher who made it can publish it." };
+  return { data: true, error: null };
+}
+
+/** The owner shares / un-shares a published activity. Sessions that already
+ *  used it keep their own copy of the words, so nothing else changes. */
+export async function setActivityShared(id: string, shared: boolean): Promise<Result<true>> {
+  const { data, error } = await supabase.from("activities").update({ shared }).eq("id", id).select("id");
+  if (error) return fail(error);
+  if (!data?.length) return { data: null, error: "Nothing changed. Only the teacher who made it can share it." };
+  return { data: true, error: null };
+}
+
+/** Admin moderation: published ↔ hidden. The database refuses anything else. */
+export async function setActivityHidden(id: string, hidden: boolean): Promise<Result<true>> {
+  const { data, error } = await supabase
+    .from("activities")
+    .update({ status: hidden ? "hidden" : "published" })
+    .eq("id", id)
+    .select("id");
+  if (error) return fail(error);
+  if (!data?.length) return { data: null, error: "Nothing changed. Only an admin can hide or unhide an activity." };
   return { data: true, error: null };
 }
 
@@ -207,8 +253,8 @@ export async function deleteDraft(id: string): Promise<Result<true>> {
   return { data: true, error: null };
 }
 
-/** Copies an activity this user can see into a new draft they own; returns the new id.
- *  The copy is shared only when an admin makes it (migration 24 trigger). */
+/** Copies an activity this teacher can see into a new private draft they own;
+ *  returns the new id. A hidden activity can't be copied (migration 25). */
 export async function duplicateActivity(id: string): Promise<Result<string>> {
   const { data, error } = await supabase.rpc("duplicate_activity", { p_activity: id });
   if (error) return fail(error);

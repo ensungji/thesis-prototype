@@ -52,6 +52,7 @@ import {
   saveWordDurations,
   SessionType,
 } from "../../../lib/session-timer";
+import { activitySessionLabel } from "../../../lib/activities";
 
 // Timed Sequence: the student break between words. The display is cleared for
 // this long (rest for the student, cooling for the solenoids). Pause / resume
@@ -71,6 +72,7 @@ type Session = {
   // Activity sessions (migration 18)
   activity_id?: string | null;
   activity_name?: string | null;
+  activity_author?: string | null; // copied at start (migration 25)
   current_index?: number | null;
   reviewed_at?: string | null; // "Done reviewing" (migration 23)
 };
@@ -2478,6 +2480,12 @@ export default function SessionDetail() {
             {session.purpose && (
               <Text style={styles.sessionPurpose}>{session.purpose}</Text>
             )}
+            {isActivitySession(session.type) && !!session.activity_name && (
+              <Text style={styles.sessionPurpose}>
+                <Ionicons name="list-outline" size={13} color={C.muted} />
+                {` ${activitySessionLabel(session.activity_name, session.activity_author)}`}
+              </Text>
+            )}
             <View style={styles.infoRow}>
               <View style={[styles.badge, { backgroundColor: C.blueWash }]}>
                 <Text style={[styles.badgeText, { color: C.navy }]}>
@@ -2739,7 +2747,7 @@ export default function SessionDetail() {
           {isActivitySession(session.type) && (
             <>
               <Text style={[styles.sectionLabel, { marginTop: 4 }]}>
-                ACTIVITY{session.activity_name ? ` · ${session.activity_name.toUpperCase()}` : ""}
+                ACTIVITY{session.activity_name ? ` · ${session.activity_name.toUpperCase()}` : ""}{session.activity_author ? ` · by ${session.activity_author}` : ""}
               </Text>
               <Text style={styles.sectionHint}>
                 {`${sessionWords.length} word${sessionWords.length === 1 ? "" : "s"}, in this order. You move from word to word with Next and Previous; there's no timer.`}
@@ -2981,6 +2989,12 @@ export default function SessionDetail() {
             <Text style={styles.sessionName}>{session.name}</Text>
             {session.purpose && (
               <Text style={styles.sessionPurpose}>{session.purpose}</Text>
+            )}
+            {isActivitySession(session.type) && !!session.activity_name && (
+              <Text style={styles.sessionPurpose}>
+                <Ionicons name="list-outline" size={13} color={C.muted} />
+                {` ${activitySessionLabel(session.activity_name, session.activity_author)}`}
+              </Text>
             )}
             <View style={styles.infoRow}>
               <View
@@ -3644,7 +3658,7 @@ export default function SessionDetail() {
                   <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flex: 1 }}>
                     <Ionicons name="list-outline" size={16} color={C.navy} />
                     <Text style={styles.cardLabel} numberOfLines={1}>
-                      ACTIVITY{session.activity_name ? ` · ${session.activity_name.toUpperCase()}` : ""}
+                      ACTIVITY{session.activity_name ? ` · ${session.activity_name.toUpperCase()}` : ""}{session.activity_author ? ` · by ${session.activity_author}` : ""}
                     </Text>
                   </View>
                   <View style={styles.activeDisplayBadge}>

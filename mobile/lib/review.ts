@@ -47,6 +47,8 @@ export type ReviewSession = {
   type: string;
   status: string;
   reviewed_at?: string | null; // migration 23
+  activity_name?: string | null; // activity sessions (migration 18)
+  activity_author?: string | null; // migration 25
 };
 
 export type ReviewData = {

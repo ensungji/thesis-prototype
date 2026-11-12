@@ -1,12 +1,14 @@
 // mobile/components/activities/ActivityListScreen.tsx
 // The Activities list, used by two routes:
 //   admin    app/admin/activities.tsx: every activity, filtered by status,
-//            each showing who made it ("Private" = a teacher's own).
+//            each "by <author> · Shared/Private · <status>".
 //   teacher  app/(teacher)/sessions/activities.tsx: two tabs.
-//              Mine    the teacher's own, any status, filtered by status; New Activity
-//              Shared  the admin's published activities (read-only, Duplicate)
-// Tapping one opens ActivityEditorScreen (editor for a draft the user manages,
-// read-only otherwise). RLS decides what each user gets (migration 24).
+//              Mine    the teacher's own, any status, filtered by status
+//                      (Hidden = hidden by an admin); New Activity
+//              Shared  other teachers' shared published activities,
+//                      "<name> · by <author>" (read-only, Duplicate)
+// Tapping one opens ActivityEditorScreen (editor for the teacher's own draft,
+// read-only otherwise). RLS decides what each user gets (migrations 24, 25).
 
 import { useCallback, useState } from "react";
 import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
@@ -21,10 +23,11 @@ import {
   type ActivityDetails,
   type ActivityStatus,
   ACTIVITY_ROUTE,
+  byAuthor,
   createActivity,
-  creatorLabel,
   listActivities,
   myUserId,
+  ownerStatusLabel,
   STATUS_COLORS,
   STATUS_LABEL,
 } from "../../lib/activities";
@@ -37,22 +40,26 @@ const FILTER_LABEL: Record<Filter, string> = { all: "All", ...STATUS_LABEL };
 
 type Tab = "mine" | "shared";
 
+type RowVariant = "mine" | "shared" | "admin";
+
 function ActivityRow({
   activity,
   onPress,
-  owner,
-  showStatus,
+  variant,
 }: {
   activity: Activity;
   onPress: () => void;
-  /** "Made by …" line (admin list) */
-  owner?: string;
-  showStatus: boolean;
+  /** mine: status badge + Shared / Private; shared: "· by <author>";
+   *  admin: "by <author> · Shared/Private · <status>" */
+  variant: RowVariant;
 }) {
   const level = activity.level ? DIFFICULTY_META[activity.level] : null;
   const status = STATUS_COLORS[activity.status];
   const words = `${activity.word_count} word${activity.word_count === 1 ? "" : "s"}`;
-  const isPrivate = !!owner && !activity.shared;
+  const sharing = activity.shared ? "Shared" : "Private";
+  // a draft is always private, so the tag only says something once published
+  const showSharing = variant === "mine" && activity.status !== "draft";
+  const adminLine = `${byAuthor(activity)} · ${sharing} · ${STATUS_LABEL[activity.status]}`;
   return (
     <Pressable
       onPress={onPress}
@@ -60,11 +67,12 @@ function ActivityRow({
       accessibilityRole="button"
       accessibilityLabel={[
         activity.name,
+        variant === "shared" ? byAuthor(activity) : undefined,
         level?.label,
         words,
-        owner,
-        isPrivate ? "private" : undefined,
-        showStatus ? STATUS_LABEL[activity.status] : undefined,
+        showSharing ? sharing : undefined,
+        variant === "mine" ? ownerStatusLabel(activity.status) : undefined,
+        variant === "admin" ? adminLine : undefined,
       ]
         .filter(Boolean)
         .join(", ")}
@@ -72,6 +80,7 @@ function ActivityRow({
       <View style={styles.cardInfo}>
         <Text style={styles.cardName} numberOfLines={2}>
           {activity.name}
+          {variant === "shared" && <Text style={styles.cardBy}>{` · ${byAuthor(activity)}`}</Text>}
         </Text>
         <View style={styles.metaRow}>
           {level && (
@@ -80,22 +89,22 @@ function ActivityRow({
             </View>
           )}
           <Text style={styles.meta}>{words}</Text>
-          {isPrivate && (
+          {showSharing && (
             <View style={styles.privateBadge}>
-              <Ionicons name="lock-closed-outline" size={10} color={C.muted} />
-              <Text style={styles.privateText}>Private</Text>
+              <Ionicons name={activity.shared ? "people-outline" : "lock-closed-outline"} size={10} color={C.muted} />
+              <Text style={styles.privateText}>{sharing}</Text>
             </View>
           )}
         </View>
-        {!!owner && (
+        {variant === "admin" && (
           <Text style={styles.owner} numberOfLines={1}>
-            {owner}
+            {adminLine}
           </Text>
         )}
       </View>
-      {showStatus && (
+      {variant === "mine" && (
         <View style={[styles.status, { backgroundColor: status.bg }]}>
-          <Text style={[styles.statusText, { color: status.text }]}>{STATUS_LABEL[activity.status]}</Text>
+          <Text style={[styles.statusText, { color: status.text }]}>{ownerStatusLabel(activity.status)}</Text>
         </View>
       )}
       <Ionicons name="chevron-forward" size={16} color={C.muted} />
@@ -154,7 +163,7 @@ export function ActivityListScreen({ area }: { area: ActivitiesArea }) {
   }
 
   // Teacher tabs: Mine = made by this teacher (any status); Shared = the rest
-  // (RLS only returns shared published ones). An admin sees one list.
+  // (RLS only returns other teachers' shared published ones). An admin sees one list.
   const mine = activities.filter((a) => !!me && a.created_by === me);
   const shared = activities.filter((a) => !me || a.created_by !== me);
   const onShared = !isAdmin && tab === "shared";
@@ -171,12 +180,12 @@ export function ActivityListScreen({ area }: { area: ActivitiesArea }) {
     ? "No activities yet"
     : "You haven't made an activity yet";
   const emptyBody = onShared
-    ? "Activities the admin publishes show up here. Duplicate one to make your own copy."
+    ? "Activities other teachers publish and share show up here. Duplicate one to make your own copy."
     : filter !== "all"
     ? ""
     : isAdmin
     ? "Tap New Activity to make the first word list."
-    : "Tap New Activity to make a word list only you can see, or duplicate one from Shared.";
+    : "Tap New Activity to make a word list. It stays private until you publish it and share it.";
 
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
@@ -270,8 +279,7 @@ export function ActivityListScreen({ area }: { area: ActivitiesArea }) {
             <ActivityRow
               activity={item}
               onPress={() => openActivity(item.id)}
-              owner={isAdmin ? creatorLabel(item, me) : undefined}
-              showStatus={!onShared}
+              variant={isAdmin ? "admin" : onShared ? "shared" : "mine"}
             />
           )}
           ListEmptyComponent={
@@ -378,6 +386,7 @@ const styles = StyleSheet.create({
   },
   cardInfo: { flex: 1, gap: 6 },
   cardName: { fontFamily: fonts.heading, fontSize: 16, color: C.navy },
+  cardBy: { fontFamily: fonts.body, fontSize: 14, color: C.muted },
   metaRow: { flexDirection: "row", alignItems: "center", gap: 8 },
   meta: { fontFamily: fonts.body, fontSize: 13, color: C.muted },
   badge: { paddingHorizontal: 8, paddingVertical: 2, borderRadius: 100, borderWidth: 1 },

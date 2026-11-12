@@ -16,6 +16,7 @@ import { supabase } from "../../../lib/supabase";
 import { updateOrQueue } from "../../../lib/outbox";
 import { colors as C, fonts, MIN_TOUCH } from "../../../lib/theme";
 import { getSessionTypeLabel } from "../../../lib/session-timer";
+import { activitySessionLabel } from "../../../lib/activities";
 import {
   type ReviewAttempt,
   type ReviewData,
@@ -200,6 +201,11 @@ export default function SessionReview() {
         {data && (
           <Text style={styles.subtitle} numberOfLines={1}>
             {data.session.name} · {getSessionTypeLabel(data.session.type)}
+          </Text>
+        )}
+        {!!data?.session.activity_name && (
+          <Text style={styles.subtitle} numberOfLines={1}>
+            {activitySessionLabel(data.session.activity_name, data.session.activity_author)}
           </Text>
         )}
       </View>

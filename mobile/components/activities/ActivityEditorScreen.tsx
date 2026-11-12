@@ -1,12 +1,15 @@
 // mobile/components/activities/ActivityEditorScreen.tsx
 // One activity, used by app/admin/activity.tsx and app/(teacher)/sessions/activity.tsx.
-// What the user can do depends on who manages it (an admin: every activity;
-// a teacher: the ones they made, migration 24):
-//   Draft they manage:         edit details; add words (typed, pasted list, Word
-//                              Bank); time per word; reorder; remove; Publish; Delete.
-//   Published / hidden one
-//   they manage:               read-only words; Duplicate; Hide / Unhide.
-//   A shared one (teacher):    read-only words; Duplicate (the copy is theirs, private).
+// What the user can do (migration 25: teachers own activities, admins oversee):
+//   Teacher, own draft:        edit details; add words (typed, pasted list, Word
+//                              Bank); time per word; reorder; remove; Publish
+//                              (optionally shared at once); Delete.
+//   Teacher, own published:    read-only words; "Share with all teachers" switch;
+//                              Duplicate.
+//   Teacher, own hidden:       read-only; "Hidden by admin" (only an admin unhides).
+//   Teacher, someone else's:   read-only words, "by <author>"; Duplicate (the
+//                              copy is their own private draft).
+//   Admin:                     read-only; Hide / Unhide a published one.
 // Every change is saved right away. The database has the final say (migration
 // 16: a published activity and its words can't change), and its message is
 // shown when it refuses something.
@@ -15,6 +18,7 @@ import { type ReactNode, useCallback, useEffect, useState } from "react";
 import {
   KeyboardAvoidingView,
   Modal,
+  Switch,
   Platform,
   Pressable,
   ScrollView,
@@ -38,18 +42,21 @@ import {
   type DroppedWord,
   ACTIVITY_ROUTE,
   addWords,
+  byAuthor,
   canManage,
   clampActivityDuration,
-  creatorLabel,
   deleteDraft,
   describeDropped,
   duplicateActivity,
   getActivity,
   myUserId,
+  ownerStatusLabel,
   parseWordList,
+  publishActivity,
   removeWord,
   savePositions,
-  setActivityStatus,
+  setActivityHidden,
+  setActivityShared,
   setWordDuration,
   STATUS_COLORS,
   STATUS_LABEL,
@@ -66,13 +73,17 @@ type AddNotice = { added: string[]; dropped: DroppedWord[] } | null;
 
 /** Who sees it, in one line, from where the user stands. */
 function visibilityLine(activity: Activity, area: ActivitiesArea, me: string | null): string {
+  if (area === "admin") return `${byAuthor(activity)} · ${activity.shared ? "Shared" : "Private"}`;
   const mine = !!me && activity.created_by === me;
-  if (area === "teacher" && !mine) return "Shared by the admin with every teacher";
-  const whose = area === "admin" ? `${creatorLabel(activity, me)} · ` : "";
-  if (activity.shared) {
-    return whose + (activity.status === "draft" ? "Every teacher will see it once published" : "Shared with every teacher");
-  }
-  return whose + (mine ? "Private: only you and admins see it" : "Private: only its teacher and admins see it");
+  if (!mine) return `Shared ${byAuthor(activity)} with every teacher`;
+  if (activity.status === "draft") return "Private draft: only you (and admins) see it";
+  if (activity.status === "hidden") return "Hidden by admin: other teachers can't see or run it";
+  return activity.shared ? "Shared with every teacher" : "Private: only you (and admins) see it";
+}
+
+function shortDate(iso: string | null): string {
+  if (!iso) return "";
+  return new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 }
 
 export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
@@ -104,11 +115,14 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
   const [timeWord, setTimeWord] = useState<ActivityWord | null>(null);
   const [timeValue, setTimeValue] = useState(20);
   const [publishOpen, setPublishOpen] = useState(false);
+  const [publishShared, setPublishShared] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
 
-  // manage: may publish / hide / delete it. isDraft: a draft they manage (editable).
+  // manage: the teacher who made it (edit, publish, share, delete the draft).
+  // isDraft: a draft they manage (editable). moderate: an admin (hide / unhide).
   const manage = !!activity && canManage(activity, area, me);
   const isDraft = manage && activity?.status === "draft";
+  const moderate = area === "admin";
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -253,8 +267,9 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
 
   async function publish() {
     if (!activity) return;
+    const shared = publishShared;
     setBusy(true);
-    const res = await setActivityStatus(activity.id, "published");
+    const res = await publishActivity(activity.id, shared);
     setBusy(false);
     setPublishOpen(false);
     if (res.error !== null) {
@@ -264,33 +279,51 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
     setNotice(null);
     await load();
     setToast({
-      message: "Published",
-      detail: activity.shared
-        ? "Every teacher can now run this activity."
-        : activity.created_by === me
-        ? "You can now run it from New Session › Activity."
-        : "Its teacher can now run it.",
+      message: shared ? "Published and shared" : "Published",
+      detail: shared
+        ? "Every teacher can now run it. You can run it from New Session › Activity."
+        : "You can now run it from New Session › Activity. Share it with all teachers any time.",
+      variant: "success",
+    });
+  }
+
+  async function toggleShared(next: boolean) {
+    if (!activity) return;
+    setBusy(true);
+    const res = await setActivityShared(activity.id, next);
+    setBusy(false);
+    if (res.error !== null) {
+      showError(next ? "Couldn't share" : "Couldn't stop sharing", res.error);
+      return;
+    }
+    setActivity({ ...activity, shared: next });
+    setToast({
+      message: next ? "Shared with all teachers" : "No longer shared",
+      detail: next
+        ? "Every teacher can now run it and duplicate it."
+        : "Other teachers no longer see it. Sessions already run keep their words.",
       variant: "success",
     });
   }
 
   async function toggleHidden() {
     if (!activity) return;
-    const next = activity.status === "hidden" ? "published" : "hidden";
+    const hide = activity.status !== "hidden";
     setBusy(true);
-    const res = await setActivityStatus(activity.id, next);
+    const res = await setActivityHidden(activity.id, hide);
     setBusy(false);
     if (res.error !== null) {
-      showError(next === "hidden" ? "Couldn't hide" : "Couldn't unhide", res.error);
+      showError(hide ? "Couldn't hide" : "Couldn't unhide", res.error);
       return;
     }
-    setActivity({ ...activity, status: next });
+    await load();
     setToast({
-      message: next === "hidden" ? "Hidden" : "Visible again",
-      detail:
-        next === "hidden"
-          ? `${activity.shared ? "Teachers no longer see it" : "It no longer shows in New Session"}. Past sessions keep their words.`
-          : "It can be run again.",
+      message: hide ? "Hidden" : "Visible again",
+      detail: hide
+        ? "Only its teacher sees it now, marked Hidden by admin. Past sessions keep their words."
+        : activity.shared
+        ? "Teachers can run it again."
+        : "Its teacher can run it again.",
       variant: "success",
     });
   }
@@ -355,7 +388,7 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
       <Header title={activity.name} onBack={() => router.back()}>
         <View style={[styles.status, { backgroundColor: status.bg }]}>
           <Text style={[styles.statusText, { color: status.text }]}>
-            {manage ? STATUS_LABEL[activity.status] : "Shared"}
+            {moderate ? STATUS_LABEL[activity.status] : manage ? ownerStatusLabel(activity.status) : "Shared"}
           </Text>
         </View>
       </Header>
@@ -385,7 +418,14 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
           </Text>
           {isDraft ? (
             <SmallButton icon="pencil-outline" label="Edit details" onPress={() => { setDetailsError(""); setDetailsOpen(true); }} disabled={busy} />
-          ) : (
+          ) : moderate ? (
+            <Text style={styles.lockedNote}>
+              <Ionicons name="eye-outline" size={12} color={C.muted} />
+              {activity.status === "draft"
+                ? " A draft is private to its teacher. Admins can view it."
+                : " Admins can view activities and hide or unhide published ones."}
+            </Text>
+          ) : activity.status === "hidden" ? null : (
             <Text style={styles.lockedNote}>
               <Ionicons name="lock-closed-outline" size={12} color={C.muted} />
               {manage
@@ -394,6 +434,42 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
             </Text>
           )}
         </View>
+
+        {/* Hidden by admin (its teacher, or an admin) */}
+        {activity.status === "hidden" && (
+          <View style={[styles.card, styles.hiddenCard]} accessibilityLiveRegion="polite">
+            <Text style={styles.sectionTitle}>
+              <Ionicons name="eye-off-outline" size={16} color={C.brown} /> Hidden by admin
+            </Text>
+            <Text style={styles.description}>
+              {moderate
+                ? `Hidden${activity.hidden_at ? ` on ${shortDate(activity.hidden_at)}` : ""}. Other teachers can't see or run it; its teacher sees it marked Hidden by admin and can't share or unhide it.`
+                : `An admin hid this activity${activity.hidden_at ? ` on ${shortDate(activity.hidden_at)}` : ""}. You can still view it, but it can't be run, shared or duplicated. Only an admin can unhide it.`}
+            </Text>
+          </View>
+        )}
+
+        {/* Share with all teachers (its teacher, published) */}
+        {manage && activity.status === "published" && (
+          <View style={styles.card}>
+            <View style={styles.switchRow}>
+              <View style={{ flex: 1, gap: 4 }}>
+                <Text style={styles.sectionTitle}>Share with all teachers</Text>
+                <Text style={styles.meta}>
+                  {`${activity.shared ? "On: every teacher can run it and duplicate it." : "Off: only you can run it."} Sessions already run aren't affected.`}
+                </Text>
+              </View>
+              <Switch
+                value={activity.shared}
+                onValueChange={toggleShared}
+                disabled={busy}
+                trackColor={{ true: C.green, false: C.border }}
+                thumbColor={C.white}
+                accessibilityLabel="Share with all teachers"
+              />
+            </View>
+          </View>
+        )}
 
         {/* Add words (draft) */}
         {isDraft && (
@@ -497,13 +573,21 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
         {/* Actions */}
         {isDraft ? (
           <View style={styles.actions}>
-            <BigButton icon="cloud-upload-outline" label="Publish" kind="primary" onPress={() => setPublishOpen(true)} disabled={busy} />
+            <BigButton
+              icon="cloud-upload-outline"
+              label="Publish"
+              kind="primary"
+              onPress={() => {
+                setPublishShared(false);
+                setPublishOpen(true);
+              }}
+              disabled={busy}
+            />
             <BigButton icon="trash-outline" label="Delete draft" kind="danger" onPress={() => setDeleteOpen(true)} disabled={busy} />
           </View>
-        ) : (
-          <View style={styles.actions}>
-            <BigButton icon="copy-outline" label="Duplicate" kind="primary" onPress={duplicate} disabled={busy} />
-            {manage && (
+        ) : moderate ? (
+          activity.status !== "draft" && (
+            <View style={styles.actions}>
               <BigButton
                 icon={activity.status === "hidden" ? "eye-outline" : "eye-off-outline"}
                 label={activity.status === "hidden" ? "Unhide" : "Hide"}
@@ -511,8 +595,14 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
                 onPress={toggleHidden}
                 disabled={busy}
               />
-            )}
-          </View>
+            </View>
+          )
+        ) : (
+          activity.status !== "hidden" && (
+            <View style={styles.actions}>
+              <BigButton icon="copy-outline" label="Duplicate" kind="primary" onPress={duplicate} disabled={busy} />
+            </View>
+          )
         )}
       </ScrollView>
 
@@ -668,14 +758,24 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
         </View>
         <Text style={[styles.sheetTitle, { textAlign: "center" }]}>Publish {activity.name}?</Text>
         <Text style={styles.confirmBody}>
-          {`Published activities can't be edited. To change one later, duplicate it. ${
-            activity.shared
-              ? "Every teacher will see it."
-              : activity.created_by === me
-              ? "Only you (and admins) will see it."
-              : "Only its teacher (and admins) will see it."
-          }`}
+          {"Published activities can't be edited. To change one later, duplicate it."}
         </Text>
+        <View style={[styles.switchRow, styles.publishShare]}>
+          <View style={{ flex: 1, gap: 2 }}>
+            <Text style={styles.switchLabel}>Share with all teachers</Text>
+            <Text style={styles.meta}>
+              {publishShared ? "Every teacher can run it and duplicate it." : "Only you can run it. You can share it later."}
+            </Text>
+          </View>
+          <Switch
+            value={publishShared}
+            onValueChange={setPublishShared}
+            disabled={busy}
+            trackColor={{ true: C.green, false: C.border }}
+            thumbColor={C.white}
+            accessibilityLabel="Share with all teachers"
+          />
+        </View>
         <SheetActions
           cancel={() => setPublishOpen(false)}
           confirm={publish}
@@ -919,6 +1019,10 @@ const styles = StyleSheet.create({
   description: { fontFamily: fonts.body, fontSize: 14, color: C.ink, lineHeight: 20 },
   owner: { fontFamily: fonts.body, fontSize: 12, color: C.muted },
   lockedNote: { fontFamily: fonts.body, fontSize: 12, color: C.muted },
+  hiddenCard: { backgroundColor: C.brownBg, borderColor: C.amberSoft },
+  switchRow: { flexDirection: "row", alignItems: "center", gap: 12 },
+  switchLabel: { fontFamily: fonts.heading, fontSize: 15, color: C.navy },
+  publishShare: { padding: 12, borderRadius: 12, backgroundColor: C.bg },
   sectionTitle: { fontFamily: fonts.heading, fontSize: 16, color: C.navy },
   addRow: { flexDirection: "row", gap: 8 },
   input: {

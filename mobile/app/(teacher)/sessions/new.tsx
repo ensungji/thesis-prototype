@@ -4,8 +4,9 @@
 // created as a pending session with type 'activity', then
 // start_activity_session (migration 19) copies the activity's words into it in
 // one step. If that refuses, the empty session is deleted again.
-// The Activity list: published activities the teacher can see (RLS, migration
-// 24): shared ones and their own, marked "Mine" / "Shared", their own first.
+// The Activity list: published activities the teacher can see (RLS, migrations
+// 24, 25): their own ("Mine") first, then other teachers' shared ones
+// ("by <author> · Shared"). Hidden and draft ones aren't listed.
 
 import { useState, useEffect, useCallback } from "react";
 import {
@@ -32,7 +33,7 @@ import {
   isActivitySession,
 } from "../../../lib/session-timer";
 import { DIFFICULTY_META, type Difficulty } from "../../../lib/difficulty";
-import { myUserId } from "../../../lib/activities";
+import { byAuthor, myUserId } from "../../../lib/activities";
 
 // A published activity the teacher can run: shared, or their own
 type PickActivity = {
@@ -41,6 +42,7 @@ type PickActivity = {
   description: string | null;
   level: Difficulty | null;
   mine: boolean;
+  author_name: string | null;
   words: string[]; // in order
 };
 
@@ -85,7 +87,7 @@ export default function NewSessionScreen() {
       myUserId(),
       supabase
         .from("activities")
-        .select("id, name, description, level, created_by, activity_words(word, position)")
+        .select("id, name, description, level, created_by, author_name, activity_words(word, position)")
         .eq("status", "published")
         .order("name"),
     ]).then(([me, { data, error }]) => {
@@ -101,6 +103,7 @@ export default function NewSessionScreen() {
         description: a.description,
         level: a.level as Difficulty | null,
         mine: !!me && a.created_by === me,
+        author_name: a.author_name as string | null,
         words: [...((a.activity_words as { word: string; position: number }[]) ?? [])]
           .sort((x, y) => x.position - y.position)
           .map((w) => w.word),
@@ -345,7 +348,7 @@ export default function NewSessionScreen() {
                 <Text style={styles.emptyText}>
                   {activitiesError
                     ? `Couldn't load activities: ${activitiesError}`
-                    : "No activities to run yet. Make and publish your own in Manage activities, or ask your admin to share one."}
+                    : "No activities to run yet. Make and publish your own in Manage activities, or ask another teacher to share one."}
                 </Text>
               ) : (
                 activities.map((a) => {
@@ -359,7 +362,7 @@ export default function NewSessionScreen() {
                       style={({ pressed }) => [styles.activityCard, on && styles.activityCardActive, pressed && { opacity: 0.85 }]}
                       accessibilityRole="radio"
                       accessibilityState={{ selected: on }}
-                      accessibilityLabel={`${a.name}, ${a.mine ? "mine" : "shared"}, ${level ? level.label + ", " : ""}${a.words.length} words: ${a.words
+                      accessibilityLabel={`${a.name}, ${a.mine ? "mine" : `${byAuthor(a)}, shared`}, ${level ? level.label + ", " : ""}${a.words.length} words: ${a.words
                         .slice(0, PREVIEW_WORDS)
                         .join(", ")}`}
                     >
@@ -385,8 +388,8 @@ export default function NewSessionScreen() {
                             size={11}
                             color={a.mine ? C.navy : C.muted}
                           />
-                          <Text style={[styles.ownerTagText, a.mine && { color: C.navy }]}>
-                            {a.mine ? "Mine" : "Shared"}
+                          <Text style={[styles.ownerTagText, a.mine && { color: C.navy }]} numberOfLines={1}>
+                            {a.mine ? "Mine" : `${byAuthor(a)} · Shared`}
                           </Text>
                         </View>
                         <Text style={[styles.activityMeta, { marginLeft: 0 }]}>
@@ -551,6 +554,7 @@ const styles = StyleSheet.create({
     borderRadius: 100,
     borderWidth: 1,
     borderColor: C.border,
+    flexShrink: 1,
   },
   ownerTagMine: { borderColor: C.navy, backgroundColor: C.blueWash },
   ownerTagText: { fontFamily: fonts.mono, fontSize: 10, color: C.muted },
