@@ -1,5 +1,6 @@
 // mobile/app/admin/index.tsx
-// Admin dashboard — view, create, edit, and deactivate teacher accounts.
+// Admin dashboard: teacher accounts (create, edit, deactivate), speech grading
+// agreement, and links to Activities (read-only overview + hide / unhide) and Logs.
 
 import { useState, useCallback } from "react";
 import {
@@ -287,7 +288,7 @@ export default function AdminDashboard() {
             pressed && { opacity: 0.7 },
           ]}
           accessibilityRole="button"
-          accessibilityLabel="Activities"
+          accessibilityLabel="Activities overview"
         >
           <Ionicons name="list-outline" size={18} color={C.navy} />
           <Text style={[styles.signOutText, { color: C.navy }]}>Activities</Text>

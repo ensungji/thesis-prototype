@@ -1,7 +1,9 @@
 // mobile/components/activities/ActivityListScreen.tsx
 // The Activities list, used by two routes:
-//   admin    app/admin/activities.tsx: every activity, filtered by status,
-//            each "by <author> · Shared/Private · <status>".
+//   admin    app/admin/activities.tsx: read-only overview of every activity
+//            (drafts too), filtered by status, each "by <author> ·
+//            Shared/Private · <status>". No New Activity: teachers make them.
+//            Tapping one opens it read-only with Hide / Unhide.
 //   teacher  app/(teacher)/sessions/activities.tsx: two tabs.
 //              Mine    the teacher's own, any status, filtered by status
 //                      (Hidden = hidden by an admin); New Activity
@@ -169,6 +171,8 @@ export function ActivityListScreen({ area }: { area: ActivitiesArea }) {
   const onShared = !isAdmin && tab === "shared";
   const pool = isAdmin ? activities : onShared ? shared : mine;
   const showFilters = !onShared;
+  // only a teacher makes activities (migration 25), on their Mine tab
+  const canCreate = !isAdmin && !onShared;
   const shown = !showFilters || filter === "all" ? pool : pool.filter((a) => a.status === filter);
   const count = (f: Filter) => (f === "all" ? pool.length : pool.filter((a) => a.status === f).length);
 
@@ -184,7 +188,7 @@ export function ActivityListScreen({ area }: { area: ActivitiesArea }) {
     : filter !== "all"
     ? ""
     : isAdmin
-    ? "Tap New Activity to make the first word list."
+    ? "Teachers make activities. Every one shows up here, drafts included."
     : "Tap New Activity to make a word list. It stays private until you publish it and share it.";
 
   return (
@@ -201,7 +205,7 @@ export function ActivityListScreen({ area }: { area: ActivitiesArea }) {
         <View style={{ flex: 1 }}>
           <Text style={styles.title}>Activities</Text>
           <Text style={styles.subtitle}>
-            {isAdmin ? "Word lists teachers can run · a teacher's own are private" : "Word lists you can run as a session"}
+            {isAdmin ? "Every teacher's word lists · you can hide or unhide published ones" : "Word lists you can run as a session"}
           </Text>
         </View>
       </View>
@@ -264,7 +268,7 @@ export function ActivityListScreen({ area }: { area: ActivitiesArea }) {
         <FlatList
           data={shown}
           keyExtractor={(a) => a.id}
-          contentContainerStyle={styles.list}
+          contentContainerStyle={[styles.list, !canCreate && { paddingBottom: Math.max(insets.bottom, 16) + 16 }]}
           refreshControl={
             <RefreshControl
               refreshing={refreshing}
@@ -291,7 +295,7 @@ export function ActivityListScreen({ area }: { area: ActivitiesArea }) {
         />
       )}
 
-      {!onShared && (
+      {canCreate && (
         <Pressable
           onPress={() => {
             setCreateError("");
@@ -300,7 +304,7 @@ export function ActivityListScreen({ area }: { area: ActivitiesArea }) {
           style={({ pressed }) => [
             styles.fab,
             // the teacher screen sits above the tab bar, which already clears the inset
-            { bottom: isAdmin ? Math.max(insets.bottom, 16) + 16 : 16 },
+            { bottom: 16 },
             pressed && { opacity: 0.85 },
           ]}
           accessibilityRole="button"

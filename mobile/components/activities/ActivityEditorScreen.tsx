@@ -117,6 +117,7 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
   const [publishOpen, setPublishOpen] = useState(false);
   const [publishShared, setPublishShared] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [hideOpen, setHideOpen] = useState(false); // admin: confirm Hide / Unhide
 
   // manage: the teacher who made it (edit, publish, share, delete the draft).
   // isDraft: a draft they manage (editable). moderate: an admin (hide / unhide).
@@ -312,6 +313,7 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
     setBusy(true);
     const res = await setActivityHidden(activity.id, hide);
     setBusy(false);
+    setHideOpen(false);
     if (res.error !== null) {
       showError(hide ? "Couldn't hide" : "Couldn't unhide", res.error);
       return;
@@ -592,7 +594,7 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
                 icon={activity.status === "hidden" ? "eye-outline" : "eye-off-outline"}
                 label={activity.status === "hidden" ? "Unhide" : "Hide"}
                 kind="plain"
-                onPress={toggleHidden}
+                onPress={() => setHideOpen(true)}
                 disabled={busy}
               />
             </View>
@@ -780,6 +782,29 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
           cancel={() => setPublishOpen(false)}
           confirm={publish}
           confirmLabel={busy ? "Publishing…" : "Publish"}
+          disabled={busy}
+        />
+      </Sheet>
+
+      {/* ── Hide / Unhide confirm (admin) ─────────────────────────────────── */}
+      <Sheet visible={hideOpen} onClose={() => !busy && setHideOpen(false)} bottom={insets.bottom}>
+        <View style={[styles.confirmIcon, { backgroundColor: C.brownBg }]}>
+          <Ionicons name={activity.status === "hidden" ? "eye-outline" : "eye-off-outline"} size={30} color={C.brown} />
+        </View>
+        <Text style={[styles.sheetTitle, { textAlign: "center" }]}>
+          {activity.status === "hidden" ? "Unhide" : "Hide"} {activity.name}?
+        </Text>
+        <Text style={styles.confirmBody}>
+          {activity.status === "hidden"
+            ? activity.shared
+              ? "It goes back to how it was: every teacher can see it and run it."
+              : "It goes back to how it was: its teacher can run it again."
+            : `${activity.shared ? "Teachers won't see it or be able to run it. " : "Its teacher won't be able to run it. "}Its teacher still sees it, marked Hidden by admin, but can't share, duplicate or unhide it. Sessions already run keep their words.`}
+        </Text>
+        <SheetActions
+          cancel={() => setHideOpen(false)}
+          confirm={toggleHidden}
+          confirmLabel={busy ? "Saving…" : activity.status === "hidden" ? "Unhide" : "Hide"}
           disabled={busy}
         />
       </Sheet>
