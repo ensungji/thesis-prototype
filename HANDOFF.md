@@ -1,6 +1,6 @@
 # Braille D.O.T.S. — Handoff
 
-Last updated: 11 Nov 2026. Repo: `github.com/ensungji/thesis-prototype`.
+Last updated: 12 Nov 2026. Repo: `github.com/ensungji/thesis-prototype`.
 Companion files: `AUDIT.md` (audit findings), `TESTING.md` (test checklist), `Braille_DOTS_Test_Results.xlsx` (results + bug list).
 
 ---
@@ -11,8 +11,8 @@ Companion files: `AUDIT.md` (audit findings), `TESTING.md` (test checklist), `Br
 |---|---|
 | **`main`** | Has the full audit work (PR #9 `fix/audit` merged). |
 | **`fix/bugs`** | 7 bug fixes (B-01 to B-07), 2 firmware commits, and app changes C1–C3 (logs CSV export, 20 s break, braille preview pinned at the top). **Pushed, not merged yet.** C1 needs a new preview build. |
-| **`feature/activities`** | Branched from `fix/bugs`. Activities Phases 1–5 (section 2b). **Pushed, not merged, app part not tested.** |
-| **Database** | Migrations 01–14 and **16–24 (Activities) run** (23 and 24 on 2026-11-11; Phase 1 script 59/59). 15 is covered by 21 (it adds the `graded_by` check). `LATER_…sql.txt` not run, on purpose. |
+| **`feature/activities`** | Branched from `fix/bugs`. Activities Phases 1–6 (section 2b). **Pushed, not merged, app part not tested.** |
+| **Database** | Migrations 01–14 and **16–26 run** (25 and 26 on 2026-11-12; `author_name` backfilled on the 8 existing activities, all teacher-made). Phase 1 script now has **74 checks** (needs a re-run after 25/26). 15 is covered by 21 (it adds the `graded_by` check). `LATER_…sql.txt` not run, on purpose. |
 | **Edge functions** | `reset-teacher-password`, `create-teacher`, `set-teacher-active`, `register-device` deployed with the new checks; **`grade-answer` v7 deployed** (every try saved, tries, correct lock). |
 | **App testing** | 22 pass, 2 partial, 15 waiting for the full device (see the Excel file). The B-01 to B-07 fixes are **not tested yet**. |
 | **Hardware** | Device assembled. Dots respond, but **weak upright** and **cells 1–3 don't respond**. See section 4. |
@@ -52,7 +52,7 @@ Companion files: `AUDIT.md` (audit findings), `TESTING.md` (test checklist), `Br
 
 ## 2b. Activities (`feature/activities`, not merged)
 
-Word lists run as a teacher-paced session: the admin's are shared, a teacher's own are private. Tests: `TESTING.md`, sections "Branch feature/activities" P1–P5.
+Word lists run as a teacher-paced session. Teachers make and own them and choose to share them; the admin only oversees (read-only overview, hide / unhide) and can switch on maintenance mode. Tests: `TESTING.md`, sections "Branch feature/activities" P1–P6.
 
 | Phase | What | State |
 |---|---|---|
@@ -60,17 +60,19 @@ Word lists run as a teacher-paced session: the admin's are shared, a teacher's o
 | **2. Admin screens + follow-ups** | Admin → Activities (create, edit draft, paste / Word Bank, time per word, reorder, publish, hide, duplicate, delete draft). Delete-session text, "Activity" label, voice-grade buttons hidden during a session, outbox drops lock refusals. | **Not tested on a phone.** |
 | **3. Activity sessions** | New Session → Activity (published only). Previous / Next (1.5 s guard), skipped rows, pause / resume, end, resume on the same word after a crash. Answers card in every mode: heard / result / tries + ▶ latest try (60 s signed URL). | **Not tested on a phone.** |
 | **4. Review + agreement** | Review screen after a session (filter, every try with ▶, re-grade any row, "Re-graded by … (was: …)"). "Done reviewing" (`sessions.reviewed_at`) and "Speech grading agreed with the teacher on X of Y voice answers (Z%)" per session and on the admin panel. | Migration 23 run. **Not tested on a phone.** |
-| **5. Teacher activities** | Migration 24: `activities.shared`, RLS (creator or admin manages), `duplicate_activity` for anyone who can see it, `start_activity_session` needs shared or own. Teacher Activities (Mine / Shared) from the Sessions list; admin list shows who made each; New Session › Activity tags Mine / Shared. | Migration 24 run; Phase 1 script **59/59**. **Not tested on a phone.** |
+| **5. Teacher activities** | Migration 24: `activities.shared`, RLS (creator or admin manages), `duplicate_activity` for anyone who can see it, `start_activity_session` needs shared or own. Teacher Activities (Mine / Shared) from the Sessions list; admin list shows who made each; New Session › Activity tags Mine / Shared. | Migration 24 run. Rules replaced by Phase 6. **Not tested on a phone.** |
+| **6. Teachers own, admin oversees, maintenance** | Migration 25: only teachers create / edit drafts / publish / delete drafts / duplicate / start; the owner shares or un-shares a published one ("Share with all teachers"); `author_name` copied at creation and `sessions.activity_author` at start ("· by <author>"); admins read everything and hide / unhide (`hidden_at`, `hidden_by`), nothing else. Migration 26: `app_settings` (maintenance, message, started_at, set_by; Realtime; on / off logged), database guards (DT002). App: share switch, Hidden by admin, admin read-only overview + Hide confirm, Maintenance card on the admin panel, teacher banner above the tab bar, New / Create / Launch / activity edits greyed out. | Migrations 25 + 26 run. Phase 1 script 74 checks (74/74 on the stand-in), policy-check 148. **Not tested on a phone** (`TESTING.md` P6). |
 
 **Decisions (keep these)**
 - **Grading lock (all modes):** while a session isn't finished, voice grades (correct, wrong, review) can't be changed; teacher / missed / skipped rows can. Retries replace wrong / review / missed / skipped until correct by voice, which then never changes (DT001; grade-answer answers `"locked": true`). After the end, re-grade anything; the first re-grade keeps the original.
 - **Deleting a session keeps the results** (`session_id` / `session_word_id` → null), so analytics don't change. Tries in `answer_attempts` go with it. Dialog: "This deletes the session. Your students' results stay in their progress."
-- **Published activities can't be edited**, only hidden / un-hidden; duplicate to change one. Only drafts can be deleted. Level = easy / medium / hard. Words A–Z, 1–40 letters, 5–60 s (default 20); a pasted word with anything else is dropped whole and listed.
+- **Published activities can't be edited**: its teacher can only share / un-share it, an admin can only hide / unhide it; duplicate to change one. Only drafts can be deleted. Level = easy / medium / hard. Words A–Z, 1–40 letters, 5–60 s (default 20); a pasted word with anything else is dropped whole and listed.
 - **Sessions copy the words** at start, so hiding / deleting an activity never touches past sessions.
 - **Types in the database:** `manual` (Live), `word_list` (Timed), `activity`. The app tries `live_session` / `timed_sequence` first and falls back on the check error; keep those refused.
 - **Outbox:** a queued change refused with 42501 / DT001 is dropped at once, logged (`sync_dropped`) and shown; other errors still get 5 retries.
 - **Activity mode:** no timer (`duration_seconds` unused), Next is refused offline, Next / End mark unanswered students Skipped, words never shown get no rows.
-- **Who sees an activity:** `shared` is set by a trigger (true when an admin creates it; only an admin can change it). Teachers see shared + published, and all of their own. The creator or an admin edits / publishes / hides / deletes drafts. Duplicate = a draft owned by whoever copied it, shared only if an admin copied it. A teacher can only start shared or own published activities (an admin too).
+- **Who owns / sees an activity (migration 25):** only teachers create, edit drafts, publish, delete drafts, duplicate and start. Every new activity and every copy is a private draft (`shared` false; a draft can never be shared). The owner turns "Share with all teachers" on / off on a published one at any time; un-sharing never touches sessions (they keep their own copy of the words and the name / author). Teachers see shared + published, and all of their own. Admins read everything and only hide / unhide published ones; `hidden` always means hidden by an admin: the owner still sees it but can't share, un-share, unhide or duplicate it, and nobody can start it. Owners can't hide their own (un-share instead; an "Archive" may come later). `author_name` is copied at creation (teachers can't read each other's profiles).
+- **Maintenance mode (migration 26):** one row in `app_settings`; everyone signed in reads it, only admins change it; on / off is logged (`maintenance_on` / `maintenance_off`; a message-only change isn't). While on, signed-in non-admins can't create sessions, start a pending one (pending → in_progress / paused), call `start_activity_session`, or write `activities` / `activity_words` (SQLSTATE DT002, triggers `a_maintenance_guard`). Everything a started session needs, reading, review, students, word bank and pairing still work; admins, the service role (grade-answer) and the SQL editor are never blocked. The outbox drops DT002 refusals like 42501 / DT001. Emergency off: `update public.app_settings set maintenance = false;`
 - **Agreement rule:** only reviewed sessions; a voice answer = still `auto` or re-graded from `auto`; it disagrees if re-graded to a different `is_correct`; rows still marked Review aren't counted. Same rule in `lib/review.ts` and `speech_grading_agreement()`.
 
 ---
@@ -135,7 +137,7 @@ Coil current is about **200–250 mA** (estimated; **measure one coil's resistan
 4. **Force:** with the device upright, check that pins don't rub in the top plate; then decide on option A, B or C.
 5. **Heat tuning:** once dots lift upright, follow the `HEAT_LIMIT_MS` steps in `TESTING.md` 1.1 (needs a thermometer or IR gun).
 6. **App:** test B-01 to B-07 and C1–C3 on the phone (preview APK), record results in the Excel file, then merge `fix/bugs` into `main`.
-6a. **Activities:** new preview APK from `feature/activities`, run `TESTING.md` P1.3 and P2–P5. Merge after `fix/bugs` (the branch contains it).
+6a. **Activities:** re-run `TESTING.md` P1.1 (74 checks), then a new preview APK from `feature/activities` and P1.3, P2–P6. Merge after `fix/bugs` (the branch contains it).
 6b. **Firmware team (later):** setup hold about 10 s with a warning sound, error-beep rate limit, setup password in `secrets.ini`, port the v7.1b chunk navigation into v7.3 (**don't flash v7.1b**, it lacks the heat budget and boot safety), then unlimited retries with dots dropping on a correct answer.
 7. **Before the defense:** preview APK build (`eas build --profile preview --platform android`, with `EXPO_PUBLIC_*` env vars set for the preview environment), Round 3 device tests in `TESTING.md`.
 

@@ -592,15 +592,16 @@ Migrations 16–22 (activities, sessions type `activity`, `start_activity_sessio
 ### P1.1 Database checks (any time; changes nothing)
 1. **Do:** Open `supabase/tests/phase1_activities_checks.sql`, paste the
    **whole file** into the SQL Editor, Run.
-   **Expect (after migration 24):** 59 rows, all **PASS**, and the last row
-   `TOTAL · 59 passed, 0 failed`. If there's only one teacher account, rows 33
-   and 54–57 are **SKIP** (54 passed). (Before migration 24 this file was 47
-   rows; it now needs migration 24.) Any **FAIL**: send the row (its detail column has
-   the error).
-   It acts as the first active admin and the first teacher with a student,
-   makes a test activity, session and answers, and rolls everything back.
+   **Expect (after migration 26):** 74 rows, all **PASS**, and the last row
+   `TOTAL · 74 passed, 0 failed`. If there's only one teacher account, 8 rows
+   are **SKIP** (`66 passed, 0 failed, 8 skipped`). (It was 59 rows up to
+   migration 24; it now needs migrations 25 and 26.) Any **FAIL**: send the
+   row (its detail column has the error).
+   It acts as the first active admin, the first teacher with a student and
+   another teacher, makes test activities, sessions and answers, turns
+   maintenance mode on and off, and rolls everything back.
 2. **Do (optional, on your PC):** `cd supabase/tests/policy-check`, `npm run check`.
-   **Expect:** `all passed` (136 checks on a stand-in database).
+   **Expect:** `all passed` (148 checks on a stand-in database).
 
 ### P1.2 Deploy grade-answer v7
 Only after P1.1 passes:
@@ -666,6 +667,9 @@ reload; the phone APK needs a new preview build
 (`eas build --profile preview --platform android`). No database changes.
 
 ### P2.1 Admin → Activities
+*(Replaced by P6.4 since migration 25: admins no longer create or edit
+activities. Steps 2–12 now apply to a **teacher's** own activities, in
+Sessions → Activities → Mine; Hide / Unhide is the admin's, see P6.4.)*
 Sign in as the **admin**.
 1. **Expect:** Admin Panel header has **Activities** (next to Logs). Tap it:
    chips **All / Draft / Published / Hidden** with counts.
@@ -860,6 +864,11 @@ answered twice.
 
 ## Branch feature/activities: Phase 5 (teachers make activities)
 
+*(Partly replaced by Phase 6 / migration 25: teachers share their own
+activities, admins only hide / unhide, and an admin's copy is no longer
+shared. Use P6 for sharing, hiding and the admin screens; P5.2 steps 1–2 and
+P5.3 still apply.)*
+
 **Run migration 24 (`20261111120900_teacher_activities.sql`) first**, then
 P1.1 again (59 rows). JS-only app changes (reload / new preview APK). You need
 the admin, teacher **T1** and, if you have one, teacher **T2**.
@@ -908,3 +917,132 @@ the admin, teacher **T1** and, if you have one, teacher **T2**.
    teachers see it once it's published.
 3. **Do:** open T1's draft. **Expect:** the admin can edit it (admins manage
    every activity).
+
+## Branch feature/activities: Phase 6 (teachers own activities, admin oversees, maintenance mode)
+
+Migrations 25 (`20261112120100_teacher_owned_activities.sql`) and 26
+(`20261112120200_maintenance_mode.sql`) **are run** (12 Nov 2026). JS-only app
+changes: reload a dev build, or a new preview APK
+(`eas build --profile preview --platform android`). You need the admin,
+teacher **T1** and teacher **T2** (both with a name on their profile), and
+for P6.6 two phones (or a phone + the SQL Editor).
+
+### P6.1 Database checks
+1. **Do:** P1.1 (the whole `phase1_activities_checks.sql`).
+   **Expect:** 74 rows PASS, `TOTAL · 74 passed, 0 failed` (one teacher only:
+   66 passed, 8 skipped). It turns maintenance off inside the test and puts it
+   back, so it works whatever the live setting is.
+2. **Do (SQL):** `select * from app_settings;`
+   **Expect:** one row, `maintenance` false (unless you turned it on).
+
+### P6.2 Teacher T1: own activities
+1. **Do:** Sessions → **Activities** → Mine → **New Activity**, add 3 words,
+   **Publish**.
+   **Expect:** the Publish sheet has a **Share with all teachers** switch,
+   off. Leave it off → Publish. Toast "Published · … Share it with all
+   teachers any time." Status **Published**, details say "Private: only you
+   (and admins) see it". No Hide button (only **Duplicate**).
+2. **Expect:** a **Share with all teachers** card with a switch, "Off: only
+   you can run it."
+3. **Do:** switch it on. **Expect:** toast "Shared with all teachers"; the
+   card says "On: every teacher can run it and duplicate it."; Mine row tag
+   **Shared**.
+4. **Do:** a second draft, **Publish** with the switch **on**.
+   **Expect:** toast "Published and shared"; tag Shared at once.
+5. **Do:** a third draft → **Delete draft**. **Expect:** gone. A draft never
+   shows a share switch (drafts are always private).
+
+### P6.3 Teacher T2: other teachers' activities
+1. **Do:** T2 → Activities → **Shared**.
+   **Expect:** T1's shared activities as "<name> · by <T1's name>"; T1's
+   private one isn't there.
+2. **Do:** open one. **Expect:** badge **Shared**, "Shared by <T1> with every
+   teacher", read-only words, only **Duplicate**.
+3. **Do:** **Duplicate**. **Expect:** "<name> (copy)" opens as T2's **Draft**
+   (editable), under Mine, "Private draft".
+4. **Do:** New Session › Activity.
+   **Expect:** T2's own published ones tagged **Mine**, T1's tagged
+   **by <T1> · Shared**. Run one of T1's (P3.2 still applies).
+5. **Expect (session screen):** the setup card, the activity card while
+   running, the finished card and the Review screen show
+   "<activity name> · by <T1>".
+6. **Do:** T1 switches sharing **off** for that activity. T2 pulls to refresh.
+   **Expect:** it's gone from Shared and from New Session › Activity. T2's
+   session that already used it is unchanged (words, results, "· by <T1>").
+
+### P6.4 Admin: overview + Hide / Unhide
+1. **Do:** admin → **Activities**.
+   **Expect:** every activity (drafts too), each "by <teacher> ·
+   Shared/Private · <status>", chips All / Draft / Published / Hidden.
+   **No New Activity** button.
+2. **Do:** open a teacher's **draft**. **Expect:** read-only words, no edit,
+   publish, duplicate or delete; note "A draft is private to its teacher."
+3. **Do:** open T1's shared published activity → **Hide** → confirm sheet
+   (says teachers won't see it and its teacher can't share or unhide it) →
+   Hide. **Expect:** status Hidden, "Hidden by admin" card with the date.
+4. **Expect (T1):** the activity shows **Hidden by admin** in Mine; opening
+   it: brown "Hidden by admin" card, read-only, **no share switch, no
+   Duplicate, no Unhide**.
+5. **Expect (T2):** it's gone from Shared and New Session.
+6. **Do:** admin → **Unhide** → confirm. **Expect:** back to Published and
+   shared as before; T2 sees it again.
+7. **Expect:** admin's activity screen has no Duplicate anywhere.
+
+### P6.5 API checks (old app builds can't get around it)
+Git Bash, tokens from section B6 (`$A` = T1, `$ADMIN`).
+1. **Do:** admin tries to create an activity:
+   ```bash
+   curl -s -w ' HTTP %{http_code}\n' -X POST "$URL/rest/v1/activities" -H "apikey: $ANON" \
+     -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" -d '{"name":"X"}'
+   ```
+   **Expect:** HTTP 403, "row-level security".
+2. **Do:** T1 tries to hide their own published activity:
+   ```bash
+   curl -s -X PATCH "$URL/rest/v1/activities?id=eq.<activity id>" -H "apikey: $ANON" \
+     -H "Authorization: Bearer $A" -H "Content-Type: application/json" -d '{"status":"hidden"}'
+   ```
+   **Expect:** "Only an admin can hide or unhide an activity".
+
+### P6.6 Maintenance mode
+1. **Do:** admin panel → **MAINTENANCE MODE** card → switch on.
+   **Expect:** sheet "Turn on maintenance mode?" with a message box. Type
+   "Updating devices, back at 3 pm" → **Turn on**. Card turns brown: "On since
+   <time> · by <admin>", the message, **Edit**.
+2. **Expect (T1's phone, already open):** within a few seconds, without a
+   reload, a brown **Maintenance mode** bar above the tab bar with the
+   message. On every tab.
+3. **Expect (T1, blocked):**
+   - Sessions → **New** is grey; tapping it: toast "Maintenance mode is on".
+   - A pending session: **Launch Session** grey, "Maintenance mode is on:
+     sessions can't be started until it ends."
+   - Activities: **New Activity** grey; opening a draft: "Maintenance mode"
+     card, no add box, no time / ↑ ↓ / 🗑, Publish and Delete grey; a
+     published one: share switch and Duplicate grey.
+4. **Expect (T1, still works):** Dashboard, Students, Analytics, Word Bank,
+   old sessions, results, Review (re-grade, Done reviewing) all open and work.
+5. **Running session:** turn maintenance **off**, have T1 launch a Live or
+   Activity session, turn it **on** again.
+   **Expect:** T1 can still send words / Next / Previous, Pause, Resume, grade,
+   and Finish. Device answers are still graded (grade-answer isn't blocked).
+6. **Admin isn't blocked:** while on, admin hides / unhides an activity.
+   **Expect:** works.
+7. **Edit message:** admin → **Edit** → change text → Save.
+   **Expect:** T1's bar shows the new text within a few seconds.
+8. **Turn off:** admin switch → "Turn off maintenance mode?" → Turn off.
+   **Expect:** T1's bar disappears; New / Launch / activity editing work again.
+9. **Logs:** Admin → Logs.
+   **Expect:** `maintenance_on` (warn, "Maintenance mode turned on by <admin>:
+   Updating devices…") and `maintenance_off` (info). Editing only the message
+   adds no log row.
+10. **Old build / API (database enforces it):** with maintenance on:
+    ```bash
+    curl -s -w ' HTTP %{http_code}\n' -X POST "$URL/rest/v1/sessions" -H "apikey: $ANON" \
+      -H "Authorization: Bearer $A" -H "Content-Type: application/json" \
+      -d '{"teacher_id":"<T1 id>","name":"X"}'
+    ```
+    **Expect:** an error with code `DT002`, "Maintenance mode is on. New
+    sessions can't be created until it ends." Nothing created.
+11. **Emergency off (if no admin can sign in):** SQL Editor
+    `update public.app_settings set maintenance = false;`
+    **Expect:** the bar disappears on T1's phone; a `maintenance_off` log row
+    with no user.
