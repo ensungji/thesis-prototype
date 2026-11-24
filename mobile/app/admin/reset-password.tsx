@@ -18,17 +18,7 @@ import { useRouter, useLocalSearchParams } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { supabase } from "../../lib/supabase";
 import { colors as C, fonts } from "../../lib/theme";
-
-// Password strength checker
-function getStrength(pw: string): { level: 0 | 1 | 2 | 3; label: string; color: string } {
-  if (pw.length === 0) return { level: 0, label: "", color: C.border };
-  if (pw.length < 8)   return { level: 1, label: "Too short", color: C.red };
-  const strong = /[A-Z]/.test(pw) && /[0-9]/.test(pw) && /[^A-Za-z0-9]/.test(pw);
-  const medium = /[A-Z]/.test(pw) || /[0-9]/.test(pw);
-  if (strong) return { level: 3, label: "Strong", color: C.green };
-  if (medium)  return { level: 2, label: "Medium", color: "#F59E0B" };
-  return { level: 1, label: "Weak", color: C.red };
-}
+import { PasswordStrengthMeter } from "../../components/PasswordStrength";
 
 export default function ResetPasswordScreen() {
   const router  = useRouter();
@@ -47,7 +37,6 @@ export default function ResetPasswordScreen() {
   const [error, setError]                     = useState<string | null>(null);
   const [success, setSuccess]                 = useState(false);
 
-  const strength = getStrength(newPassword);
 
   async function handleReset() {
     setError(null);
@@ -204,27 +193,7 @@ export default function ResetPasswordScreen() {
             </View>
 
             {/* Strength bar */}
-            {newPassword.length > 0 && (
-              <View style={styles.strengthWrap}>
-                <View style={styles.strengthBar}>
-                  {[1, 2, 3].map((seg) => (
-                    <View
-                      key={seg}
-                      style={[
-                        styles.strengthSeg,
-                        {
-                          backgroundColor:
-                            strength.level >= seg ? strength.color : C.border,
-                        },
-                      ]}
-                    />
-                  ))}
-                </View>
-                <Text style={[styles.strengthLabel, { color: strength.color }]}>
-                  {strength.label}
-                </Text>
-              </View>
-            )}
+            <PasswordStrengthMeter password={newPassword} />
           </View>
 
           {/* Confirm password */}
@@ -394,10 +363,6 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
 
-  strengthWrap:  { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 2 },
-  strengthBar:   { flexDirection: "row", gap: 5, flex: 1 },
-  strengthSeg:   { flex: 1, height: 4, borderRadius: 2 },
-  strengthLabel: { fontFamily: fonts.mono, fontSize: 10 },
 
   matchError: { fontFamily: fonts.body, fontSize: 12, color: C.red, marginTop: -2 },
 

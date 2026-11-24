@@ -5,6 +5,10 @@
 // and they can't sign in again. A token they already hold stays valid until it
 // expires (at most 1 hour). Activating lifts the ban.
 //
+// Approving a self-registered teacher (register-teacher, migration 28) is the
+// same as activating: activating also sets pending_approval false.
+// Deactivating doesn't touch pending_approval.
+//
 // Body: { teacherId: string, active: boolean }
 // Only an active admin may call it, and only teacher accounts can be changed.
 
@@ -74,7 +78,7 @@ serve(async (req) => {
   // 2. Profile flag (service role: allowed by the profile guard trigger)
   const { error: profErr } = await admin
     .from("profiles")
-    .update({ is_active: active })
+    .update(active ? { is_active: true, pending_approval: false } : { is_active: false })
     .eq("id", teacherId);
   if (profErr) {
     // undo the ban change so login and profile agree

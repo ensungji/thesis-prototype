@@ -24,6 +24,11 @@ import { BrailleCell } from "../components/BrailleCell";
 import { getDeviceId, resetDeviceId } from "../lib/device-id";
 import { homeFor, readAccess, routeForSession } from "../lib/route-for-session";
 
+// Shown when the login is refused because the account is banned / inactive:
+// a self-registered teacher not approved yet (migration 28), or deactivated.
+const NOT_ACTIVE_MSG =
+  "Your account is waiting for admin approval or has been deactivated. Contact the admin.";
+
 export default function Login() {
   const router = useRouter();
 
@@ -42,7 +47,7 @@ export default function Login() {
     routeForSession().then(({ route, reason }) => {
       if (!active) return;
       if (route) router.replace(route as any);
-      else if (reason === "inactive") setError("Your account has been deactivated. Contact the admin.");
+      else if (reason === "inactive") setError(NOT_ACTIVE_MSG);
       else if (reason === "offline") setError("Couldn't check your account. Check your connection and try again.");
     });
     return () => {
@@ -82,7 +87,10 @@ export default function Login() {
 
     if (authError) {
       setLoading(false);
-      setError(authError.message);
+      // A banned login (not approved yet, or deactivated) comes back as
+      // code "user_banned" / "User is banned"
+      const banned = authError.code === "user_banned" || /banned/i.test(authError.message);
+      setError(banned ? NOT_ACTIVE_MSG : authError.message);
       return;
     }
 
@@ -104,7 +112,7 @@ export default function Login() {
     // Only block if explicitly deactivated (is_active === false, not null/undefined)
     if (!access.isActive) {
       await supabase.auth.signOut();
-      setError("Your account has been deactivated. Contact the admin.");
+      setError(NOT_ACTIVE_MSG);
       return;
     }
 
@@ -193,7 +201,7 @@ export default function Login() {
           <View style={styles.headingBlock}>
             <Text style={styles.h1}>Sign in</Text>
             <Text style={styles.sub}>
-              {"Your account is created by an admin.\nContact them if you don't have access yet."}
+              {"Sign in with your teacher or admin account.\nNew teacher? Create an account below."}
             </Text>
           </View>
 
@@ -280,6 +288,19 @@ export default function Login() {
               )}
             </Pressable>
 
+            {/* Self-registration (register-teacher; the admin approves it) */}
+            <Pressable
+              onPress={() => router.push("/register" as any)}
+              style={({ pressed }) => [styles.createLink, pressed && { opacity: 0.6 }]}
+              accessibilityRole="link"
+              accessibilityHint="Opens the sign-up form. The admin approves new accounts."
+            >
+              <Text style={styles.createText}>
+                {"No account yet? "}
+                <Text style={styles.createTextStrong}>Create an account</Text>
+              </Text>
+            </Pressable>
+
           </View>
 
           <Text style={styles.footer}>
@@ -360,6 +381,10 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 4 },
   },
   ctaText: { fontFamily: fonts.heading, fontSize: 17, color: "#1A1200" },
+
+  createLink: { alignItems: "center", justifyContent: "center", minHeight: 44, paddingVertical: 8 },
+  createText: { fontFamily: fonts.body, fontSize: 14, color: C.ink },
+  createTextStrong: { fontFamily: fonts.heading, color: C.navy, textDecorationLine: "underline" },
 
   footer: { fontFamily: fonts.body, fontSize: 12, color: C.muted, textAlign: "center" },
 });

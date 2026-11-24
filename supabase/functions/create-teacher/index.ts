@@ -1,6 +1,8 @@
-// Supabase Edge Function: create-teacher (v2)
+// Supabase Edge Function: create-teacher (v3)
 // Uses upsert so profile is always created even if trigger fails.
 // Only an active admin may call it.
+// v3: sets pending_approval false (migration 28): an account the admin adds
+//     is active at once and never waits for approval. Nothing else changed.
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -73,6 +75,7 @@ serve(async (req) => {
       title:       title || null,
       institution: institution || null,
       is_active:   true,
+      pending_approval: false,
     });
 
     if (profileError) {

@@ -35,7 +35,14 @@ type Teacher = {
   institution: string | null;
   is_active: boolean;
   created_at: string;
+  pending_approval?: boolean; // signed up in the app, not approved yet (migration 28)
 };
+
+/** Signed up in the app and still waiting: inactive + pending_approval. */
+const isPending = (t: Pick<Teacher, "is_active" | "pending_approval">) => !t.is_active && !!t.pending_approval;
+
+const signedUpOn = (iso: string) =>
+  new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -80,16 +87,16 @@ function TeacherCard({
           <View
             style={[
               styles.badge,
-              { backgroundColor: teacher.is_active ? C.greenBg : C.redBg },
+              { backgroundColor: teacher.is_active ? C.greenBg : isPending(teacher) ? C.brownBg : C.redBg },
             ]}
           >
             <Text
               style={[
                 styles.badgeText,
-                { color: teacher.is_active ? C.green : C.red },
+                { color: teacher.is_active ? C.green : isPending(teacher) ? C.brown : C.red },
               ]}
             >
-              {teacher.is_active ? "Active" : "Inactive"}
+              {teacher.is_active ? "Active" : isPending(teacher) ? "Pending" : "Inactive"}
             </Text>
           </View>
         </View>
@@ -102,6 +109,44 @@ function TeacherCard({
       </View>
       <Ionicons name="chevron-forward" size={16} color={C.muted} />
     </Pressable>
+  );
+}
+
+// ── Pending sign-up card (Approve) ────────────────────────────────────────────
+
+function PendingCard({ teacher, onApprove, onPress }: { teacher: Teacher; onApprove: () => void; onPress: () => void }) {
+  return (
+    <View style={[styles.card, styles.pendingCard]}>
+      <Pressable
+        onPress={onPress}
+        style={({ pressed }) => [styles.pendingInfo, pressed && { opacity: 0.8 }]}
+        accessibilityRole="button"
+        accessibilityLabel={`${teacher.full_name || teacher.email}, waiting for approval. More options`}
+      >
+        <View style={[styles.avatar, { backgroundColor: C.brown }]}>
+          <Text style={styles.avatarText}>{getInitials(teacher.full_name || teacher.email)}</Text>
+        </View>
+        <View style={styles.cardInfo}>
+          <Text style={styles.teacherName}>{teacher.full_name || "—"}</Text>
+          <Text style={styles.teacherEmail}>{teacher.email}</Text>
+          {(teacher.title || teacher.institution) && (
+            <Text style={styles.teacherMeta} numberOfLines={2}>
+              {[teacher.title, teacher.institution].filter(Boolean).join(" · ")}
+            </Text>
+          )}
+          <Text style={styles.pendingDate}>Signed up {signedUpOn(teacher.created_at)}</Text>
+        </View>
+      </Pressable>
+      <Pressable
+        onPress={onApprove}
+        style={({ pressed }) => [styles.approveBtn, pressed && { opacity: 0.8 }]}
+        accessibilityRole="button"
+        accessibilityLabel={`Approve ${teacher.full_name || teacher.email}`}
+      >
+        <Ionicons name="checkmark-circle-outline" size={18} color={C.green} />
+        <Text style={styles.approveText}>Approve</Text>
+      </Pressable>
+    </View>
   );
 }
 
@@ -225,6 +270,7 @@ export default function AdminDashboard() {
     if (!confirmTarget) return;
     setConfirming(true);
     const newState = !confirmTarget.is_active;
+    const approving = isPending(confirmTarget);
     // The edge function also bans / unbans the login, so a deactivated
     // teacher can't sign in or keep refreshing their session
     const res = await supabase.functions.invoke("set-teacher-active", {
@@ -243,7 +289,7 @@ export default function AdminDashboard() {
     }
     loadTeachers();
     setToast({
-      message: newState ? "Teacher activated" : "Teacher deactivated",
+      message: approving ? "Teacher approved" : newState ? "Teacher activated" : "Teacher deactivated",
       detail: confirmTarget.full_name || confirmTarget.email,
       variant: newState ? "success" : "delete",
     });
@@ -283,11 +329,25 @@ export default function AdminDashboard() {
     );
   }
 
+  // Pending sign-ups are inactive too, but counted on their own (not as Inactive)
+  const pending       = teachers.filter(isPending);
+  const others        = teachers.filter((t) => !isPending(t));
   const activeCount   = teachers.filter((t) => t.is_active).length;
-  const inactiveCount = teachers.length - activeCount;
+  const pendingCount  = pending.length;
+  const inactiveCount = teachers.length - activeCount - pendingCount;
 
   // For the confirm sheet
   const isDeactivating = confirmTarget?.is_active ?? true;
+  const isApproving = !!confirmTarget && isPending(confirmTarget);
+
+  const openOptions = (t: Teacher) => {
+    setSelected(t);
+    setOptionsModal(true);
+  };
+  const requestApprove = (t: Teacher) => {
+    setConfirmTarget(t);
+    setConfirmModal(true);
+  };
 
   const SignOutButton = (
     <Pressable
@@ -352,6 +412,16 @@ export default function AdminDashboard() {
           </Text>
           <Text style={styles.summaryLabel}>Inactive</Text>
         </View>
+        <View
+          style={[styles.summaryCard, { backgroundColor: C.brownBg }]}
+          accessible
+          accessibilityLabel={`${pendingCount} waiting for approval`}
+        >
+          <Text style={[styles.summaryValue, { color: C.brown }]}>
+            {pendingCount}
+          </Text>
+          <Text style={styles.summaryLabel}>Pending</Text>
+        </View>
         <View style={[styles.summaryCard, { backgroundColor: C.blueWash }]}>
           <Text style={[styles.summaryValue, { color: C.navy }]}>
             {teachers.length}
@@ -389,8 +459,22 @@ export default function AdminDashboard() {
 
       {/* Teacher list */}
       <FlatList
-        data={teachers}
+        data={others}
         keyExtractor={(t) => t.id}
+        ListHeaderComponent={
+          pendingCount > 0 ? (
+            <View style={styles.pendingSection}>
+              <Text style={styles.sectionLabel}>PENDING APPROVAL · {pendingCount}</Text>
+              <Text style={styles.pendingHint}>
+                {"Teachers who signed up in the app. They can't sign in until you approve them. To leave one waiting, do nothing; accounts are never deleted."}
+              </Text>
+              {pending.map((t) => (
+                <PendingCard key={t.id} teacher={t} onApprove={() => requestApprove(t)} onPress={() => openOptions(t)} />
+              ))}
+              {others.length > 0 && <Text style={[styles.sectionLabel, { marginTop: 8 }]}>TEACHERS</Text>}
+            </View>
+          ) : null
+        }
         contentContainerStyle={styles.list}
         refreshControl={
           <RefreshControl
@@ -403,16 +487,10 @@ export default function AdminDashboard() {
           />
         }
         renderItem={({ item }) => (
-          <TeacherCard
-            teacher={item}
-            onPress={() => {
-              setSelected(item);
-              setOptionsModal(true);
-            }}
-          />
+          <TeacherCard teacher={item} onPress={() => openOptions(item)} />
         )}
         ListEmptyComponent={
-          <View style={styles.empty}>
+          pendingCount > 0 ? null : <View style={styles.empty}>
             <Text style={styles.emptyTitle}>No teachers yet</Text>
             <Text style={styles.emptyBody}>
               Tap + Add to create the first teacher account.
@@ -604,7 +682,7 @@ export default function AdminDashboard() {
                   { color: selected?.is_active ? C.red : C.green },
                 ]}
               >
-                {selected?.is_active ? "Deactivate" : "Activate"}
+                {selected?.is_active ? "Deactivate" : selected && isPending(selected) ? "Approve" : "Activate"}
               </Text>
               <Ionicons name="chevron-forward" size={16} color={C.muted} />
             </Pressable>
@@ -653,7 +731,7 @@ export default function AdminDashboard() {
 
             {/* Title */}
             <Text style={styles.confirmTitle}>
-              {isDeactivating ? "Deactivate Teacher?" : "Activate Teacher?"}
+              {isDeactivating ? "Deactivate Teacher?" : isApproving ? "Approve Teacher?" : "Activate Teacher?"}
             </Text>
 
             {/* Teacher name pill */}
@@ -675,7 +753,9 @@ export default function AdminDashboard() {
             <Text style={styles.confirmBody}>
               {isDeactivating
                 ? "This teacher will no longer be able to sign in. Their students and sessions will remain intact and can be restored by reactivating the account."
-                : "This teacher will regain full access to their account, students, and sessions immediately."}
+                : isApproving
+                  ? `This teacher signed up in the app on ${confirmTarget ? signedUpOn(confirmTarget.created_at) : ""}. Approving lets them sign in and use the app right away. You can deactivate the account later.`
+                  : "This teacher will regain full access to their account, students, and sessions immediately."}
             </Text>
 
             {/* Actions */}
@@ -769,11 +849,12 @@ const styles = StyleSheet.create({
     letterSpacing: 0.5,
   },
 
-  summaryRow: { flexDirection: "row", gap: 10, padding: 16, paddingBottom: 4 },
+  summaryRow: { flexDirection: "row", gap: 8, padding: 16, paddingBottom: 4 },
   summaryCard: {
     flex: 1,
     borderRadius: 12,
-    padding: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 4, // four cards (Active / Inactive / Pending / Total) fit at 320 dp
     alignItems: "center",
     gap: 2,
   },
@@ -795,6 +876,25 @@ const styles = StyleSheet.create({
   agreeSub: { fontFamily: fonts.body, fontSize: 12, color: C.muted },
 
   list: { padding: 16, gap: 12, paddingBottom: 100 },
+
+  pendingSection: { gap: 12, marginBottom: 0 },
+  sectionLabel: { fontFamily: fonts.mono, fontSize: 11, color: C.brown, letterSpacing: 1 },
+  pendingHint: { fontFamily: fonts.body, fontSize: 12.5, color: C.ink, lineHeight: 18 },
+  pendingCard: { borderColor: C.amberSoft, flexDirection: "column", alignItems: "stretch", gap: 12 },
+  pendingInfo: { flexDirection: "row", alignItems: "center", gap: 12 },
+  pendingDate: { fontFamily: fonts.mono, fontSize: 10, color: C.brown, marginTop: 2 },
+  approveBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    minHeight: 44,
+    borderRadius: 12,
+    backgroundColor: C.greenBg,
+    borderWidth: 1.5,
+    borderColor: "#C9DFB2",
+  },
+  approveText: { fontFamily: fonts.heading, fontSize: 14, color: C.green },
 
   card: {
     flexDirection: "row",

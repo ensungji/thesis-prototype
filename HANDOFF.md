@@ -12,15 +12,15 @@ Companion files: `AUDIT.md` (audit findings), `TESTING.md` (test checklist), `Br
 | **`main`** | Has the full audit work (PR #9 `fix/audit` merged). |
 | **`fix/bugs`** | 7 bug fixes (B-01 to B-07), 2 firmware commits, and app changes C1–C3 (logs CSV export, 20 s break, braille preview pinned at the top). **Pushed, not merged yet.** C1 needs a new preview build. |
 | **`feature/activities`** | Branched from `fix/bugs`. Activities Phases 1–6 (section 2b). **Pushed, not merged, app part not tested.** |
-| **`feature/reports-and-signup`** | Branched from `feature/activities` (f1917e5). Parts 1–4 done and pushed: PDF + CSV reports, Live Session keyboard, admin header, admin routing (section 2c). Parts 5–6 to come. **Needs a new EAS build (expo-print).** |
-| **Database** | Migrations 01–14 and **16–27 run** (25 and 26 on 2026-11-12; `author_name` backfilled on the 8 existing activities, all teacher-made; **27 on 2026-11-24: 558/558 tries backfilled with `device_id` and `late`**). Phase 1 script now has **74 checks** (needs a re-run after 25/26). 15 is covered by 21 (it adds the `graded_by` check). `LATER_…sql.txt` not run, on purpose. |
+| **`feature/reports-and-signup`** | Branched from `feature/activities` (f1917e5). Parts 1–5 done and pushed: PDF + CSV reports, Live Session keyboard, admin header, admin routing, teacher self-registration (section 2c). Part 6 to come. **Deploy set-teacher-active, create-teacher, register-teacher (2c).** **Needs a new EAS build (expo-print).** |
+| **Database** | Migrations 01–14 and **16–28 run** (25 and 26 on 2026-11-12; `author_name` backfilled on the 8 existing activities, all teacher-made; **27 on 2026-11-24: 558/558 tries backfilled with `device_id` and `late`**; **28 on 2026-11-24: `profiles.pending_approval`, all 10 profiles false, triggers `protect_pending_approval` + `signup_starts_pending` present**). Phase 1 script now has **74 checks** (needs a re-run after 25/26). 15 is covered by 21 (it adds the `graded_by` check). `LATER_…sql.txt` not run, on purpose. |
 | **Edge functions** | `reset-teacher-password`, `create-teacher`, `set-teacher-active`, `register-device` deployed with the new checks; **`grade-answer` v8 deployed** (2026-11-24: each try also saves `device_id` and `late`, migration 27; v7: every try saved, tries, correct lock). |
 | **App testing** | 22 pass, 2 partial, 15 waiting for the full device (see the Excel file). The B-01 to B-07 fixes are **not tested yet**. |
 | **Hardware** | Device assembled. Dots respond, but **weak upright** and **cells 1–3 don't respond**. See section 4. |
 
 ### Still to confirm
 - [ ] Wi-Fi password changed (the old one is in public git history, commit `d28b59e`).
-- [ ] Supabase → Authentication → "Allow new users to sign up" is **off**.
+- [ ] Supabase → Authentication → "Allow new users to sign up" is **off**. Keep it off: teacher sign-up in the app goes through the `register-teacher` function, not Supabase sign-ups.
 - [x] Migration 15: no longer matters. The live table had no `graded_by` check; migration 21 adds it (auto, teacher, missed, skipped).
 
 ---
@@ -88,6 +88,7 @@ Tests: `TESTING.md`, section "Branch feature/reports-and-signup".
 | **2. Live Session input** | Focused style; input row kept above the keyboard on Android edge-to-edge (`lib/use-keyboard-inset.ts`). | JS only. Not tested on a phone. |
 | **3. Admin header** | Two rows on phones, one row ≥ 520 dp, 44 px buttons. | JS only. Not tested on a phone. |
 | **4. Admin routing** | `lib/route-for-session.ts` decides admin / teacher / signed out for the welcome screen, login, and both layout guards; admins never land in the teacher screens (also offline, using the last role seen on the phone); deactivated saved logins are signed out; Android Back on the Admin Panel leaves the app. | JS only. Not tested on a phone. |
+| **5. Teacher sign-up** | "Create an account" on Sign in → `app/register.tsx` (email check, 8+ characters with the Reset Password strength meter, passwords match) → new edge function `register-teacher` (no login needed; always teacher / inactive / pending / banned; duplicate email refused; length limits; max 20 sign-ups an hour; errors logged, nothing deleted). Migration 28 `20261124120200_profiles_pending_approval.sql`: `profiles.pending_approval` + guard trigger + sign-ups start pending in the database. Admin Panel: Active / Inactive / **Pending** / Total, Pending approval section with **Approve** (same confirm sheet as Activate; no reject / delete). `set-teacher-active`: activating also clears `pending_approval`. `create-teacher` v3: sets `pending_approval` false. Banned / inactive sign-in → "waiting for admin approval or has been deactivated". | Migration 28 **run**. **Functions not deployed yet**, in this order: `npx supabase functions deploy set-teacher-active`, `npx supabase functions deploy create-teacher`, `npx supabase functions deploy register-teacher`. JS only (no new build beyond Part 1's). Not tested on a phone. |
 
 ---
 

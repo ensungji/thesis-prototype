@@ -1156,3 +1156,109 @@ deactivate. Phone online unless a step says otherwise.
     **Expect:** T3 stays on the teacher screens offline (no profile check
     possible). As soon as the phone is online and the app is reopened,
     T3 is signed out (step 10). Reactivate T3 after the test.
+
+### R5 Teacher self-registration with admin approval
+Migration 28 (`20261124120200_profiles_pending_approval.sql`) **is run**
+(24 Nov 2026). Deploy the three functions first (HANDOFF 2c), then reload a
+dev build (JS only). Supabase → Authentication → "Allow new users to sign
+up" must stay **off**: the app doesn't use it. Use a fresh email, e.g.
+`newteacher1@example.com`.
+
+**Register screen**
+1. **Do:** welcome → Get Started → Sign in.
+   **Expect:** under **Sign In**: "No account yet? **Create an account**".
+2. **Do:** tap it.
+   **Expect:** "Create an account", same look as Sign in: Full name, Email,
+   Password (with Show), Confirm password, Title (optional), Institution
+   (optional), **Create account**. "‹ Sign in" goes back.
+3. **Do:** tap **Create account** with everything empty.
+   **Expect:** red hints under Full name, Email, Password, Confirm; nothing
+   sent.
+4. **Do:** email `teacher@school` (no dot after @), leave the field.
+   **Expect:** "Enter a valid email address…". Fix it to
+   `newteacher1@example.com`.
+5. **Do:** password `abc`, then `abcdefgh`, then `Abcdefg1`, then `Abcdef1!`.
+   **Expect:** the bar under the field: Too short (red, 1 bar) → Weak (red,
+   1) → Medium (amber, 2) → Strong (green, 3): the same bar as Admin →
+   Reset Password.
+6. **Do:** confirm `Abcdef1?` (different), leave the field.
+   **Expect:** "The passwords don't match." Fix it: "Passwords match" (green).
+7. **Do:** airplane mode → **Create account**.
+   **Expect:** "You're offline…", nothing created. Airplane mode off.
+8. **Do:** name `  Juan   Dela  Cruz  `, title `Teacher I`, institution your
+   school → **Create account**.
+   **Expect:** spinner, then "Account created · The admin needs to approve
+   it before you can sign in." with the email, and **Back to Sign in**.
+
+**Can't sign in yet**
+9. **Do:** sign in as `newteacher1@example.com` with the right password.
+   **Expect:** "Your account is waiting for admin approval or has been
+   deactivated. Contact the admin." Still on Sign in.
+10. **Do:** Create an account again with the **same email** in other case
+    (`NewTeacher1@Example.com`).
+    **Expect:** "An account with this email already exists. Sign in, or
+    contact the admin." No second account.
+
+**Admin**
+11. **Do:** admin opens the Admin Panel (or is already on it).
+    **Expect:** within a few seconds, no reload: counts **Active / Inactive
+    / Pending / Total**, Pending 1, Inactive unchanged (the new account is
+    **not** counted as Inactive), Total + 1. A **PENDING APPROVAL · 1**
+    section at the top: "Juan Dela Cruz" (spaces cleaned), email,
+    "Teacher I · <school>", "Signed up <date>", green **Approve**. Below it
+    **TEACHERS** with everyone else. No Reject / Delete anywhere.
+12. **Do (SQL):**
+    `select role, is_active, pending_approval, full_name from profiles where email = 'newteacher1@example.com';`
+    **Expect:** `teacher | false | true | Juan Dela Cruz`. Authentication →
+    Users → that user: banned until about 100 years from now.
+13. **Do:** tap the pending teacher's name.
+    **Expect:** the options sheet; its last option says **Approve** (not
+    Activate). Cancel.
+14. **Do:** **Approve**.
+    **Expect:** the same sheet style as Activate: green icon, "Approve
+    Teacher?", name pill, "This teacher signed up in the app on <date>…",
+    Cancel / Approve. Tap **Cancel**: nothing changes (leave pending).
+15. **Do:** **Approve** → **Approve**.
+    **Expect:** toast "Teacher approved"; the section disappears; the
+    teacher is listed as **Active**; Pending 0, Active + 1. SQL from step
+    12: `teacher | true | false`; not banned any more.
+16. **Do:** sign in as `newteacher1@example.com`.
+    **Expect:** the teacher Dashboard (empty class); works like any teacher.
+17. **Do:** admin deactivates that teacher, then activates again.
+    **Expect:** shown as **Inactive** (not Pending; `pending_approval`
+    stays false); sign-in shows the "waiting for admin approval or
+    deactivated" message; after activating, sign-in works.
+
+**Add Teacher unchanged**
+18. **Do:** admin → **Add Teacher**, a new teacher as before.
+    **Expect:** "Account created"; Active at once (never Pending); signs in
+    straight away. SQL: `pending_approval` false.
+
+**API checks (Git Bash, section B6)**
+19. **Do:** try to sign up as an active admin:
+    ```bash
+    curl -s -X POST "$URL/functions/v1/register-teacher" -H "apikey: $ANON" \
+      -H "Authorization: Bearer $ANON" -H "Content-Type: application/json" \
+      -d '{"full_name":"Evil Admin","email":"evil1@example.com","password":"Abcdef1!","role":"admin","is_active":true,"pending_approval":false}'
+    ```
+    **Expect:** `{"ok":true}`, but SQL shows `evil1@example.com` as
+    `teacher | false | true`, banned; its sign-in is refused. (Leave it
+    pending; nothing is deleted.)
+20. **Do:** bad input, e.g.
+    `-d '{"full_name":"X","email":"bad","password":"short"}'`
+    **Expect:** HTTP 400 "Enter your full name."; fixing each field in turn:
+    "Enter a valid email address.", "Password: at least 8 characters.". A
+    300-character name: "Full name: at most 100 characters."
+21. **Do:** an active teacher tries to change the flag directly:
+    ```bash
+    curl -s -X PATCH "$URL/rest/v1/profiles?id=eq.<T1 id>" -H "apikey: $ANON" \
+      -H "Authorization: Bearer $A" -H "Content-Type: application/json" \
+      -d '{"pending_approval":true}'
+    ```
+    **Expect:** "Only an admin can change approval status".
+22. **Do:** Admin → **Logs**.
+    **Expect:** a `teacher_signup` (info) row per sign-up, with the email.
+    No `signup_profile_failed` / `signup_not_locked` errors.
+23. **Do (rate limit, optional):** 21 sign-ups within one hour.
+    **Expect:** the 21st: "Too many sign-ups right now…" (HTTP 429) and a
+    `signup_rate_limited` warning in Logs.
