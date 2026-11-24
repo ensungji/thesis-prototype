@@ -1157,5 +1157,57 @@ await check("26: changing only the message logs nothing; the SQL editor can swit
   });
 }
 
+// ── 29 Shared Word Bank: active teachers + admins read every word ───────────
+{
+  const WA = "a0d00000-0000-0000-0000-000000000000"; // Teacher A's word
+  const WB = "b0d00000-0000-0000-0000-000000000000"; // Teacher B's word
+  const PEND = "9e4d0000-0000-0000-0000-000000000000"; // a teacher waiting for approval
+  const mig29 = readdirSync(migDir).find((f) => f.includes("word_library_shared_read"));
+  const words = async (user) =>
+    (await as(user, "authenticated", `select word from word_library where id in ('${WA}', '${WB}') order by word`)).rows.map((r) => r.word);
+  await check("29: setup: one word each for A and B, a pending teacher", async () => {
+    await as(null, null, `insert into word_library (id, teacher_id, word) values ('${WA}', '${A}', 'APPLE29'), ('${WB}', '${B}', 'BANANA29')`);
+    await as(null, null, `insert into profiles (id, email, role, is_active, pending_approval) values ('${PEND}', 'p29@x', 'teacher', false, true)`);
+  });
+  await check("29: the 4 old word_library policies are unchanged, 1 new select policy", async () => {
+    const r = await as(null, null, `select policyname, cmd from pg_policies where tablename = 'word_library' order by cmd, policyname`);
+    eq(r.rows, [
+      { policyname: "Teachers can delete own words", cmd: "DELETE" },
+      { policyname: "Teachers can insert own words", cmd: "INSERT" },
+      { policyname: "Teachers and admins can read all words", cmd: "SELECT" },
+      { policyname: "Teachers can read own and shared words", cmd: "SELECT" },
+      { policyname: "Teachers can update own words", cmd: "UPDATE" },
+    ], "policies");
+  });
+  await check("29: teacher B sees A's word (and A sees B's); the admin sees both", async () => {
+    eq(await words(B), ["APPLE29", "BANANA29"], "B");
+    eq(await words(A), ["APPLE29", "BANANA29"], "A");
+    eq(await words(D), ["APPLE29", "BANANA29"], "admin");
+  });
+  await check("29: B can't change or delete A's word (0 rows), and can't add a word as A", async () => {
+    eq((await as(B, "authenticated", `update word_library set word = 'HACKED' where id = '${WA}' returning id`)).rows.length, 0, "update");
+    eq((await as(B, "authenticated", `delete from word_library where id = '${WA}' returning id`)).rows.length, 0, "delete");
+    await expectError(as(B, "authenticated", `insert into word_library (teacher_id, word) values ('${A}', 'FAKE')`), /row-level security/);
+    eq((await as(null, null, `select word from word_library where id = '${WA}'`)).rows, [{ word: "APPLE29" }], "A's word kept");
+  });
+  await check("29: owners still edit / delete their own words", async () => {
+    eq((await as(B, "authenticated", `update word_library set difficulty = 'easy' where id = '${WB}' returning id`)).rows.length, 1, "update own");
+  });
+  await check("29: a deactivated or pending teacher only reads their own + teacher_id null words; anon nothing", async () => {
+    await as(null, null, `update profiles set is_active = false where id = '${B}'`);
+    eq(await words(B), ["BANANA29"], "deactivated B");
+    await as(null, null, `update profiles set is_active = true where id = '${B}'`);
+    eq(await words(PEND), [], "pending");
+    eq((await as(PEND, "authenticated", `select count(*)::int as n from word_library where teacher_id is null`)).rows[0].n > 0, true, "null-owner words still readable");
+    eq((await as(null, "anon", `select count(*)::int as n from word_library`)).rows, [{ n: 0 }], "anon");
+  });
+  await check("29: runs again without changing anything", async () => {
+    await db.exec(readFileSync(join(migDir, mig29), "utf8"));
+    eq((await as(null, null, `select count(*)::int as n from pg_policies where tablename = 'word_library'`)).rows, [{ n: 5 }], "policies");
+    await as(null, null, `delete from word_library where id in ('${WA}', '${WB}')`);
+    await as(null, null, `delete from profiles where id = '${PEND}'`);
+  });
+}
+
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);
