@@ -12,10 +12,16 @@ import { supabase } from "../../lib/supabase";
 import { colors as C, fonts } from "../../lib/theme";
 import { BrailleCell } from "../../components/BrailleCell";
 import { BrailleLoader } from "../../components/BrailleLoader";
+import { ReportExportBar } from "../../components/ReportExportBar";
+import { Toast } from "../../components/Toast";
+import { type ReportPeriod, PERIOD_LABEL, periodSince, fmtDateTime } from "../../lib/report-data";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type Period = "week" | "month" | "all";
+// Today = since midnight (Asia/Manila); This Week = rolling 7 days;
+// This Month = rolling month; All Time. Same rules as the reports.
+type Period = ReportPeriod;
+const PERIODS: Period[] = ["today", "week", "month", "all"];
 
 type StudentStat = {
   id: string;
@@ -45,14 +51,7 @@ function formatTime(ms: number): string {
 }
 
 function periodFilter(period: Period): string | null {
-  if (period === "all") return null;
-  const now = new Date();
-  if (period === "week") {
-    now.setDate(now.getDate() - 7);
-  } else {
-    now.setMonth(now.getMonth() - 1);
-  }
-  return now.toISOString();
+  return periodSince(period)?.toISOString() ?? null;
 }
 
 function accuracyColors(pct: number) {
@@ -124,6 +123,7 @@ export default function AnalyticsScreen() {
   const [summary, setSummary]         = useState<ClassSummary | null>(null);
   const [loading, setLoading]         = useState(true);
   const [refreshing, setRefreshing]   = useState(false);
+  const [reportToast, setReportToast] = useState<{ message: string; detail: string } | null>(null);
 
   const loadAnalytics = useCallback(async () => {
     const { data: { user } } = await supabase.auth.getUser();
@@ -257,19 +257,32 @@ export default function AnalyticsScreen() {
       >
         {/* Period filter */}
         <View style={styles.periodRow}>
-          {(["week", "month", "all"] as Period[]).map(p => (
+          {PERIODS.map(p => (
             <Pressable
               key={p}
               onPress={() => { setPeriod(p); setLoading(true); }}
               style={[styles.periodChip, period === p && styles.periodChipActive]}
               accessibilityRole="button"
+              accessibilityState={{ selected: period === p }}
             >
               <Text style={[styles.periodChipText, period === p && styles.periodChipTextActive]}>
-                {p === "week" ? "This Week" : p === "month" ? "This Month" : "All Time"}
+                {PERIOD_LABEL[p]}
               </Text>
             </Pressable>
           ))}
         </View>
+        <Text style={styles.rangeText}>
+          {period === "all"
+            ? "All answers so far"
+            : `${fmtDateTime(periodSince(period))} to now (Asia/Manila)`}
+        </Text>
+
+        {/* Report for the selected period: every answer and try, PDF or CSV */}
+        <ReportExportBar
+          label={`REPORT · ${PERIOD_LABEL[period].toUpperCase()}`}
+          scope={{ kind: "period", period }}
+          onError={(message, detail) => setReportToast({ message, detail })}
+        />
 
         {!hasData ? (
           /* Empty state */
@@ -327,6 +340,14 @@ export default function AnalyticsScreen() {
           </>
         )}
       </ScrollView>
+      <Toast
+        message={reportToast?.message ?? ""}
+        detail={reportToast?.detail}
+        visible={!!reportToast}
+        variant="warning"
+        duration={6000}
+        onDismiss={() => setReportToast(null)}
+      />
     </SafeAreaView>
   );
 }
@@ -346,8 +367,9 @@ const styles = StyleSheet.create({
   scroll: { padding: 16, gap: 14, paddingBottom: 40 },
 
   // Period filter
-  periodRow:            { flexDirection: "row", gap: 8 },
-  periodChip:           { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 100, borderWidth: 1.5, borderColor: C.border, backgroundColor: C.white },
+  periodRow:            { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  rangeText:            { fontFamily: fonts.body, fontSize: 12, color: C.muted, marginTop: -6 },
+  periodChip:           { paddingHorizontal: 14, paddingVertical: 8, minHeight: 36, justifyContent: "center", borderRadius: 100, borderWidth: 1.5, borderColor: C.border, backgroundColor: C.white },
   periodChipActive:     { backgroundColor: C.navy, borderColor: C.navy },
   periodChipText:       { fontFamily: fonts.heading, fontSize: 12, color: C.muted },
   periodChipTextActive: { color: C.white },

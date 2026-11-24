@@ -21,6 +21,8 @@ import { supabase } from "../../../lib/supabase";
 import { colors as C, fonts } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
 import { BrailleLoader } from "../../../components/BrailleLoader";
+import { ReportExportBar } from "../../../components/ReportExportBar";
+import { Toast } from "../../../components/Toast";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -136,6 +138,9 @@ export default function StudentDetail() {
 
   // Disconnect-device confirm modal
   const [unpairModal, setUnpairModal] = useState(false);
+
+  // Report export failed
+  const [reportToast, setReportToast] = useState<{ message: string; detail: string } | null>(null);
 
   // ── Load data ────────────────────────────────────────────────────────────────
 
@@ -449,6 +454,13 @@ export default function StudentDetail() {
           />
         </View>
 
+        {/* Report: every answer and try, PDF or CSV */}
+        <ReportExportBar
+          label="STUDENT REPORT"
+          scope={{ kind: "student", studentId: student.id }}
+          onError={(message, detail) => setReportToast({ message, detail })}
+        />
+
         {/* Recent attempts */}
         <Text style={styles.sectionLabel}>RECENT ATTEMPTS</Text>
         {attempts.length === 0 ? (
@@ -490,6 +502,15 @@ export default function StudentDetail() {
           </View>
         )}
       </ScrollView>
+
+      <Toast
+        message={reportToast?.message ?? ""}
+        detail={reportToast?.detail}
+        visible={!!reportToast}
+        variant="warning"
+        duration={6000}
+        onDismiss={() => setReportToast(null)}
+      />
 
       {/* ── Options sheet ──────────────────────────────────────────────────── */}
       <Modal

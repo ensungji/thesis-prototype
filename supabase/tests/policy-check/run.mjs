@@ -1063,5 +1063,45 @@ await check("26: changing only the message logs nothing; the SQL editor can swit
   eq((await as(null, null, `select maintenance, maintenance_set_by from app_settings`)).rows, [{ maintenance: false, maintenance_set_by: null }], "off");
 });
 
+// ── 27 answer_attempts.device_id / late ──────────────────────────────────────
+{
+  const S27 = "52700000-0000-0000-0000-000000000000", W27 = "12700000-0000-0000-0000-000000000000";
+  const ANA27 = "a1000000-0000-0000-0000-000000000000", DEV1 = "de100000-0000-0000-0000-000000000000", DEV3 = "de300000-0000-0000-0000-000000000000";
+  const mig27 = readdirSync(migDir).find((f) => f.includes("answer_attempts_device_late"));
+  await check("27: setup: a session word, 3 tries, 2 matching answer_graded logs (+1 with a bad try number)", async () => {
+    await as(null, null, `insert into sessions (id, teacher_id, status) values ('${S27}', '${A}', 'finished')`);
+    await as(null, null, `insert into session_words (id, session_id, word, order_index) values ('${W27}', '${S27}', 'CAT', 0)`);
+    await as(null, "service_role", `insert into answer_attempts (session_word_id, student_id, attempt_no, result) values
+      ('${W27}', '${ANA27}', 1, 'wrong'), ('${W27}', '${ANA27}', 2, 'review'), ('${W27}', '${ANA27}', 3, 'correct')`);
+    await as(null, null, `insert into system_logs (source, event, device_id, meta) values
+      ('edge', 'answer_graded', '${DEV1}', '{"session_word_id":"${W27}","student_id":"${ANA27}","attempt_no":1,"late":false}'),
+      ('edge', 'answer_graded', '${DEV3}', '{"session_word_id":"${W27}","student_id":"${ANA27}","attempt_no":2,"late":true}'),
+      ('edge', 'answer_graded', '${DEV1}', '{"session_word_id":"${W27}","student_id":"${ANA27}","attempt_no":"x"}')`);
+  });
+  await check("27: backfill fills device_id / late from the logs, only where empty; runs again without changes", async () => {
+    await db.exec(readFileSync(join(migDir, mig27), "utf8"));
+    await db.exec(readFileSync(join(migDir, mig27), "utf8"));
+    const r = await as(null, null, `select attempt_no, device_id, late from answer_attempts where session_word_id = '${W27}' order by attempt_no`);
+    eq(r.rows, [
+      { attempt_no: 1, device_id: DEV1, late: false },
+      { attempt_no: 2, device_id: DEV3, late: true },
+      { attempt_no: 3, device_id: null, late: null },
+    ], "tries");
+  });
+  await check("27: grade-answer (service role) writes both; teachers still only read", async () => {
+    await as(null, "service_role", `insert into answer_attempts (session_word_id, student_id, attempt_no, result, device_id, late)
+      values ('${W27}', '${ANA27}', 4, 'correct', '${DEV1}', false)`);
+    eq((await as(A, "authenticated", `select count(*)::int as n from answer_attempts where session_word_id = '${W27}' and device_id is not null`)).rows, [{ n: 3 }], "teacher reads");
+    await expectError(as(A, "authenticated", `update answer_attempts set late = true where session_word_id = '${W27}'`), /permission denied/);
+  });
+  await check("27: removing a device keeps the try (device_id set to null)", async () => {
+    await as(null, null, `update devices set paired_student_id = null where id = '${DEV3}'`);
+    await as(null, null, `delete from devices where id = '${DEV3}'`);
+    const r = await as(null, null, `select device_id, late from answer_attempts where session_word_id = '${W27}' and attempt_no = 2`);
+    eq(r.rows, [{ device_id: null, late: true }], "try 2");
+    await as(null, null, `delete from sessions where id = '${S27}'`);
+  });
+}
+
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);

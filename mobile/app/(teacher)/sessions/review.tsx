@@ -38,6 +38,7 @@ import {
 import { BrailleLoader } from "../../../components/BrailleLoader";
 import { PlayRecordingButton } from "../../../components/PlayRecordingButton";
 import { Toast } from "../../../components/Toast";
+import { ReportExportBar } from "../../../components/ReportExportBar";
 
 const RESULT_STYLE: Record<ReviewResult, { bg: string; fg: string; label: string }> = {
   correct: { bg: C.greenBg, fg: C.green, label: "✓ Correct" },
@@ -380,6 +381,15 @@ export default function SessionReview() {
             )}
           </Pressable>
         )}
+
+        {/* Session report: every answer and try, PDF or CSV */}
+        <View style={{ marginTop: 8 }}>
+          <ReportExportBar
+            label="SESSION REPORT"
+            scope={{ kind: "session", sessionId: data.session.id }}
+            onError={(message, detail) => setToast({ message, detail })}
+          />
+        </View>
       </ScrollView>
 
       {/* Some answers still say Review: ask before counting the session */}

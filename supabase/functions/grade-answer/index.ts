@@ -1,5 +1,8 @@
 // supabase/functions/grade-answer/index.ts
-// Braille D.O.T.S. — voice answer grading  (v7)
+// Braille D.O.T.S. — voice answer grading  (v8)
+//
+// v8: each try also saves device_id and late (migration 27; still works
+//     without it). Response unchanged.
 //
 // v7: (Activities, Phase 1 — needs migrations 20–22)
 //     - every answer is kept in answer_attempts (attempt_no 1, 2, 3 ...) and
@@ -414,6 +417,8 @@ Deno.serve(async (req) => {
         result,
         confidence,
         response_time_ms: responseTimeMs,
+        device_id: deviceId, // migration 27
+        late,
       }, { device_id: deviceId, session_id: sessionId })
     : 1;
 
@@ -552,10 +557,15 @@ async function saveTry(
     result: string;
     confidence: number;
     response_time_ms: number | null;
+    device_id: string;
+    late: boolean;
   },
   ctx: { device_id: string; session_id: string },
 ): Promise<number> {
   let attemptNo = prevTries + 1;
+  // Migration 27 adds device_id / late. Until it's run, the insert is refused
+  // with "column not found" (PGRST204 / 42703): save the try without them.
+  let values: Record<string, unknown> = row;
   for (let i = 0; i < 3; i++) {
     const { data: last } = await supabase
       .from("answer_attempts")
@@ -570,9 +580,15 @@ async function saveTry(
       session_word_id: sessionWordId,
       student_id: studentId,
       attempt_no: attemptNo,
-      ...row,
+      ...values,
     });
     if (!error) return attemptNo;
+    if ((error.code === "PGRST204" || error.code === "42703") && "device_id" in values) {
+      const { device_id: _d, late: _l, ...rest } = row;
+      values = rest;
+      i--; // this round didn't count
+      continue;
+    }
     if (error.code !== "23505") {
       await log("warn", "try_not_saved", `Answer try not saved: ${error.message}`, {
         ...ctx,

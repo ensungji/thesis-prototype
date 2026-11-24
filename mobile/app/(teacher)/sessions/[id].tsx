@@ -32,6 +32,7 @@ import { colors as C, fonts } from "../../../lib/theme";
 import { BrailleCell } from "../../../components/BrailleCell";
 import { BrailleLoader } from "../../../components/BrailleLoader";
 import { Toast } from "../../../components/Toast";
+import { ReportExportBar } from "../../../components/ReportExportBar";
 import { Countdown } from "../../../components/Countdown";
 import { wordToChunks, getPattern, isValidWord } from "../../../lib/braille";
 import { fisherYatesShuffle, saveWordOrder } from "../../../lib/word-order";
@@ -530,6 +531,8 @@ export default function SessionDetail() {
   const [finishSessionModal, setFinishSessionModal] = useState(false);
   const [finishingSession, setFinishingSession] = useState(false);
   const [finishToast, setFinishToast] = useState<{ name: string } | null>(null);
+  // Session report export failed (finished view)
+  const [reportToast, setReportToast] = useState<{ message: string; detail: string } | null>(null);
 
   // ── Auto-pause: app background + navigation away ────────────────────────────
   // sessionStatusRef mirrors session.status without stale-closure issues so
@@ -3005,6 +3008,14 @@ export default function SessionDetail() {
         {Header}
         {DeleteSessionModal}
         <Toast
+          message={reportToast?.message ?? ""}
+          detail={reportToast?.detail}
+          visible={!!reportToast}
+          variant="warning"
+          duration={6000}
+          onDismiss={() => setReportToast(null)}
+        />
+        <Toast
           message="Session finished"
           detail={finishToast?.name}
           visible={!!finishToast}
@@ -3073,6 +3084,13 @@ export default function SessionDetail() {
             </View>
             <Ionicons name="chevron-forward" size={18} color={C.navy} />
           </Pressable>
+
+          {/* ── Session report: every answer and try, PDF or CSV ── */}
+          <ReportExportBar
+            label="SESSION REPORT"
+            scope={{ kind: "session", sessionId: session.id }}
+            onError={(message, detail) => setReportToast({ message, detail })}
+          />
 
           {/* ── Words sent during session ──────────────────────── */}
           <Text style={styles.sectionLabel}>WORDS SENT</Text>
