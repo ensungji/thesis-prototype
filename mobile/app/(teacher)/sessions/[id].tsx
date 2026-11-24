@@ -34,6 +34,7 @@ import { BrailleLoader } from "../../../components/BrailleLoader";
 import { Toast } from "../../../components/Toast";
 import { ReportExportBar } from "../../../components/ReportExportBar";
 import { Countdown } from "../../../components/Countdown";
+import { useKeyboardInset } from "../../../lib/use-keyboard-inset";
 import { wordToChunks, getPattern, isValidWord } from "../../../lib/braille";
 import { fisherYatesShuffle, saveWordOrder } from "../../../lib/word-order";
 import { useWordBank, filterWordBank } from "../../../lib/word-bank";
@@ -533,6 +534,11 @@ export default function SessionDetail() {
   const [finishToast, setFinishToast] = useState<{ name: string } | null>(null);
   // Session report export failed (finished view)
   const [reportToast, setReportToast] = useState<{ message: string; detail: string } | null>(null);
+
+  // Live word input: focused style + kept above the keyboard (Android edge-to-edge)
+  const kb = useKeyboardInset();
+  const sendRowRef = useRef<View>(null);
+  const [wordInputFocused, setWordInputFocused] = useState(false);
 
   // ── Auto-pause: app background + navigation away ────────────────────────────
   // sessionStatusRef mirrors session.status without stale-closure issues so
@@ -3374,7 +3380,13 @@ export default function SessionDetail() {
     <SafeAreaView style={styles.safe} edges={["top"]}>
       <ActiveSessionKeepAwake />
       {Header}
+      {/* paddingBottom = how much of this area the keyboard covers (lib/use-keyboard-inset) */}
+      <View ref={kb.containerRef} style={{ flex: 1, paddingBottom: kb.inset }}>
       <ScrollView
+        ref={kb.scrollRef}
+        onScroll={kb.onScroll}
+        scrollEventThrottle={16}
+        keyboardShouldPersistTaps="handled"
         contentContainerStyle={styles.scroll}
         showsVerticalScrollIndicator={false}
         stickyHeaderIndices={[0]}
@@ -3548,9 +3560,18 @@ export default function SessionDetail() {
                   Type a word and send it to the braille display. You dictate the pace based on the student&apos;s progress.
                 </Text>
 
-                <View style={styles.sendRow}>
+                <View ref={sendRowRef} style={styles.sendRow}>
                   <TextInput
-                    style={[styles.wordInput, { flex: 1 }]}
+                    style={[styles.wordInput, wordInputFocused && styles.wordInputFocused, { flex: 1 }]}
+                    onFocus={() => {
+                      setWordInputFocused(true);
+                      kb.reveal(sendRowRef.current);
+                    }}
+                    onBlur={() => {
+                      setWordInputFocused(false);
+                      kb.reveal(null);
+                    }}
+                    accessibilityLabel="Word to send"
                     value={manualWord}
                     onChangeText={(v) => {
                       // Input Validation: Enforce strict A-Z only
@@ -4056,6 +4077,7 @@ export default function SessionDetail() {
         )}
 
       </ScrollView>
+      </View>
       {WordBankSheet}
       {DupWordModal}
       {FinishSessionModal}
@@ -4742,6 +4764,15 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     paddingHorizontal: 16,
     paddingVertical: 13,
+  },
+  // Live word input while typing: thicker navy border + light blue wash.
+  // Padding drops by the extra border so the text doesn't jump.
+  wordInputFocused: {
+    borderWidth: 2.5,
+    borderColor: C.navy,
+    backgroundColor: C.blueWash,
+    paddingHorizontal: 15,
+    paddingVertical: 12,
   },
   wordInputDisabled: {
     backgroundColor: C.brownBg,
