@@ -1103,5 +1103,59 @@ await check("26: changing only the message logs nothing; the SQL editor can swit
   });
 }
 
+// ── 28 profiles.pending_approval (teacher self-registration) ────────────────
+{
+  const SELF = "5e1f0000-0000-0000-0000-000000000000", SELF2 = "5e1f0000-0000-0000-0000-000000000002";
+  const ADDED = "add00000-0000-0000-0000-000000000000";
+  const mig28 = readdirSync(migDir).find((f) => f.includes("profiles_pending_approval"));
+  await check("28: existing profiles are not pending (column default false, not null)", async () => {
+    const r = await as(null, null, `select count(*)::int as n, count(*) filter (where pending_approval)::int as p from profiles`);
+    eq(r.rows[0].p, 0, "pending");
+    await expectError(as(null, null, `update profiles set pending_approval = null where id = '${A}'`), /null value/);
+  });
+  await check("28: register-teacher's user (app_metadata dots_signup=self) starts teacher / inactive / pending, whatever the metadata says", async () => {
+    await as(null, null, `insert into auth.users (id, email, raw_user_meta_data, raw_app_meta_data) values
+      ('${SELF}', 'self@x', '{"role":"admin","full_name":"Self Signup","is_active":true,"pending_approval":false}', '{"dots_signup":"self"}')`);
+    const r = await as(null, null, `select role, is_active, pending_approval, full_name from profiles where id = '${SELF}'`);
+    eq(r.rows, [{ role: "teacher", is_active: false, pending_approval: true, full_name: "Self Signup" }], "profile");
+  });
+  await check("28: the function's upsert can't turn a sign-up into an admin by inserting the profile itself", async () => {
+    await as(null, null, `insert into auth.users (id, email, raw_app_meta_data) values ('${SELF2}', 'self2@x', '{"dots_signup":"self"}')`);
+    await as(null, null, `delete from profiles where id = '${SELF2}'`); // as if handle_new_user hadn't made it
+    await as(null, "service_role", `insert into profiles (id, email, role, is_active, pending_approval) values ('${SELF2}', 'self2@x', 'admin', true, false)`);
+    const r = await as(null, null, `select role, is_active, pending_approval from profiles where id = '${SELF2}'`);
+    eq(r.rows, [{ role: "teacher", is_active: false, pending_approval: true }], "profile");
+  });
+  await check("28: Add Teacher (no dots_signup) is not pending and stays active", async () => {
+    await as(null, null, `insert into auth.users (id, email, raw_user_meta_data) values ('${ADDED}', 'added@x', '{"full_name":"Added"}')`);
+    eq((await as(null, null, `select role, is_active, pending_approval from profiles where id = '${ADDED}'`)).rows,
+      [{ role: "teacher", is_active: true, pending_approval: false }], "profile");
+  });
+  await check("28: a teacher can't clear (or set) their own pending_approval; other columns still editable", async () => {
+    await expectError(as(SELF, "authenticated", `update profiles set pending_approval = false where id = '${SELF}'`), /Only an admin|row-level security/);
+    await expectError(as(A, "authenticated", `update profiles set pending_approval = true where id = '${A}'`), /Only an admin can change approval status/);
+    eq((await as(A, "authenticated", `update profiles set full_name = 'Alice B' where id = '${A}' returning pending_approval`)).rows,
+      [{ pending_approval: false }], "own name");
+  });
+  await check("28: approving: service role (set-teacher-active) and an admin can; deactivating leaves it alone", async () => {
+    await as(null, "service_role", `update profiles set is_active = true, pending_approval = false where id = '${SELF}'`);
+    eq((await as(null, null, `select is_active, pending_approval from profiles where id = '${SELF}'`)).rows, [{ is_active: true, pending_approval: false }], "approved");
+    await as(null, "service_role", `update profiles set is_active = false where id = '${SELF}'`);
+    eq((await as(null, null, `select is_active, pending_approval from profiles where id = '${SELF}'`)).rows, [{ is_active: false, pending_approval: false }], "deactivated");
+    eq((await as(D, "authenticated", `update profiles set pending_approval = false where id = '${SELF2}' returning pending_approval`)).rows,
+      [{ pending_approval: false }], "admin");
+  });
+  await check("28: anon can't read or change it", async () => {
+    eq((await as(null, "anon", `select pending_approval from profiles`)).rows.length, 0, "anon reads");
+    eq((await as(null, "anon", `update profiles set pending_approval = false returning id`)).rows.length, 0, "anon updates");
+  });
+  await check("28: runs again without changing anything", async () => {
+    await db.exec(readFileSync(join(migDir, mig28), "utf8"));
+    eq((await as(null, null, `select pending_approval from profiles where id = '${SELF}'`)).rows, [{ pending_approval: false }], "kept");
+    await as(null, null, `delete from profiles where id in ('${SELF}', '${SELF2}', '${ADDED}')`);
+    await as(null, null, `delete from auth.users where id in ('${SELF}', '${SELF2}', '${ADDED}')`);
+  });
+}
+
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);
