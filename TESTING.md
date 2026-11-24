@@ -1124,7 +1124,7 @@ deactivate. Phone online unless a step says otherwise.
    Not signed out, not the teacher screens. Turn airplane mode off.
 7. **Do (API trick):** while signed in as admin on a dev build, open the
    teacher dashboard by deep link
-   `npx uri-scheme open "mobile:///(teacher)/dashboard" --android`
+   `npx uri-scheme open "brailledots:///dashboard" --android`
    (or any way into the teacher tabs).
    **Expect:** a blank screen for a moment, then the Admin Panel. The
    teacher tabs are never usable.
