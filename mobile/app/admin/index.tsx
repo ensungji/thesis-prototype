@@ -11,6 +11,7 @@ import {
   Modal,
   StyleSheet,
   RefreshControl,
+  useWindowDimensions,
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter, useFocusEffect, useLocalSearchParams } from "expo-router";
@@ -107,6 +108,9 @@ function TeacherCard({
 
 export default function AdminDashboard() {
   const router = useRouter();
+  // Header layout: one row on wide screens, two rows on phones
+  const { width } = useWindowDimensions();
+  const wideHeader = width >= 520;
   const insets = useSafeAreaInsets();
   const params = useLocalSearchParams<{
     created?: string;
@@ -272,52 +276,52 @@ export default function AdminDashboard() {
   // For the confirm sheet
   const isDeactivating = confirmTarget?.is_active ?? true;
 
+  const SignOutButton = (
+    <Pressable
+      onPress={signOut}
+      style={({ pressed }) => [styles.headerBtn, styles.headerBtnSignOut, pressed && { opacity: 0.7 }]}
+      accessibilityRole="button"
+      accessibilityLabel="Sign out"
+    >
+      <Ionicons name="log-out-outline" size={18} color={C.red} />
+      <Text style={styles.headerBtnText}>Sign Out</Text>
+    </Pressable>
+  );
+
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
-      {/* Header */}
-      <View style={styles.header}>
-        <View>
-          <Text style={styles.title}>Admin Panel</Text>
-          <Text style={styles.subtitle}>Braille D.O.T.S</Text>
+      {/* Header. Phones: title + Sign Out on top, Activities / Logs as two
+          equal buttons below. Wide screens (≥ 520 dp): everything on one row.
+          Every button is at least 44 px tall; labels never truncate (the
+          rows wrap with large system font sizes). */}
+      <View style={[styles.header, wideHeader && styles.headerWide]}>
+        <View style={styles.headerTop}>
+          <View style={styles.headerTitle}>
+            <Text style={styles.title} numberOfLines={1}>Admin Panel</Text>
+            <Text style={styles.subtitle}>Braille D.O.T.S</Text>
+          </View>
+          {!wideHeader && SignOutButton}
         </View>
-        <View style={{ flexDirection: "row", gap: 8 }}>
-        <Pressable
-          onPress={() => router.push("/admin/activities" as any)}
-          style={({ pressed }) => [
-            styles.signOutBtn,
-            { backgroundColor: C.blueWash },
-            pressed && { opacity: 0.7 },
-          ]}
-          accessibilityRole="button"
-          accessibilityLabel="Activities overview"
-        >
-          <Ionicons name="list-outline" size={18} color={C.navy} />
-          <Text style={[styles.signOutText, { color: C.navy }]}>Activities</Text>
-        </Pressable>
-        <Pressable
-          onPress={() => router.push("/admin/logs" as any)}
-          style={({ pressed }) => [
-            styles.signOutBtn,
-            { backgroundColor: C.blueWash },
-            pressed && { opacity: 0.7 },
-          ]}
-          accessibilityRole="button"
-          accessibilityLabel="System logs"
-        >
-          <Ionicons name="document-text-outline" size={18} color={C.navy} />
-          <Text style={[styles.signOutText, { color: C.navy }]}>Logs</Text>
-        </Pressable>
-        <Pressable
-          onPress={signOut}
-          style={({ pressed }) => [
-            styles.signOutBtn,
-            pressed && { opacity: 0.7 },
-          ]}
-          accessibilityRole="button"
-        >
-          <Ionicons name="log-out-outline" size={18} color={C.red} />
-          <Text style={styles.signOutText}>Sign Out</Text>
-        </Pressable>
+        <View style={[styles.headerNav, wideHeader && styles.headerNavWide]}>
+          <Pressable
+            onPress={() => router.push("/admin/activities" as any)}
+            style={({ pressed }) => [styles.headerBtn, styles.headerBtnNav, !wideHeader && styles.headerBtnGrow, pressed && { opacity: 0.7 }]}
+            accessibilityRole="button"
+            accessibilityLabel="Activities overview"
+          >
+            <Ionicons name="list-outline" size={18} color={C.navy} />
+            <Text style={[styles.headerBtnText, { color: C.navy }]}>Activities</Text>
+          </Pressable>
+          <Pressable
+            onPress={() => router.push("/admin/logs" as any)}
+            style={({ pressed }) => [styles.headerBtn, styles.headerBtnNav, !wideHeader && styles.headerBtnGrow, pressed && { opacity: 0.7 }]}
+            accessibilityRole="button"
+            accessibilityLabel="System logs"
+          >
+            <Ionicons name="document-text-outline" size={18} color={C.navy} />
+            <Text style={[styles.headerBtnText, { color: C.navy }]}>Logs</Text>
+          </Pressable>
+          {wideHeader && SignOutButton}
         </View>
       </View>
 
@@ -715,15 +719,35 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 
   header: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 20,
-    paddingVertical: 16,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 12,
+    gap: 12,
     backgroundColor: C.white,
     borderBottomWidth: 1.5,
     borderBottomColor: C.border,
   },
+  headerWide: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 20 },
+  headerTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 },
+  headerTitle: { flexShrink: 1 },
+  headerNav: { flexDirection: "row", flexWrap: "wrap", gap: 10 },
+  headerNavWide: { justifyContent: "flex-end" },
+  headerBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    minHeight: 44,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+  },
+  headerBtnNav: { backgroundColor: C.blueWash, borderWidth: 1.5, borderColor: "#C9DDF1" },
+  headerBtnSignOut: { backgroundColor: C.redBg, borderWidth: 1.5, borderColor: "#F0CACA" },
+  // phones: Activities / Logs share the row equally; on a very narrow screen
+  // or with large text each takes a full row instead of truncating
+  headerBtnGrow: { flexGrow: 1, flexBasis: 130 },
+  headerBtnText: { fontFamily: fonts.heading, fontSize: 14, color: C.red },
   title: { fontFamily: fonts.heading, fontSize: 22, color: C.navy },
   subtitle: {
     fontFamily: fonts.mono,
@@ -731,16 +755,6 @@ const styles = StyleSheet.create({
     color: C.brown,
     letterSpacing: 0.5,
   },
-  signOutBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 10,
-    backgroundColor: C.redBg,
-  },
-  signOutText: { fontFamily: fonts.heading, fontSize: 13, color: C.red },
 
   summaryRow: { flexDirection: "row", gap: 10, padding: 16, paddingBottom: 4 },
   summaryCard: {

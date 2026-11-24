@@ -1046,3 +1046,57 @@ Git Bash, tokens from section B6 (`$A` = T1, `$ADMIN`).
     `update public.app_settings set maintenance = false;`
     **Expect:** the bar disappears on T1's phone; a `maintenance_off` log row
     with no user.
+
+---
+
+## Branch feature/reports-and-signup
+
+Branch from `feature/activities` (f1917e5). One part per section; the
+reports (Part 1), sign-up, routing and word bank sections are added when
+those parts are finished.
+
+### R2 Live Session word input (JS only: reload a dev build)
+Use the **smallest Android phone** you have, and one other phone if possible.
+Start a Live Session with one student and launch it.
+1. **Do:** look at the word input without touching it.
+   **Expect:** thin grey border, light grey background.
+2. **Do:** tap the input.
+   **Expect:** the border turns thick navy and the box goes light blue; the
+   text inside doesn't jump. The keyboard opens and the screen scrolls so the
+   whole row (input, **Word Bank**, **Send**) sits just above the keyboard,
+   fully visible. The braille preview stays pinned at the top.
+3. **Do:** type `CAT`, tap **Send** with the keyboard still open.
+   **Expect:** sent on the first tap (the tap isn't used up closing the
+   keyboard).
+4. **Do:** with the keyboard open, tap an empty area of the screen below the
+   header (between cards, or on a card's plain text).
+   **Expect:** the keyboard closes; the input goes back to the grey style;
+   the empty space at the bottom disappears.
+5. **Do:** tap the input, then close the keyboard with the Android **Back**
+   button (the input may stay focused), then tap the input again.
+   **Expect:** the keyboard opens and the row is scrolled above it again.
+6. **Do:** scroll the list all the way down (with several words sent so the
+   Words Sent card is long), then tap the input.
+   **Expect:** the screen scrolls back so the row is above the keyboard.
+7. **Do:** rotate the phone to landscape (if rotation is on) and repeat 2.
+   **Expect:** the row is still above the keyboard (or as high as the screen
+   allows).
+8. **Do (iPhone, if you have one):** repeat 2–4.
+   **Expect:** same behaviour; nothing hidden behind the keyboard.
+
+### R3 Admin Panel header (JS only)
+1. **Do:** log in as admin on a small phone (about 5", 360 dp wide or less).
+   **Expect:** top row: **Admin Panel** / Braille D.O.T.S on the left,
+   **Sign Out** (red) on the right. Second row: **Activities** and **Logs**,
+   the same width, side by side. No label cut off ("Activi…"), even spacing,
+   nothing touching the screen edges.
+2. **Do:** tap each button near its edge.
+   **Expect:** every button reacts (each is at least 44 px tall). Activities
+   and Logs open their screens; Sign Out opens the "Sign Out?" sheet.
+3. **Do:** Android Settings → Display → Font size **largest**, open the
+   Admin Panel again.
+   **Expect:** labels still complete; if they don't fit side by side,
+   Activities and Logs each take a full row instead of truncating.
+4. **Do:** a large phone or tablet (520 dp wide or more), or landscape.
+   **Expect:** title on the left, Activities · Logs · Sign Out on one row on
+   the right.
