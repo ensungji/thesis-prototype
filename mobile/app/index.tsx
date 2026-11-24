@@ -1,8 +1,8 @@
 // mobile/app/index.tsx
 // Braille D.O.T.S — Splash + Landing screen.
 
-import { useState, useEffect, useRef } from "react";
-import { useRouter } from "expo-router";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { useRouter, useFocusEffect } from "expo-router";
 import {
   View,
   Text,
@@ -15,7 +15,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { supabase } from "../lib/supabase";
+import { routeForSession } from "../lib/route-for-session";
 import { fonts } from "../lib/theme";
 
 
@@ -264,39 +264,39 @@ function LandingPage({ onHelp, onStart }: { onHelp: () => void; onStart: () => v
 export default function Intro() {
   const router = useRouter();
   const [ready, setReady] = useState(false);
+  const firstCheck = useRef(true);
 
-  useEffect(() => {
-    supabase.auth
-      .getSession()
-      .then(async ({ data: { session } }) => {
-        if (session) {
-          const { data: profile } = await supabase
-            .from("profiles")
-            .select("role, is_active")
-            .eq("id", session.user.id)
-            .single();
-          // Deactivated since the last login: sign out. (If the profile can't
-          // load, e.g. offline, carry on as before; the server bans the login.)
-          if (profile?.is_active === false) {
-            await supabase.auth.signOut();
-            setReady(true);
-            return;
-          }
-          if (profile?.role === "admin") {
-            router.replace("/admin" as any);
+  // At start, and whenever this screen comes back into view (Back / swipe
+  // from a signed-in area): a saved login goes to where it belongs
+  // (lib/route-for-session), so the welcome screen is never shown to someone
+  // who is still signed in. A deactivated user is signed out and stays here.
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+      const first = firstCheck.current;
+      firstCheck.current = false;
+      routeForSession()
+        .then(({ route, reason }) => {
+          if (!active) return;
+          if (route) {
+            router.replace(route as any);
+          } else if (first && reason === "no-session") {
+            // 2500 ms — gives DB + assets time to fully initialize
+            setTimeout(() => setReady(true), 2500);
           } else {
-            router.replace("/(teacher)/dashboard" as any);
+            // signed out (deactivated), or offline with no known role
+            setReady(true);
           }
-        } else {
-          // 2500 ms — gives DB + assets time to fully initialize
-          setTimeout(() => setReady(true), 2500);
-        }
-      })
-      .catch((err) => {
-        console.warn("Auth session check failed on startup:", err);
-        setReady(true);
-      });
-  }, []);
+        })
+        .catch((err) => {
+          console.warn("Auth session check failed on startup:", err);
+          setReady(true);
+        });
+      return () => {
+        active = false;
+      };
+    }, [router]),
+  );
 
   if (!ready) return <SplashScreen />;
 

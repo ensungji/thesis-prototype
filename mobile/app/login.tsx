@@ -22,6 +22,7 @@ import { supabase } from "../lib/supabase";
 import { colors as C, fonts } from "../lib/theme";
 import { BrailleCell } from "../components/BrailleCell";
 import { getDeviceId, resetDeviceId } from "../lib/device-id";
+import { homeFor, readAccess, routeForSession } from "../lib/route-for-session";
 
 export default function Login() {
   const router = useRouter();
@@ -33,11 +34,20 @@ export default function Login() {
   const [error, setError]               = useState<string | null>(null);
   const [focused, setFocused]           = useState<"email" | "password" | null>(null);
 
-  // Skip login if a session already exists (e.g. app restart)
+  // A saved login (e.g. Back to the welcome screen → Get Started) goes to
+  // where its role belongs, never straight to the teacher screens
+  // (lib/route-for-session). Deactivated: signed out, the form stays.
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session) router.replace("/(teacher)/dashboard" as any);
+    let active = true;
+    routeForSession().then(({ route, reason }) => {
+      if (!active) return;
+      if (route) router.replace(route as any);
+      else if (reason === "inactive") setError("Your account has been deactivated. Contact the admin.");
+      else if (reason === "offline") setError("Couldn't check your account. Check your connection and try again.");
     });
+    return () => {
+      active = false;
+    };
   }, [router]);
 
   /** Claim this device as active and navigate to the correct screen. */
@@ -53,11 +63,7 @@ export default function Login() {
       .update({ active_device_id: deviceId })
       .eq("id", userId);
 
-    if (role === "admin") {
-      router.replace("/admin" as any);
-    } else {
-      router.replace("/(teacher)/dashboard" as any);
-    }
+    router.replace(homeFor(role) as any);
   }
 
   async function signIn() {
@@ -80,25 +86,23 @@ export default function Login() {
       return;
     }
 
-    // Fetch profile for role + active check + concurrent session check
-    const { data: profile, error: profileError } = await supabase
-      .from("profiles")
-      .select("role, is_active, active_device_id")
-      .eq("id", signInData.user!.id)
-      .single();
+    // Profile for role + active check + concurrent session check (also
+    // remembers the role on this phone for the offline fallback)
+    const access = await readAccess(signInData.user!.id);
 
     setLoading(false);
 
     // No profile = we can't tell the role or whether the account is active:
     // don't let them in (a deactivated teacher must not slip through)
-    if (profileError || !profile) {
+    if (!access.ok) {
       await supabase.auth.signOut();
       setError("Couldn't load your account. Check your connection and try again.");
       return;
     }
+    const profile = { role: access.role, active_device_id: access.activeDeviceId };
 
     // Only block if explicitly deactivated (is_active === false, not null/undefined)
-    if (profile.is_active === false) {
+    if (!access.isActive) {
       await supabase.auth.signOut();
       setError("Your account has been deactivated. Contact the admin.");
       return;

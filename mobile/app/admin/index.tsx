@@ -12,6 +12,7 @@ import {
   StyleSheet,
   RefreshControl,
   useWindowDimensions,
+  BackHandler,
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter, useFocusEffect, useLocalSearchParams } from "expo-router";
@@ -108,6 +109,18 @@ function TeacherCard({
 
 export default function AdminDashboard() {
   const router = useRouter();
+  // Android Back on the Admin Panel leaves the app instead of showing the
+  // welcome screen while still signed in (open sheets handle Back themselves)
+  useFocusEffect(
+    useCallback(() => {
+      const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+        BackHandler.exitApp();
+        return true;
+      });
+      return () => sub.remove();
+    }, []),
+  );
+
   // Header layout: one row on wide screens, two rows on phones
   const { width } = useWindowDimensions();
   const wideHeader = width >= 520;

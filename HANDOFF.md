@@ -1,6 +1,6 @@
 # Braille D.O.T.S. — Handoff
 
-Last updated: 12 Nov 2026. Repo: `github.com/ensungji/thesis-prototype`.
+Last updated: 24 Nov 2026. Repo: `github.com/ensungji/thesis-prototype`.
 Companion files: `AUDIT.md` (audit findings), `TESTING.md` (test checklist), `Braille_DOTS_Test_Results.xlsx` (results + bug list).
 
 ---
@@ -12,8 +12,9 @@ Companion files: `AUDIT.md` (audit findings), `TESTING.md` (test checklist), `Br
 | **`main`** | Has the full audit work (PR #9 `fix/audit` merged). |
 | **`fix/bugs`** | 7 bug fixes (B-01 to B-07), 2 firmware commits, and app changes C1–C3 (logs CSV export, 20 s break, braille preview pinned at the top). **Pushed, not merged yet.** C1 needs a new preview build. |
 | **`feature/activities`** | Branched from `fix/bugs`. Activities Phases 1–6 (section 2b). **Pushed, not merged, app part not tested.** |
-| **Database** | Migrations 01–14 and **16–26 run** (25 and 26 on 2026-11-12; `author_name` backfilled on the 8 existing activities, all teacher-made). Phase 1 script now has **74 checks** (needs a re-run after 25/26). 15 is covered by 21 (it adds the `graded_by` check). `LATER_…sql.txt` not run, on purpose. |
-| **Edge functions** | `reset-teacher-password`, `create-teacher`, `set-teacher-active`, `register-device` deployed with the new checks; **`grade-answer` v7 deployed** (every try saved, tries, correct lock). |
+| **`feature/reports-and-signup`** | Branched from `feature/activities` (f1917e5). Parts 1–4 done and pushed: PDF + CSV reports, Live Session keyboard, admin header, admin routing (section 2c). Parts 5–6 to come. **Needs a new EAS build (expo-print).** |
+| **Database** | Migrations 01–14 and **16–27 run** (25 and 26 on 2026-11-12; `author_name` backfilled on the 8 existing activities, all teacher-made; **27 on 2026-11-24: 558/558 tries backfilled with `device_id` and `late`**). Phase 1 script now has **74 checks** (needs a re-run after 25/26). 15 is covered by 21 (it adds the `graded_by` check). `LATER_…sql.txt` not run, on purpose. |
+| **Edge functions** | `reset-teacher-password`, `create-teacher`, `set-teacher-active`, `register-device` deployed with the new checks; **`grade-answer` v8 deployed** (2026-11-24: each try also saves `device_id` and `late`, migration 27; v7: every try saved, tries, correct lock). |
 | **App testing** | 22 pass, 2 partial, 15 waiting for the full device (see the Excel file). The B-01 to B-07 fixes are **not tested yet**. |
 | **Hardware** | Device assembled. Dots respond, but **weak upright** and **cells 1–3 don't respond**. See section 4. |
 
@@ -74,6 +75,19 @@ Word lists run as a teacher-paced session. Teachers make and own them and choose
 - **Who owns / sees an activity (migration 25):** only teachers create, edit drafts, publish, delete drafts, duplicate and start. Every new activity and every copy is a private draft (`shared` false; a draft can never be shared). The owner turns "Share with all teachers" on / off on a published one at any time; un-sharing never touches sessions (they keep their own copy of the words and the name / author). Teachers see shared + published, and all of their own. Admins read everything and only hide / unhide published ones; `hidden` always means hidden by an admin: the owner still sees it but can't share, un-share, unhide or duplicate it, and nobody can start it. Owners can't hide their own (un-share instead; an "Archive" may come later). `author_name` is copied at creation (teachers can't read each other's profiles).
 - **Maintenance mode (migration 26):** one row in `app_settings`; everyone signed in reads it, only admins change it; on / off is logged (`maintenance_on` / `maintenance_off`; a message-only change isn't). While on, signed-in non-admins can't create sessions, start a pending one (pending → in_progress / paused), call `start_activity_session`, or write `activities` / `activity_words` (SQLSTATE DT002, triggers `a_maintenance_guard`). Everything a started session needs, reading, review, students, word bank and pairing still work; admins, the service role (grade-answer) and the SQL editor are never blocked. The outbox drops DT002 refusals like 42501 / DT001. Emergency off: `update public.app_settings set maintenance = false;`
 - **Agreement rule:** only reviewed sessions; a voice answer = still `auto` or re-graded from `auto`; it disagrees if re-graded to a different `is_correct`; rows still marked Review aren't counted. Same rule in `lib/review.ts` and `speech_grading_agreement()`.
+
+---
+
+## 2c. Reports and sign-up (`feature/reports-and-signup`, not merged)
+
+Tests: `TESTING.md`, section "Branch feature/reports-and-signup".
+
+| Part | What | State |
+|---|---|---|
+| **1. PDF + CSV reports** | Per student (students screen, period chips), per session (finished session + Review screen), Analytics period (new **Today** chip = since midnight Asia/Manila). Every answer and every try, metrics by student and group (B = Beginner, I = Intermediate, other = Other), data dictionary. CSV = one row per try. `lib/report-data.ts`, `lib/pdf-report.ts`, `components/ReportExportBar.tsx`. Migration 27 `20261124120100_answer_attempts_device_late.sql`: `answer_attempts.device_id` + `late`. | Migration 27 **run**, grade-answer **v8 deployed** (2026-11-24). **New EAS build needed** (expo-print). Not tested on a phone. |
+| **2. Live Session input** | Focused style; input row kept above the keyboard on Android edge-to-edge (`lib/use-keyboard-inset.ts`). | JS only. Not tested on a phone. |
+| **3. Admin header** | Two rows on phones, one row ≥ 520 dp, 44 px buttons. | JS only. Not tested on a phone. |
+| **4. Admin routing** | `lib/route-for-session.ts` decides admin / teacher / signed out for the welcome screen, login, and both layout guards; admins never land in the teacher screens (also offline, using the last role seen on the phone); deactivated saved logins are signed out; Android Back on the Admin Panel leaves the app. | JS only. Not tested on a phone. |
 
 ---
 

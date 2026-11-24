@@ -1100,3 +1100,53 @@ Start a Live Session with one student and launch it.
 4. **Do:** a large phone or tablet (520 dp wide or more), or landscape.
    **Expect:** title on the left, Activities · Logs · Sign Out on one row on
    the right.
+
+### R4 Admin never lands in the teacher screens (JS only)
+You need the admin, teacher **T1**, and a spare teacher **T3** you can
+deactivate. Phone online unless a step says otherwise.
+1. **Do:** sign out everywhere. Admin: welcome → **Get Started** → sign in.
+   **Expect:** Admin Panel.
+2. **Do:** press Android **Back** on the Admin Panel.
+   **Expect:** the app closes (goes to the home screen). The welcome screen
+   is **not** shown.
+3. **Do:** open the app again from the launcher.
+   **Expect:** splash, then straight to the Admin Panel (no welcome, no
+   teacher tabs, not even for a moment).
+4. **Do (old bug path):** from the Admin Panel, use anything that brings
+   back the welcome screen (on iPhone: swipe back from the left edge), then
+   tap **Get Started**.
+   **Expect:** back in the Admin Panel; never the teacher Dashboard.
+5. **Do:** with a sheet open on the Admin Panel (e.g. Sign Out?), press
+   **Back**.
+   **Expect:** only the sheet closes; the app stays open.
+6. **Do:** force-close the app, turn on **airplane mode**, open the app.
+   **Expect:** the Admin Panel (maybe with offline errors in its lists).
+   Not signed out, not the teacher screens. Turn airplane mode off.
+7. **Do (API trick):** while signed in as admin on a dev build, open the
+   teacher dashboard by deep link
+   `npx uri-scheme open "mobile:///(teacher)/dashboard" --android`
+   (or any way into the teacher tabs).
+   **Expect:** a blank screen for a moment, then the Admin Panel. The
+   teacher tabs are never usable.
+8. **Do (teacher unaffected):** sign out; T1 signs in.
+   **Expect:** teacher Dashboard as before. All tabs, sessions, word bank
+   work. Close and reopen the app: straight to the Dashboard. Airplane
+   mode + reopen: still the Dashboard (not signed out).
+9. **Do (T1, Back):** press Back on the Dashboard.
+   **Expect:** you stay signed in. The welcome screen may flash and the
+   Dashboard comes back (or the app closes); you never end up on the
+   welcome screen while signed in.
+10. **Do (deactivated, saved login):** T3 signs in on the phone and closes
+    the app. Admin (another phone) deactivates T3. Open the app on T3's
+    phone.
+    **Expect:** splash, then the **welcome screen**, signed out. Get Started
+    → the sign-in form (empty); signing in as T3 is refused.
+11. **Do (deactivated while inside):** T3 reactivated and signed in, on the
+    Dashboard. Admin deactivates T3. On T3's phone switch tabs or pull to
+    refresh, then close and reopen the app.
+    **Expect:** at the latest on reopening: the welcome screen, signed out.
+12. **Do (offline, deactivated):** T3 signed in, airplane mode, admin
+    deactivates T3, reopen T3's app (still offline).
+    **Expect:** T3 stays on the teacher screens offline (no profile check
+    possible). As soon as the phone is online and the app is reopened,
+    T3 is signed out (step 10). Reactivate T3 after the test.

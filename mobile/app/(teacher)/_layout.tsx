@@ -1,10 +1,12 @@
 // mobile/app/(teacher)/_layout.tsx
 // Tab navigator for the authenticated teacher area.
-// Auth guard: redirects to login if no active session.
+// Auth guard: redirects to the welcome screen if no active session; an admin
+// is sent to /admin (lib/route-for-session), a deactivated user is signed out.
 // Maintenance mode (migration 26): a banner sits just above the tab bar on
 // every teacher screen while it's on.
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { View, StyleSheet } from "react-native";
 import { Tabs, useRouter } from "expo-router";
 import { BottomTabBar } from "@react-navigation/bottom-tabs";
 import { Ionicons } from "@expo/vector-icons";
@@ -12,17 +14,46 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { supabase } from "../../lib/supabase";
 import { colors as C, fonts } from "../../lib/theme";
 import { MaintenanceBanner } from "../../components/MaintenanceBanner";
+import { ADMIN_HOME, rememberedRole, routeForSession } from "../../lib/route-for-session";
 
 export default function TeacherLayout() {
   const insets = useSafeAreaInsets();
   const router  = useRouter();
+  // Covers the tabs until we know this isn't an admin (no flash of teacher
+  // screens). Offline with nothing known: shown, as before.
+  const [checked, setChecked] = useState(false);
 
-  // Auth guard — redirect to login if no active session
+  // Role guard: admins never stay in the teacher screens
   useEffect(() => {
-    // Check on mount
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (!session) router.replace("/");
-    });
+    let active = true;
+    (async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        router.replace("/");
+        return;
+      }
+      // Fast path: the role this phone saw last time
+      if ((await rememberedRole(session.user.id)) === "admin") {
+        router.replace(ADMIN_HOME as any);
+        return;
+      }
+      // Then the server: admin → /admin; deactivated → signed out (the
+      // listener below goes to "/"); offline → stay (never signs out)
+      const { route, reason } = await routeForSession();
+      if (!active) return;
+      if (route === ADMIN_HOME) {
+        router.replace(ADMIN_HOME as any);
+        return;
+      }
+      if (reason !== "inactive" && reason !== "no-session") setChecked(true);
+    })().catch(() => active && setChecked(true));
+    return () => {
+      active = false;
+    };
+  }, [router]);
+
+  // Auth guard — back to the welcome screen on sign-out / session expiry
+  useEffect(() => {
 
     // Listen for sign-out / session expiry
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
@@ -37,6 +68,7 @@ export default function TeacherLayout() {
   }, [router]);
 
   return (
+    <>
     <Tabs
       tabBar={(props) => (
         <>
@@ -134,5 +166,7 @@ export default function TeacherLayout() {
         })}
       />
     </Tabs>
+    {!checked && <View style={[StyleSheet.absoluteFill, { backgroundColor: C.bg }]} pointerEvents="auto" />}
+    </>
   );
 }
