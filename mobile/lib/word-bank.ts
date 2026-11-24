@@ -1,6 +1,13 @@
 // mobile/lib/word-bank.ts
-// The teacher's Word Bank plus the shared words (teacher_id = null), for
-// picking words: the Add Word screen and the Live session's Word Bank sheet.
+// The shared Word Bank (migration 29): every active teacher reads every
+// teacher's words, plus the old shared words (teacher_id = null). Used by the
+// Word Bank tab, Add Word's Word Bank tab, the Live session's Word Bank sheet
+// and the activity editor's From Word Bank.
+//   - each word is listed once (case-insensitive); the teacher's own copy wins
+//   - mine = the teacher's own word (only these can be deleted);
+//     shared = anyone else's (other teachers', or teacher_id null)
+//   - "Already in your Word Bank" (saveWordToBank) still checks only the
+//     teacher's own words
 
 import { useCallback, useState } from "react";
 import { useFocusEffect } from "expo-router";
@@ -12,8 +19,12 @@ export type WordBankItem = {
   word: string;
   category?: string | null;
   difficulty?: string | null;
-  shared: boolean; // a shared word, not one of the teacher's own
+  mine: boolean; // the signed-in teacher's own word (can delete it)
+  shared: boolean; // = !mine: added by another teacher (or an old shared word)
 };
+
+/** Mine / All chips. */
+export type WordBankScope = "all" | "mine";
 
 /** The word's saved difficulty, or one guessed from its length. */
 export function wordDifficulty(w: { word: string; difficulty?: string | null }): Difficulty {
@@ -22,14 +33,66 @@ export function wordDifficulty(w: { word: string; difficulty?: string | null }):
     : getDifficultyFromLength(w.word);
 }
 
-/** Words matching a search text and (optionally) a difficulty. */
-export function filterWordBank(words: WordBankItem[], search: string, difficulty: Difficulty | null = null) {
+/** Words matching a search text, (optionally) a difficulty, and Mine / All. */
+export function filterWordBank(
+  words: WordBankItem[],
+  search: string,
+  difficulty: Difficulty | null = null,
+  scope: WordBankScope = "all",
+) {
   const q = search.trim().toLowerCase();
   return words.filter(
     (w) =>
       w.word.toLowerCase().includes(q) &&
-      (difficulty ? wordDifficulty(w) === difficulty : true)
+      (difficulty ? wordDifficulty(w) === difficulty : true) &&
+      (scope === "mine" ? w.mine : true)
   );
+}
+
+const PAGE = 1000;
+
+/**
+ * Every word the teacher can read (RLS: all words for an active teacher),
+ * each word once, A–Z. Paged, so more than 1,000 rows are never cut off.
+ */
+export async function loadWordBank(): Promise<{ words: WordBankItem[]; error: string | null }> {
+  const { data: sessionData } = await supabase.auth.getSession();
+  const uid = sessionData.session?.user.id;
+  if (!uid) return { words: [], error: "You're signed out." };
+
+  type Row = { id: string; word: string; category: string | null; difficulty: string | null; teacher_id: string | null };
+  const rows: Row[] = [];
+  for (let from = 0; ; ) {
+    const { data, error } = await supabase
+      .from("word_library")
+      .select("id, word, category, difficulty, teacher_id")
+      .order("word")
+      .order("id")
+      .range(from, from + PAGE - 1);
+    if (error) return { words: [], error: error.message };
+    if (!data || data.length === 0) break;
+    rows.push(...(data as Row[]));
+    from += data.length;
+  }
+
+  const byWord = new Map<string, WordBankItem>();
+  for (const row of rows) {
+    const key = row.word.trim().toUpperCase();
+    if (!key) continue;
+    const mine = row.teacher_id === uid;
+    const item: WordBankItem = {
+      id: row.id,
+      word: row.word,
+      category: row.category,
+      difficulty: row.difficulty,
+      mine,
+      shared: !mine,
+    };
+    // the teacher's own copy wins; otherwise the first one (A–Z, then id)
+    if (!byWord.has(key) || (mine && !byWord.get(key)!.mine)) byWord.set(key, item);
+  }
+  const words = [...byWord.values()].sort((a, b) => a.word.toUpperCase().localeCompare(b.word.toUpperCase()));
+  return { words, error: null };
 }
 
 export type SaveToBankResult =
@@ -88,33 +151,12 @@ export function useWordBank({ reloadOnFocus = true }: { reloadOnFocus?: boolean 
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-      if (!user) return;
-      const { data, error: loadError } = await supabase
-        .from("word_library")
-        .select("id, word, category, difficulty, teacher_id")
-        .or(`teacher_id.eq.${user.id},teacher_id.is.null`)
-        .order("word");
-      if (loadError) {
-        setError(loadError.message); // keep the words already loaded
+      const res = await loadWordBank();
+      if (res.error) {
+        setError(res.error); // keep the words already loaded
         return;
       }
-      // A word in both lists is shown once, as the teacher's own
-      const byWord = new Map<string, WordBankItem>();
-      for (const row of data ?? []) {
-        const key = row.word.toUpperCase();
-        const item: WordBankItem = {
-          id: row.id,
-          word: row.word,
-          category: row.category,
-          difficulty: row.difficulty,
-          shared: row.teacher_id == null,
-        };
-        if (!byWord.has(key) || !item.shared) byWord.set(key, item);
-      }
-      setWords([...byWord.values()]);
+      setWords(res.words);
       setError("");
     } catch (err) {
       setError(String((err as { message?: string })?.message ?? err));

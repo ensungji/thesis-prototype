@@ -1,5 +1,7 @@
 // mobile/app/(teacher)/wordbank/index.tsx
-// Teacher's personal word bank — search, filter by difficulty, and delete words.
+// The shared Word Bank (migration 29): every teacher's words, each listed
+// once; All / Mine chips; a "Shared" tag on words other teachers added. Only
+// the teacher's own words can be deleted. Search, filter by difficulty.
 // Add words via the dedicated new.tsx screen.
 
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -28,8 +30,10 @@ import {
   DIFFICULTY_META,
 } from "../../../lib/difficulty";
 import { wordbankToastBus } from "../../../lib/wordbank-toast";
+import { type WordBankItem, type WordBankScope, filterWordBank, loadWordBank, wordDifficulty } from "../../../lib/word-bank";
+import { WordBankScopeChips, SharedTag } from "../../../components/WordBankScopeChips";
 
-type Word = { id: string; word: string; difficulty: string };
+type Word = WordBankItem;
 
 // ─── Difficulty badge (tinted, subtle — sits on word cards) ──────────────────
 
@@ -62,6 +66,8 @@ export default function WordBankScreen() {
   const [filtered, setFiltered] = useState<Word[]>([]);
   const [search, setSearch] = useState("");
   const [diffFilter, setDiffFilter] = useState<Difficulty | null>(null);
+  const [scope, setScope] = useState<WordBankScope>("all");
+  const [loadError, setLoadError] = useState("");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -78,10 +84,10 @@ export default function WordBankScreen() {
   const [toastData, setToastData] = useState<{
     message: string;
     detail: string;
-    variant: "success" | "delete";
+    variant: "success" | "delete" | "warning";
   }>({ message: "", detail: "", variant: "success" });
 
-  function showToast(message: string, detail: string, variant: "success" | "delete") {
+  function showToast(message: string, detail: string, variant: "success" | "delete" | "warning") {
     setToastData({ message, detail, variant });
     setToastVisible(true);
     // Incrementing the key unmounts + remounts Toast, resetting all animation
@@ -90,16 +96,13 @@ export default function WordBankScreen() {
   }
 
   const loadWords = useCallback(async () => {
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) return;
-    const { data } = await supabase
-      .from("word_library")
-      .select("id, word, difficulty")
-      .eq("teacher_id", user.id)
-      .order("word");
-    setWords(data ?? []);
+    // Every teacher's words, each once (lib/word-bank, paged)
+    const res = await loadWordBank();
+    if (res.error) setLoadError(res.error); // keep what's on screen
+    else {
+      setWords(res.words);
+      setLoadError("");
+    }
     setLoading(false);
     setRefreshing(false);
   }, []);
@@ -124,38 +127,40 @@ export default function WordBankScreen() {
     return () => wordbankToastBus.off();
   }, []);
 
-  // Combined search + difficulty filter
+  // Combined search + difficulty + Mine / All filter
   useEffect(() => {
-    let result = words;
-    if (search.trim()) {
-      result = result.filter((w) =>
-        w.word.toLowerCase().includes(search.toLowerCase())
-      );
-    }
-    if (diffFilter) {
-      result = result.filter((w) => w.difficulty === diffFilter);
-    }
-    setFiltered(result);
-  }, [search, diffFilter, words]);
+    setFiltered(filterWordBank(words, search, diffFilter, scope));
+  }, [search, diffFilter, scope, words]);
 
   function toggleDiffFilter(d: Difficulty) {
     setDiffFilter((prev) => (prev === d ? null : d));
   }
 
   function confirmDelete(word: Word) {
+    if (!word.mine) return; // other teachers' words can't be deleted (RLS too)
     setWordToDelete(word);
     setDeleteModal(true);
   }
 
   async function executeDelete() {
-    if (!wordToDelete) return;
+    if (!wordToDelete || !wordToDelete.mine) return;
     setDeleting(true);
-    await supabase.from("word_library").delete().eq("id", wordToDelete.id);
+    // RLS refuses other teachers' rows silently (0 rows), so check what went
+    const { data, error } = await supabase
+      .from("word_library")
+      .delete()
+      .eq("id", wordToDelete.id)
+      .select("id");
     const removed = wordToDelete.word;
-    setWords((prev) => prev.filter((w) => w.id !== wordToDelete.id));
     setDeleting(false);
     setDeleteModal(false);
     setWordToDelete(null);
+    if (error || !data || data.length === 0) {
+      showToast("Couldn't remove the word", error?.message ?? "Only words you added can be removed.", "warning");
+      return;
+    }
+    // Another teacher may have the same word: reload so it shows up as Shared
+    loadWords();
     showToast("Removed from Word Bank", removed, "delete");
   }
 
@@ -270,11 +275,20 @@ export default function WordBankScreen() {
         })}
       </View>
 
+      {/* ── All / Mine (shared Word Bank) ── */}
+      <View style={styles.scopeRow}>
+        <WordBankScopeChips scope={scope} onChange={setScope} words={words} />
+      </View>
+
       {/* ── Count ── */}
       <Text style={styles.countText}>
         {filtered.length} word{filtered.length !== 1 ? "s" : ""}
+        {scope === "mine" ? " · added by you" : " · all teachers"}
         {diffFilter ? ` · ${DIFFICULTY_META[diffFilter].label}` : ""}
       </Text>
+      {!!loadError && (
+        <Text style={[styles.countText, { color: C.red }]}>{`Couldn't refresh: ${loadError}`}</Text>
+      )}
 
       {/* ── Word list ── */}
       <FlatList
@@ -299,19 +313,25 @@ export default function WordBankScreen() {
             </View>
             <View style={styles.wordCardBody}>
               <Text style={styles.wordText}>{item.word}</Text>
-              <DifficultyBadge difficulty={item.difficulty} />
+              <View style={styles.tagRow}>
+                {item.shared && <SharedTag />}
+                <DifficultyBadge difficulty={wordDifficulty(item)} />
+              </View>
             </View>
-            <Pressable
-              onPress={() => confirmDelete(item)}
-              hitSlop={8}
-              style={({ pressed }) => [
-                styles.deleteBtn,
-                pressed && { opacity: 0.6 },
-              ]}
-              accessibilityLabel={`Remove ${item.word}`}
-            >
-              <Ionicons name="trash-outline" size={16} color={C.red} />
-            </Pressable>
+            {/* Only the teacher's own words can be removed */}
+            {item.mine && (
+              <Pressable
+                onPress={() => confirmDelete(item)}
+                hitSlop={8}
+                style={({ pressed }) => [
+                  styles.deleteBtn,
+                  pressed && { opacity: 0.6 },
+                ]}
+                accessibilityLabel={`Remove ${item.word}`}
+              >
+                <Ionicons name="trash-outline" size={16} color={C.red} />
+              </Pressable>
+            )}
           </View>
         )}
         ListEmptyComponent={
@@ -320,12 +340,14 @@ export default function WordBankScreen() {
             <Text style={styles.emptyTitle}>
               {search.trim() || diffFilter
                 ? "No matching words"
-                : "Word bank is empty"}
+                : scope === "mine"
+                  ? "You haven't added words yet"
+                  : "Word bank is empty"}
             </Text>
             <Text style={styles.emptyBody}>
               {search.trim() || diffFilter
                 ? "Try a different search or filter."
-                : "Tap + Add to start building your personal word bank. Words saved here appear when building session word lists."}
+                : "Tap + Add to add a word. Words in the Word Bank are shared with every teacher and appear when building word lists."}
             </Text>
           </View>
         }
@@ -350,7 +372,7 @@ export default function WordBankScreen() {
             </View>
             <Text style={styles.deleteTitle}>Remove from Word Bank?</Text>
             <Text style={styles.deleteSub}>
-              {"This word will be removed from your bank. It won't affect sessions that have already used it."}
+              {"This word will be removed from the Word Bank for every teacher. It won't affect sessions or activities that already use it."}
             </Text>
             <View style={styles.sheetActions}>
               <Pressable
@@ -393,6 +415,9 @@ const CHIP_INACTIVE_BG = "#EDEDEB"; // slightly darker than bg — visible but q
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: C.bg },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
+
+  scopeRow: { paddingHorizontal: 16, paddingTop: 2, paddingBottom: 2 },
+  tagRow: { flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
 
   // ── Header ──────────────────────────────────────────────────────────────────
   header: {

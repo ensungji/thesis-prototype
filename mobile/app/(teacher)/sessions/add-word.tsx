@@ -42,7 +42,8 @@ import {
 } from "../../../lib/session-timer";
 import { updateOrQueue } from "../../../lib/outbox";
 import { fisherYatesShuffle, saveWordOrder } from "../../../lib/word-order";
-import { useWordBank, filterWordBank, wordDifficulty, saveWordToBank } from "../../../lib/word-bank";
+import { useWordBank, filterWordBank, wordDifficulty, saveWordToBank, type WordBankScope } from "../../../lib/word-bank";
+import { WordBankScopeChips, SharedTag } from "../../../components/WordBankScopeChips";
 import DraggableFlatList, {
   ScaleDecorator,
 } from "react-native-draggable-flatlist";
@@ -147,6 +148,7 @@ export default function AddWordScreen() {
   const { words: wordBank, loading: loadingBank, reload: loadWordBank } = useWordBank();
   const [bankSearch, setBankSearch] = useState("");
   const [diffFilter, setDiffFilter] = useState<Difficulty | null>(null);
+  const [bankScope, setBankScope] = useState<WordBankScope>("all"); // shared Word Bank: All / Mine
 
   function toggleDiffFilter(d: Difficulty) {
     setDiffFilter((prev) => (prev === d ? null : d));
@@ -376,7 +378,7 @@ export default function AddWordScreen() {
     setReordering(false);
   }
 
-  const filteredBank = filterWordBank(wordBank, bankSearch, diffFilter);
+  const filteredBank = filterWordBank(wordBank, bankSearch, diffFilter, bankScope);
 
   const activeMeta = DIFFICULTY_META[effectiveDifficulty];
   const showDifficultySection = newWord.trim().length > 0;
@@ -804,9 +806,15 @@ export default function AddWordScreen() {
               })}
             </View>
 
+            {/* ── All / Mine (shared Word Bank) ── */}
+            <View style={{ paddingHorizontal: 16, paddingBottom: 8 }}>
+              <WordBankScopeChips scope={bankScope} onChange={setBankScope} words={wordBank} />
+            </View>
+
             {/* ── Count ── */}
             <Text style={styles.countText}>
               {filteredBank.length} word{filteredBank.length !== 1 ? "s" : ""}
+              {bankScope === "mine" ? " · added by you" : " · all teachers"}
               {diffFilter ? ` · ${DIFFICULTY_META[diffFilter].label}` : ""}
             </Text>
 
@@ -820,12 +828,16 @@ export default function AddWordScreen() {
                 <Text style={styles.emptyTitle}>
                   {wordBank.length === 0
                     ? "Word bank is empty"
-                    : "No matching words"}
+                    : bankScope === "mine" && !wordBank.some((w) => w.mine)
+                      ? "You haven't added words yet"
+                      : "No matching words"}
                 </Text>
                 <Text style={styles.emptyBody}>
                   {wordBank.length === 0
                     ? "Switch to New Word and save words to your bank."
-                    : "Try a different search or filter."}
+                    : bankScope === "mine" && !wordBank.some((w) => w.mine)
+                      ? "Tap All to see every teacher's words."
+                      : "Try a different search or filter."}
                 </Text>
               </View>
             ) : (
@@ -842,6 +854,7 @@ export default function AddWordScreen() {
                     <View style={styles.bankItem}>
                       <View style={styles.bankItemLeft}>
                         <Text style={styles.bankWord}>{item.word}</Text>
+                        {item.shared && <SharedTag style={{ alignSelf: "flex-start" }} />}
                         <DifficultyBadge difficulty={effectiveDiff} />
                       </View>
 

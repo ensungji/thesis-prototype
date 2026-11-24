@@ -37,7 +37,8 @@ import { Countdown } from "../../../components/Countdown";
 import { useKeyboardInset } from "../../../lib/use-keyboard-inset";
 import { wordToChunks, getPattern, isValidWord } from "../../../lib/braille";
 import { fisherYatesShuffle, saveWordOrder } from "../../../lib/word-order";
-import { useWordBank, filterWordBank } from "../../../lib/word-bank";
+import { useWordBank, filterWordBank, type WordBankScope } from "../../../lib/word-bank";
+import { WordBankScopeChips, SharedTag } from "../../../components/WordBankScopeChips";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useKeepAwake } from "expo-keep-awake";
 import { PlayRecordingButton, latestRecordingPath } from "../../../components/PlayRecordingButton";
@@ -506,6 +507,7 @@ export default function SessionDetail() {
     useWordBank({ reloadOnFocus: false });
   const [wordBankSheet, setWordBankSheet] = useState(false);
   const [bankSearch, setBankSearch] = useState("");
+  const [bankScope, setBankScope] = useState<WordBankScope>("all"); // shared Word Bank: All / Mine
 
   // ── Live attempt feed ───────────────────────────────────────────────────────
   const [liveAttempts, setLiveAttempts] = useState<WordAttempt[]>([]);
@@ -2237,7 +2239,7 @@ export default function SessionDetail() {
   );
 
   // ── WORD BANK SHEET (Live Session) ──────────────────────────────────────────
-  const bankMatches = filterWordBank(bankWords, bankSearch);
+  const bankMatches = filterWordBank(bankWords, bankSearch, null, bankScope);
   const WordBankSheet = (
     <Modal
       visible={wordBankSheet}
@@ -2268,6 +2270,7 @@ export default function SessionDetail() {
               </Pressable>
             )}
           </View>
+          <WordBankScopeChips scope={bankScope} onChange={setBankScope} words={bankWords} />
           {loadingBank && bankWords.length === 0 ? (
             <ActivityIndicator color={C.navy} style={{ marginTop: 24 }} />
           ) : bankMatches.length === 0 ? (
@@ -2275,7 +2278,9 @@ export default function SessionDetail() {
               {bankError && bankWords.length === 0
                 ? "Couldn't load the Word Bank. Check your connection and try again."
                 : bankWords.length === 0
-                ? "Your Word Bank is empty. Add words in the Word Bank tab."
+                ? "The Word Bank is empty. Add words in the Word Bank tab."
+                : bankScope === "mine" && !bankWords.some((w) => w.mine)
+                ? "You haven't added words yet. Tap All to see every teacher's words."
                 : "No matching words."}
             </Text>
           ) : (
@@ -2295,7 +2300,7 @@ export default function SessionDetail() {
                     accessibilityLabel={`Send ${item.word}${sent ? ", already sent" : ""}`}
                   >
                     <Text style={styles.bankRowWord}>{item.word.toUpperCase()}</Text>
-                    {item.shared && <Text style={styles.bankRowTag}>Shared</Text>}
+                    {item.shared && <SharedTag />}
                     {sent && <Text style={[styles.bankRowTag, { color: C.brown }]}>Sent</Text>}
                     <View style={{ flex: 1 }} />
                     <Ionicons name="send" size={14} color={C.navy} />

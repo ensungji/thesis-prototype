@@ -35,7 +35,8 @@ import { Ionicons } from "@expo/vector-icons";
 import { colors as C, fonts, MIN_TOUCH } from "../../lib/theme";
 import { DIFFICULTY_META } from "../../lib/difficulty";
 import { MAX_WORD_DURATION_SEC, MIN_WORD_DURATION_SEC } from "../../lib/session-timer";
-import { filterWordBank, useWordBank } from "../../lib/word-bank";
+import { filterWordBank, useWordBank, type WordBankScope } from "../../lib/word-bank";
+import { WordBankScopeChips, SharedTag } from "../WordBankScopeChips";
 import {
   type ActivitiesArea,
   type Activity,
@@ -109,6 +110,7 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
   const [pasteText, setPasteText] = useState("");
   const [bankOpen, setBankOpen] = useState(false);
   const [bankSearch, setBankSearch] = useState("");
+  const [bankScope, setBankScope] = useState<WordBankScope>("all"); // shared Word Bank: All / Mine
   const [bankPicked, setBankPicked] = useState<Set<string>>(new Set());
   const wordBank = useWordBank({ reloadOnFocus: false });
 
@@ -389,7 +391,7 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
   const level = activity.level ? DIFFICULTY_META[activity.level] : null;
   const status = STATUS_COLORS[activity.status];
   const totalSec = words.reduce((s, w) => s + w.duration_seconds, 0);
-  const bankShown = filterWordBank(wordBank.words, bankSearch);
+  const bankShown = filterWordBank(wordBank.words, bankSearch, null, bankScope);
   const pastePreview = parseWordList(pasteText, words.map((w) => w.word));
 
   return (
@@ -684,6 +686,7 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
           style={styles.input}
           accessibilityLabel="Search the Word Bank"
         />
+        <WordBankScopeChips scope={bankScope} onChange={setBankScope} words={wordBank.words} />
         {!!wordBank.error && <Text style={styles.errorText}>{wordBank.error}</Text>}
         <ScrollView style={{ flexGrow: 0, maxHeight: 360 }} keyboardShouldPersistTaps="handled">
           {wordBank.loading && wordBank.words.length === 0 ? (
@@ -691,7 +694,11 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
               <BrailleLoader size={12} />
             </View>
           ) : bankShown.length === 0 ? (
-            <Text style={[styles.meta, { padding: 12 }]}>No words found.</Text>
+            <Text style={[styles.meta, { padding: 12 }]}>
+              {bankScope === "mine" && !wordBank.words.some((w) => w.mine)
+                ? "You haven't added words yet. Tap All to see every teacher's words."
+                : "No words found."}
+            </Text>
           ) : (
             bankShown.map((w) => {
               const on = bankPicked.has(w.id);
@@ -715,7 +722,7 @@ export function ActivityEditorScreen({ area }: { area: ActivitiesArea }) {
                   <Ionicons name={on ? "checkbox" : "square-outline"} size={22} color={on ? C.navy : C.muted} />
                   <Text style={[styles.bankWord, already && { color: C.muted }]}>{w.word.toUpperCase()}</Text>
                   {already && <Text style={styles.meta}>in list</Text>}
-                  {w.shared && <Text style={styles.meta}>shared</Text>}
+                  {w.shared && <SharedTag />}
                 </Pressable>
               );
             })

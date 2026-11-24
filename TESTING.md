@@ -1051,9 +1051,191 @@ Git Bash, tokens from section B6 (`$A` = T1, `$ADMIN`).
 
 ## Branch feature/reports-and-signup
 
-Branch from `feature/activities` (f1917e5). One part per section; the
-reports (Part 1), sign-up, routing and word bank sections are added when
-those parts are finished.
+Branch from `feature/activities` (f1917e5). One section per part: R1
+reports + Today filter, R2 Live Session input, R3 Admin header, R4 admin /
+teacher routing, R5 teacher sign-up, R6 shared Word Bank.
+
+Automated checks (all passing on 24 Nov 2026): `cd mobile && npx tsc
+--noEmit`, `npm run lint` (0 errors), `npx deno check` on grade-answer,
+register-teacher, create-teacher and set-teacher-active, and
+`cd supabase/tests/policy-check && npm run check` (170 checks, migrations
+27–29 included).
+
+### R1 Reports: PDF + CSV (needs the new APK: expo-print)
+Migration 27 and grade-answer v8 **are in** (24 Nov 2026). Install the new
+preview APK (`eas build --profile preview --platform android`). Use T1 with
+students named like the study (`B01`, `B02`, `I01`, …) plus one other name
+(e.g. `Ana`), and at least: one finished **Live**, one **Timed** and one
+**Activity** session with a few tries, one No answer, one Skipped (Activity
+Next), one answer still marked Review, one re-graded answer, and one session
+marked **Done reviewing**. Have the SQL Editor open for the counts. To read
+a PDF: share → Save to Drive / Files, open on a computer. CSV: open in Excel
+or Google Sheets.
+
+**R1.1 Analytics: Today chip**
+1. **Do:** Analytics tab.
+   **Expect:** chips **Today · This Week · This Month · All Time** (they wrap
+   on a small phone, none cut off). Under them the exact range, e.g.
+   "2026-11-24 00:00:00 to now (Asia/Manila)"; All Time: "All answers so far".
+2. **Do:** tap **Today** after answering a few words today.
+   **Expect:** only today's answers (since midnight, phone time = Manila).
+   Compare with SQL:
+   ```sql
+   select count(*) from word_attempts
+   where attempted_at >= date_trunc('day', now() at time zone 'Asia/Manila') at time zone 'Asia/Manila'
+     and coalesce(needs_review, false) = false
+     and student_id in (select id from students where teacher_id = '<T1 id>');
+   ```
+   = **Total Words**.
+3. **Do:** This Week / This Month / All Time.
+   **Expect:** same numbers as before this branch (rolling 7 days / rolling
+   month / everything).
+4. **Do (around midnight, optional):** answer a word at 23:58, check Today
+   at 00:01. **Expect:** the 23:58 answer is no longer under Today.
+
+**R1.2 Student report** (Students → B01)
+1. **Expect:** a **STUDENT REPORT** block: chips Today / This Week / This
+   Month / All Time (All Time selected), **Export PDF** and **Export CSV**.
+2. **Do:** All Time → **Export PDF**.
+   **Expect:** both buttons disable, "Preparing…" with a spinner and a hint
+   line; then the share sheet with `dots-student-B01-all-<date>-<time>.pdf`.
+3. **Expect (PDF, page 1):** title "Student report: B01", Period, exact
+   date range, Generated (Manila time), Teacher (your title + name).
+   Student table: Name / code, Group **Beginner**, Paired device (code or
+   "none"), Class standing "Rank X of Y students with answers…", Sessions
+   with answers.
+4. **Expect (Metrics):** every row present: Answers, Scored answers,
+   Correct, Accuracy, First-try correct, First-try accuracy, Average tries
+   per word, Average tries until correct, Average / Fastest / Slowest
+   response, Answers with a response time, No answer, No-answer rate,
+   Skipped, Needs review, Re-graded answers, Speech grading agreement. Then
+   **By word length** (3 letters / 5 letters / More than 5) and **By
+   session type** (Live / Timed / Activity).
+5. **Expect (matches the app):** Analytics → All Time → B01 card "c/t
+   correct": **Correct** = c, **Scored answers** = t, **Accuracy** = the
+   card's % (the PDF has one decimal). Class standing: B01's place when
+   the Analytics cards are sorted by accuracy (ties: more answers first).
+6. **Expect (answer tables):** a new page "Every answer and try, by
+   session"; one block per session (heading, type, date start–end,
+   activity + author, reviewed or not), each block on its own page.
+   Columns: # · Word · Len · Hold · Answered / try time · Device · Heard ·
+   Conf. · Result · Needs review · Tries · Resp. ms · Resp. s · Graded by ·
+   Original (before re-grade) · Re-graded by / at · Late · Rec. saved.
+   Under each answer, one grey "↳ try N" row per try with its own time,
+   device, heard text, confidence, result, response time, late, recording.
+   A table that runs over a page repeats its header row.
+7. **Expect (values):** results use correct / wrong / review / no answer /
+   skipped; the re-graded answer shows "wrong by voice" (or similar) in
+   Original and "<your name> · <time>" in Re-graded; Device = the device
+   code for tries after migration 27 (older ones backfilled; "—" when not
+   recorded); Late yes / no / not recorded. **No file paths or links**
+   anywhere (search the PDF for ".wav" / "answers/": nothing).
+8. **Expect (count):** answer rows in the PDF =
+   `select count(*) from word_attempts where student_id = '<B01 id>';`
+   and try rows =
+   `select count(*) from answer_attempts where student_id = '<B01 id>';`
+   (tries of deleted sessions are gone; their answers show under "Session
+   deleted" at the end).
+9. **Expect:** page numbers "Page n of N" bottom right, a footer with the
+   title and generation time bottom left, last page **Data dictionary**
+   (every column, every metric explained).
+10. **Do:** **Today** chip → Export PDF.
+    **Expect:** only today's answers; the date range starts today 00:00.
+    A student with nothing today: "No answers in this period.", not ranked.
+11. **Do:** **Export CSV** (All Time).
+    **Expect:** `dots-student-B01-all-….csv`; first row = column names
+    (session_name … try_recording_saved, 44 columns; 45 if an older heard
+    text column exists); one row per try, answer/session columns repeated;
+    an answer with no try (No answer, Skipped, teacher grade) = one row
+    with empty try_ columns. Rows =
+    tries + answers without tries (SQL in R1.5).
+
+**R1.3 Session report** (a finished session, and its Review screen)
+1. **Expect:** the finished session screen has **SESSION REPORT** with
+   Export PDF / Export CSV under "Review answers"; the Review screen has
+   the same at the bottom.
+2. **Do:** Export PDF (a reviewed Live or Timed session).
+   **Expect:** Session details: Name, Type, Purpose, Status, Date, Created,
+   Start time, End time, Duration (start to end), Activity ("not an
+   activity session" or name · by author), Reviewed at, Words /
+   participants. **Word list (in order)**: #, word, letters, length group,
+   hold time, answers, correct.
+3. **Expect:** **Participants: metrics for this session**: one row per
+   assigned student (also those with no answers), every metric column,
+   "Rank in session". **Group comparison**: Beginner / Intermediate / Other
+   / All side by side (Ana under Other), every metric plus by length and
+   type. **Speech grading agreement** = the Review screen's sentence.
+4. **Expect:** then one page per student: every word of the session in
+   order; their answer + tries, or "No answer row saved…" for a word they
+   never got a row for.
+5. **Expect (counts):** answer rows =
+   `select count(*) from word_attempts where session_id = '<id>';`
+   = the Review screen's **All** count.
+6. **Do:** an Activity session → Export PDF.
+   **Expect:** Type Activity, "<activity> · by <author>", hold times marked
+   "not used: teacher-paced", Skipped rows present.
+7. **Do:** a session **not** marked Done reviewing.
+   **Expect:** the agreement says "Provisional: this session isn't marked
+   Done reviewing yet."
+8. **Do:** Export CSV. **Expect:** same columns as R1.2, only this session.
+
+**R1.4 Analytics report** (Analytics tab)
+1. **Expect:** "REPORT · ALL TIME" (changes with the chip) with Export PDF /
+   Export CSV.
+2. **Do:** All Time → Export PDF.
+   **Expect:** Class overview (students, sessions in the period, answers,
+   class accuracy as in the app **and** pooled, average response both
+   ways), Metrics whole class, by word length, by session type; **Group
+   comparison** page; **Every student's metrics** (rank, every metric, also
+   students with no answers); every student by word length and session
+   type; **Sessions in the period** (date, name, type, purpose, activity,
+   start, end, duration, status, words, students, answers, accuracy,
+   reviewed); then one page per student with answers: every answer + try,
+   grouped by session.
+3. **Expect (matches the app):** "Class accuracy (average of students…)" =
+   Analytics **Class Accuracy**; "Answers (… scored)" scored number =
+   **Total Words**; "Average response (average of students…)" = **Avg
+   Response**.
+4. **Do:** Today / This Week → Export PDF.
+   **Expect:** the date range printed at the top is exactly that period;
+   only answers in it; sessions created or started in it.
+5. **Do:** Export CSV (All Time). **Expect:** rows = R1.5 total.
+
+**R1.5 CSV row count (SQL)**
+```sql
+-- tries + answers that have no try = CSV rows for the whole class (All Time)
+select (select count(*) from answer_attempts aa
+          join word_attempts wa on wa.session_word_id = aa.session_word_id and wa.student_id = aa.student_id
+          join students s on s.id = wa.student_id where s.teacher_id = '<T1 id>')
+     + (select count(*) from word_attempts wa join students s on s.id = wa.student_id
+          where s.teacher_id = '<T1 id>'
+            and not exists (select 1 from answer_attempts aa
+                            where aa.session_word_id = wa.session_word_id and aa.student_id = wa.student_id)) as csv_rows;
+```
+**Expect:** = the number of data rows in the All Time CSV (Excel row count
+minus the header). Add `and wa.session_id = '<id>'` (both halves) for one
+session, `and wa.student_id = '<id>'` for one student.
+
+**R1.6 Errors, offline, old build**
+1. **Do:** airplane mode → Export PDF.
+   **Expect:** toast "Couldn't make the PDF · You're offline. Connect to the
+   internet and try again." Buttons usable again.
+2. **Do:** turn off Wi-Fi in the middle of a big export.
+   **Expect:** toast "No connection to the server…", no crash.
+3. **Do:** cancel the share sheet. **Expect:** back on the screen, nothing
+   else happens; exporting again works.
+4. **Do (old APK without expo-print):** Export PDF.
+   **Expect:** toast "This app build can't make PDFs yet. Install the
+   latest app build…". Export CSV still works (as text if expo-sharing is
+   missing too).
+5. **Do:** All Time with lots of data (500+ answers).
+   **Expect:** finishes (may take some seconds); nothing cut off at 1,000
+   rows (compare counts as above).
+
+**R1.7 Privacy**
+1. **Expect (every PDF and CSV):** students only by their stored name /
+   code; no recording paths, URLs or ids; "Rec. saved" / `recording_saved`
+   is only yes / no.
 
 ### R2 Live Session word input (JS only: reload a dev build)
 Use the **smallest Android phone** you have, and one other phone if possible.
@@ -1262,3 +1444,58 @@ up" must stay **off**: the app doesn't use it. Use a fresh email, e.g.
 23. **Do (rate limit, optional):** 21 sign-ups within one hour.
     **Expect:** the 21st: "Too many sign-ups right now…" (HTTP 429) and a
     `signup_rate_limited` warning in Logs.
+
+### R6 Shared Word Bank (JS only)
+Migration 29 (`20261124120300_word_library_shared_read.sql`) **is run**
+(24 Nov 2026). Teachers **T1** and **T2** (both active). T1 adds `APPLE`,
+T2 adds `BANANA` and also `CAT`; T1 also has `CAT` (or add it).
+1. **Do:** T2 → Word Bank tab.
+   **Expect:** chips **All n · Mine m** under the difficulty chips (All
+   selected). `APPLE` is listed with a small **Shared** tag and **no
+   trash button**. `BANANA` has a trash button and no tag. `CAT` appears
+   **once**, as T2's own (trash, no tag). Count line "… · all teachers".
+2. **Do:** tap **Mine**.
+   **Expect:** only T2's words (`BANANA`, `CAT`); "… · added by you". A
+   teacher with no words of their own: "You haven't added words yet".
+3. **Do:** T2 deletes `CAT` (own) → Remove.
+   **Expect:** toast "Removed from Word Bank"; `CAT` stays in the list but
+   now with **Shared** (T1's copy) and no trash. The delete sheet says it's
+   removed for every teacher.
+4. **Do (API, Git Bash, B6):** T2 tries to delete T1's word:
+   ```bash
+   curl -s -X DELETE "$URL/rest/v1/word_library?word=eq.APPLE" -H "apikey: $ANON" \
+     -H "Authorization: Bearer $B" -H "Prefer: return=representation"
+   ```
+   **Expect:** `[]`; `APPLE` still there for both teachers.
+5. **Do:** T2 → Live Session → **Word Bank** (picker).
+   **Expect:** search, then **All / Mine** chips; `APPLE` with **Shared**;
+   tapping it sends it like any word. Mine hides it.
+6. **Do:** T2 → a pending session → Add Word → **Word Bank** tab.
+   **Expect:** All / Mine chips under the difficulty chips, `APPLE` with
+   **Shared**, Add works (timer stepper too).
+7. **Do:** T2 → Activities → a draft → **From Word Bank**.
+   **Expect:** All / Mine chips; `APPLE` with **Shared**; tick it → Add →
+   it's in the activity.
+8. **Do ("Already in your Word Bank" = own words only):** T2 → Add Word →
+   New Word → type `APPLE` with "Save to Word Bank" on → Add.
+   **Expect:** **saved** to T2's own bank (not "already in your Word
+   Bank": that's T1's copy). In the Word Bank tab `APPLE` now shows as T2's
+   own (trash, no tag), still once. Type `BANANA` again → "Already in your
+   Word Bank".
+9. **Do:** T2 → Word Bank → **+ Add** → `BANANA`.
+   **Expect:** "already in your word bank".
+10. **Do:** T1 → Word Bank.
+    **Expect:** T2's `BANANA` with **Shared**, no trash; T1's own words
+    with trash.
+11. **Do (admin):** admin opens an activity (read-only); nothing to pick.
+    **Expect:** no change for admins (they never add words).
+12. **Do (deactivated teacher):** deactivate T2 (admin), then SQL
+    (run all four lines together):
+    ```sql
+    select set_config('request.jwt.claim.sub', '<T2 id>', false);
+    set role authenticated;
+    select word, teacher_id from word_library;
+    reset role;
+    ```
+    **Expect:** only T2's own words and
+    words with no owner. Reactivate T2.
