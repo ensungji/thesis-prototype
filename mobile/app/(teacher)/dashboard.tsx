@@ -4,7 +4,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
   View, Text, Pressable, ScrollView, Modal,
-  StyleSheet, ActivityIndicator, RefreshControl,
+  StyleSheet, ActivityIndicator, RefreshControl, BackHandler,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter, useFocusEffect } from "expo-router";
@@ -69,6 +69,20 @@ function StatCard({ value, label, bg, color }: {
 
 export default function Dashboard() {
   const router = useRouter();
+
+  // Android Back on the Dashboard (the first tab, nothing open) closes the
+  // app, like the Admin Panel, instead of flashing the welcome screen while
+  // still signed in. Other tabs keep their normal Back (to the Dashboard);
+  // open sheets / modals handle Back themselves.
+  useFocusEffect(
+    useCallback(() => {
+      const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+        BackHandler.exitApp();
+        return true;
+      });
+      return () => sub.remove();
+    }, []),
+  );
 
   const [profile, setProfile]             = useState<Profile | null>(null);
   const [studentCount, setStudentCount]   = useState(0);

@@ -1132,10 +1132,16 @@ deactivate. Phone online unless a step says otherwise.
    **Expect:** teacher Dashboard as before. All tabs, sessions, word bank
    work. Close and reopen the app: straight to the Dashboard. Airplane
    mode + reopen: still the Dashboard (not signed out).
-9. **Do (T1, Back):** press Back on the Dashboard.
-   **Expect:** you stay signed in. The welcome screen may flash and the
-   Dashboard comes back (or the app closes); you never end up on the
-   welcome screen while signed in.
+9. **Do (T1, Back):** on the Dashboard (first tab, no sheet open) press
+   Android **Back**.
+   **Expect:** the app closes (home screen); no welcome screen, not even a
+   flash. Reopen: straight to the Dashboard.
+9a. **Do (T1, Back elsewhere):** open Students → a student; press Back.
+   **Expect:** back to the Students list (normal). Press Back again on the
+   Students list. **Expect:** the Dashboard (normal tab Back), the app stays
+   open. Open a session from the Sessions tab, press Back: back to the
+   session list. On the Dashboard, open any sheet / modal and press Back:
+   only the sheet closes.
 10. **Do (deactivated, saved login):** T3 signs in on the phone and closes
     the app. Admin (another phone) deactivates T3. Open the app on T3's
     phone.
